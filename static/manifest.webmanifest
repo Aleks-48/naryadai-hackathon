@@ -1,0 +1,13 @@
+{
+  "id": "/",
+  "name": "НарядAI — ремонтные работы",
+  "short_name": "НарядAI",
+  "description": "Локальный интерфейс управления ремонтными нарядами",
+  "lang": "ru",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f7f4",
+  "theme_color": "#102a2a",
+  "icons": [{"src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]
+}
