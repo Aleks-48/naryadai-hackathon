@@ -117,7 +117,7 @@ def show_worker_actions(order: dict[str, Any], constants: dict[str, Any]) -> Non
         faults = constants.get("fault_codes", [])
         materials = constants.get("materials", [])
         with st.form(f"complete-{oid}"):
-            report = st.text_area("Что сделано и какой результат наблюдался", min_chars=20)
+            report = st.text_area("Что сделано и какой результат наблюдался")
             fault_ids = [item["id"] for item in faults]
             fault_labels = {item["id"]: f"{item['code']} · {item['label']}" for item in faults}
             fault_id = st.selectbox("Код неисправности", fault_ids, format_func=lambda key: fault_labels[key]) if fault_ids else None
@@ -200,9 +200,9 @@ def reports_panel() -> None:
         data=api("GET","/api/reports?"+urlencode(params))
         st.json(data["summary"])
         st.caption("Пауза — события журнала; это не подтверждённый простой оборудования. Сводка rules-only.")
-        st.dataframe(data.get("worker_totals",[]),use_container_width=True)
-        st.dataframe(data.get("material_totals",[]),use_container_width=True)
-        st.dataframe(data.get("items",[]),use_container_width=True)
+        st.dataframe(data.get("worker_totals",[]),width="stretch")
+        st.dataframe(data.get("material_totals",[]),width="stretch")
+        st.dataframe(data.get("items",[]),width="stretch")
 
 
 def main() -> None:
@@ -226,11 +226,11 @@ def main() -> None:
         st.info("Синтетические демонстрационные данные. ИИ и фото не являются допуском по безопасности и не доказывают исправность оборудования.")
         if page=="Отчёт": reports_panel();return
         if page=="Команда":
-            st.dataframe([{k:x.get(k) for k in ("display_name","brigade","availability_label","specialty","qualification_level","shift_code","active_orders")} for x in bootstrap.get("members",[])],use_container_width=True)
+            st.dataframe([{k:x.get(k) for k in ("display_name","brigade","availability_label","specialty","qualification_level","shift_code","active_orders")} for x in bootstrap.get("members",[])],width="stretch")
             st.caption("Специальность, квалификация и график сгенерированы для демо и не подтверждают фактические допуски.")
         if user["role"]=="master": create_order(constants,bootstrap.get("free_workers",[]))
         orders=bootstrap.get("orders",[])
-        st.dataframe([{ "Наряд":o["code"],"Статус":o["status_label"],"Работа":o["title"],"Оборудование":o["equipment"]["name"],"Исполнитель":o["worker"]["display_name"],"Срок UTC":o["due_at"]} for o in orders[:100]],use_container_width=True)
+        st.dataframe([{ "Наряд":o["code"],"Статус":o["status_label"],"Работа":o["title"],"Оборудование":o["equipment"]["name"],"Исполнитель":o["worker"]["display_name"],"Срок UTC":o["due_at"]} for o in orders[:100]],width="stretch")
         if not orders: return
         selected=st.selectbox("Открыть наряд",[o["id"] for o in orders],format_func=lambda key: next(order_label(o) for o in orders if o["id"]==key))
         detail=api("GET",f"/api/orders/{selected}")
@@ -245,7 +245,7 @@ def main() -> None:
         elif user["role"]=="master": show_master_actions(order)
         else: st.caption("Руководительский просмотр: только чтение.")
         with st.expander("Аудит наряда"):
-            st.dataframe(detail.get("history",[]),use_container_width=True)
+            st.dataframe(detail.get("history",[]),width="stretch")
     except (RuntimeError, requests.RequestException) as error:
         st.error(f"Запрос к НарядAI API не выполнен: {error}")
 

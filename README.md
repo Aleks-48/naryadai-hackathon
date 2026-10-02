@@ -46,7 +46,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 node --check .\static\app.js
 ```
 
-Полный локальный прогон: `python -m unittest discover -s tests -v` — 25/25 за 68,16 с. В том же прогоне маленький PNG записался за 0,213 с, видимость между двумя HTTP-сессиями — 0,170 с. UI-гонки: `node --test tests/test_frontend_races.js` — 19/19; `node --check static/app.js`, Python `py_compile` и `git diff --check` прошли. Это только локальные тестовые измерения. Реальный браузер, Android, мобильную сеть, Docker build и Streamlit runtime здесь не проверяли.
+Полный локальный прогон: `python -m unittest discover -s tests -v` — 25/25 за 72,58 с. В том же прогоне маленький PNG записался за 0,253 с, видимость между двумя HTTP-сессиями — 0,125 с. UI-гонки: `node --test tests/test_frontend_races.js` — 19/19; `node --check static/app.js`, Python `py_compile` и `git diff --check` прошли. Это только локальные тестовые измерения. Реальный браузер, Android, мобильную сеть, Docker build и здесь не проверяли. Streamlit AppTest: 2/2 tests passed on Streamlit 1.64.0 using a temporary SQLite database and real API.
 
 ## Режимы ИИ и интеграции
 
@@ -85,6 +85,8 @@ node --check .\static\app.js
 
 `docker compose up --build` собирает API/PWA и хранит SQLite/фото в именованном volume `naryadai-data`; локальный порт привязан только к `127.0.0.1:8765`. Docker в этой рабочей сессии не запускался. `docker compose down` сохраняет данные; `docker compose down -v` удаляет volume с базой и фото. Переменные пусты, поэтому LLM остаётся в `rules-only`. Внешний HTTPS, push, публичный host и постоянный удалённый диск этим файлом не создаются.
 
-Опциональный UI поверх того же API: `docker compose --profile demo-ui up --build` (Streamlit на `127.0.0.1:8501`). Каждый браузерный сеанс создаёт отдельную API-сессию; роли повторно проверяет `server.py`. Streamlit не содержит моков, базы или таймера. При перезапуске UI пользователь входит снова, а SQLite и фото остаются в volume API. Для прямого запуска: установите отдельный необязательный пакет из `requirements-streamlit.txt`, задайте `NARYADAI_API_URL` и запустите `streamlit run streamlit_app.py`. Пакет в текущем окружении не устанавливался.
+Опциональный UI поверх того же API: `docker compose --profile demo-ui up --build` (Streamlit на `127.0.0.1:8501`). Каждый браузерный сеанс создаёт отдельную API-сессию; роли повторно проверяет `server.py`. Streamlit не содержит моков, базы или таймера. При перезапуске UI пользователь входит снова, а SQLite и фото остаются в volume API. Для прямого запуска: установите отдельный необязательный пакет из `requirements-streamlit.txt`, задайте `NARYADAI_API_URL` и запустите `streamlit run streamlit_app.py`.
+
+Проверка Streamlit UI через AppTest с временной БД и реальным API: `python tests/run_streamlit_apptest.py`. Тест использует необязательный пакет из `requirements-streamlit.txt` и покрывает роли, изоляцию сессий, запрет доступа к чужому наряду, отчёт руководителя и полный цикл с паузой и доработкой.
 
 Streamlit Cloud или иной внешний UI требует отдельно доступного HTTPS API с постоянным хранилищем; бесплатный host, его сон/перезапуск и сохранность SQLite здесь не подтверждались. Образ не делает деплой и не открывает порт наружу.
