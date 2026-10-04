@@ -59,6 +59,7 @@ p, [data-testid="stCaptionContainer"] { line-height: 1.5; }
 }
 [data-testid="stMetric"] {
   min-height: 112px;
+  min-width: 0;
   padding: 1rem 1.1rem;
   background: var(--nai-white);
   border: 1px solid var(--nai-line);
@@ -67,6 +68,20 @@ p, [data-testid="stCaptionContainer"] { line-height: 1.5; }
 }
 [data-testid="stMetricLabel"] { color: var(--nai-muted); font-size: .95rem; }
 [data-testid="stMetricValue"] { color: var(--nai-ink); font-size: 1.8rem; font-weight: 750; }
+.st-key-status-summary .stColumn { min-width: 0; }
+.st-key-status-summary [data-testid="stCaptionContainer"],
+.st-key-status-summary [data-testid="stMetricLabel"],
+.st-key-status-summary [data-testid="stCaptionContainer"] *,
+.st-key-status-summary [data-testid="stMetricLabel"] [data-testid="stMarkdownContainer"],
+.st-key-status-summary [data-testid="stMetricLabel"] [data-testid="stMarkdownContainer"] *,
+.st-key-status-summary [data-testid="stMetricLabel"] * {
+  min-width: 0;
+  max-width: 100%;
+  overflow: visible !important;
+  overflow-wrap: anywhere;
+  text-overflow: clip !important;
+  white-space: normal !important;
+}
 /* Streamlit 1.64 renders st.columns wrappers with .stColumn (not data-testid="column"). */
 .st-key-status-summary .stColumn:nth-child(1) [data-testid="stMetric"] { border-top: 4px solid #567cb5; }
 .st-key-status-summary .stColumn:nth-child(2) [data-testid="stMetric"] { border-top: 4px solid var(--nai-green); }
@@ -75,14 +90,38 @@ p, [data-testid="stCaptionContainer"] { line-height: 1.5; }
 [data-testid="stBaseButton-primary"] { background: var(--nai-green); border-color: var(--nai-green); border-radius: 9px; min-height: 44px; font-weight: 700; }
 [data-testid="stBaseButton-primary"]:hover { background: var(--nai-green-dark); border-color: var(--nai-green-dark); }
 [data-testid="stBaseButton-secondary"] { border-radius: 9px; min-height: 42px; font-weight: 650; }
-[data-testid="stTextInput"] input,
-[data-testid="stTextArea"] textarea,
-[data-testid="stNumberInput"] input,
-[data-baseweb="select"] > div {
+[data-testid="stTextInputRootElement"],
+[data-testid="stTextAreaRootElement"],
+[data-testid="stNumberInput"] [data-baseweb="input"],
+[data-testid="stSelectbox"] > .react-aria-ComboBox > div {
   min-height: 44px;
+  background-color: var(--nai-white) !important;
+  border: 1px solid #7f9088 !important;
   border-radius: 9px;
   font-size: 1rem;
+  color: var(--nai-ink) !important;
 }
+[data-testid="stTextInputField"] {
+  min-height: 42px;
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+  color: var(--nai-ink) !important;
+}
+[data-testid="stNumberInput"] input { min-height: 42px; background: transparent !important; border: 0 !important; box-shadow: none !important; color: var(--nai-ink) !important; }
+[data-testid="stTextInputRootElement"]:focus-within,
+[data-testid="stTextAreaRootElement"]:focus,
+[data-testid="stNumberInput"] [data-baseweb="input"]:focus-within,
+[data-testid="stSelectbox"] > .react-aria-ComboBox > div:focus-within {
+  border-color: var(--nai-green-dark) !important;
+  outline: 0;
+  box-shadow: 0 0 0 3px rgba(21, 155, 122, .2) !important;
+}
+[data-testid="stTextInputField"]::placeholder,
+[data-testid="stTextAreaRootElement"]::placeholder,
+[data-testid="stNumberInput"] input::placeholder,
+[data-testid="stSelectbox"] input::placeholder { color: #66766f !important; opacity: 1; }
+[data-testid="stSelectbox"] button { min-height: 44px; }
 [data-testid="stTextArea"] textarea { line-height: 1.45; }
 [data-testid="stWidgetLabel"] { color: #42544c; font-size: .95rem; font-weight: 650; }
 [data-testid="stAlert"] { border-radius: 10px; line-height: 1.5; }
@@ -94,6 +133,14 @@ p, [data-testid="stCaptionContainer"] { line-height: 1.5; }
   border-radius: 12px;
   background: #fff;
   margin: .4rem 0 1rem;
+}
+@media (max-width: 1200px) {
+  .st-key-status-summary [data-testid="stHorizontalBlock"] {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+    gap: .75rem !important;
+  }
+  .st-key-status-summary .stColumn { width: auto !important; min-width: 0 !important; flex: initial !important; }
 }
 @media (max-width: 760px) {
   div.block-container { padding: 1.15rem .9rem 2.2rem; }
