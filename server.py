@@ -9,6 +9,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import http.client
 import io
 import json
 import math
@@ -27,7 +28,7 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 from PIL import Image, ImageOps
 
 ROOT = Path(__file__).resolve().parent
@@ -210,6 +211,14 @@ def init_db(path: Path | str = DB_PATH) -> None:
             id INTEGER PRIMARY KEY, event TEXT NOT NULL, payload_json TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'queued_local', created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS telegram_bindings (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            chat_id TEXT UNIQUE NOT NULL, telegram_user_id TEXT NOT NULL, linked_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS telegram_pairings (
+            code_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT
+        );
         CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
         CREATE INDEX IF NOT EXISTS idx_orders_assignee_status ON orders(assigned_to,status);
         CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
@@ -228,6 +237,14 @@ def init_db(path: Path | str = DB_PATH) -> None:
             db.execute("ALTER TABLE photos ADD COLUMN perceptual_hash TEXT")
         if "color_signature" not in photo_columns:
             db.execute("ALTER TABLE photos ADD COLUMN color_signature TEXT")
+        telegram_columns = {r[1] for r in db.execute("PRAGMA table_info(telegram_outbox)")}
+        for name, definition in (("recipient_user_id", "INTEGER REFERENCES users(id) ON DELETE CASCADE"),
+                                 ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT"),
+                                  ("sent_at", "TEXT"), ("send_started_at", "TEXT"), ("last_error", "TEXT"), ("dedupe_key", "TEXT")):
+            if name not in telegram_columns:
+                db.execute(f"ALTER TABLE telegram_outbox ADD COLUMN {name} {definition}")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dedupe ON telegram_outbox(dedupe_key) WHERE dedupe_key IS NOT NULL")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_telegram_delivery ON telegram_outbox(status,next_attempt_at,id)")
         db.execute("UPDATE photos SET duplicate_type='exact' WHERE duplicate=1 AND duplicate_type='none'")
         db.execute("CREATE INDEX IF NOT EXISTS idx_photos_sha256 ON photos(sha256)")
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
@@ -407,11 +424,173 @@ def seed_demo(db: sqlite3.Connection) -> None:
 
 
 def audit(db: sqlite3.Connection, actor_id: int | None, order_id: int | None, event: str, payload: dict) -> None:
-    db.execute("INSERT INTO audit(actor_id,order_id,event,payload_json,created_at) VALUES (?,?,?,?,?)",
-               (actor_id, order_id, event, json.dumps(payload, ensure_ascii=False), iso()))
-    # Adapter boundary only: this row stays local and no Telegram API call is made.
-    db.execute("INSERT INTO telegram_outbox(event,payload_json,status,created_at) VALUES (?,?,?,?)",
-               (event, json.dumps({"order_id": order_id, **payload}, ensure_ascii=False), "queued_local", iso()))
+    cur = db.execute("INSERT INTO audit(actor_id,order_id,event,payload_json,created_at) VALUES (?,?,?,?,?)",
+                     (actor_id, order_id, event, json.dumps(payload, ensure_ascii=False), iso()))
+    queue_telegram_event(db, cur.lastrowid, order_id, event)
+
+
+TELEGRAM_EVENT_TEXT = {
+    "issued": ("worker", "Наряд выдан"), "reissue": ("worker", "Наряд выдан повторно"),
+    "reassigned": ("worker", "Наряд переназначен"), "accept": ("master", "Наряд принят исполнителем"),
+    "queue": ("master", "Наряд поставлен в очередь"), "reject": ("master", "Наряд отклонён; проверьте причину в системе"),
+    "start": ("master", "Исполнитель начал работу"), "pause": ("master", "Работа приостановлена; проверьте причину в системе"),
+    "resume": ("master", "Работа возобновлена"), "complete": ("master", "Исполнение отмечено; требуется проверка мастера"),
+    "ai_check": ("master", "Текстовый результат проверен; решение остаётся за мастером"),
+    "request_rework": ("worker", "Мастер запросил доработку"), "close": ("worker", "Мастер принял наряд"),
+    "acceptance_escalated": ("both", "Наряд не принят вовремя; проверьте систему"),
+    "deadline_reminder": ("both", "Приближается срок наряда"), "deadline_escalated": ("both", "Срок наряда просрочен"),
+    "deadline_repeat": ("both", "Наряд остаётся просроченным; проверьте систему"),
+}
+
+
+def telegram_delivery_configured() -> bool:
+    return (os.environ.get("NARYADAI_TELEGRAM_ENABLED", "").strip() == "1"
+            and bool(os.environ.get("NARYADAI_TELEGRAM_BOT_TOKEN", "").strip())
+            and bool(os.environ.get("NARYADAI_TELEGRAM_WEBHOOK_SECRET", "").strip()))
+
+
+def enqueue_telegram_message(db: sqlite3.Connection, recipient_user_id: int, event: str,
+                             message: str, dedupe_key: str) -> None:
+    db.execute("""INSERT OR IGNORE INTO telegram_outbox
+        (recipient_user_id,event,payload_json,status,created_at,dedupe_key)
+        VALUES (?,?,?,'queued_local',?,?)""",
+        (recipient_user_id, event, json.dumps({"text": message[:280]}, ensure_ascii=False), iso(), dedupe_key))
+
+
+def queue_telegram_event(db: sqlite3.Connection, audit_id: int, order_id: int | None, event: str) -> None:
+    """Queue only a small event template for authorized roles, never the audit payload/reason."""
+    template = TELEGRAM_EVENT_TEXT.get(event)
+    if not template or order_id is None:
+        return
+    order = db.execute("SELECT id,code,assigned_to,assigned_master_id,status FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not order:
+        return
+    audience, description = template
+    recipients = set()
+    if audience in ("worker", "both"):
+        recipients.add(order["assigned_to"])
+    if audience in ("master", "both"):
+        recipients.add(order["assigned_master_id"])
+    status_label = STATUS_LABELS.get(order["status"], "обновлён")
+    message = f"Наряд {order['code']}: {description}. Статус: {status_label}."
+    for recipient in recipients:
+        enqueue_telegram_message(db, recipient, event, message, f"audit:{audit_id}:user:{recipient}")
+
+
+def create_telegram_pairing(db: sqlite3.Connection, user_id: int) -> tuple[str, str]:
+    code = secrets.token_hex(6).upper()
+    created = utcnow()
+    expires = created + timedelta(minutes=10)
+    db.execute("DELETE FROM telegram_pairings WHERE user_id=?", (user_id,))
+    db.execute("INSERT INTO telegram_pairings(code_hash,user_id,created_at,expires_at) VALUES (?,?,?,?)",
+               (hashlib.sha256(code.encode()).hexdigest(), user_id, iso(created), iso(expires)))
+    return code, iso(expires)
+
+
+class TelegramRetry(Exception):
+    def __init__(self, delay_seconds: int):
+        self.delay_seconds = max(1, min(int(delay_seconds), 300))
+
+
+class TelegramRejected(Exception):
+    pass
+
+
+class TelegramUncertain(Exception):
+    pass
+
+
+class _NoTelegramRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def telegram_send_message(token: str, chat_id: str, text: str) -> None:
+    """Send one plain-text Bot API message; never log the token or response body."""
+    url = f"https://api.telegram.org/bot{quote(token, safe=':')}/sendMessage"
+    body = urlencode({"chat_id": chat_id, "text": text[:280], "disable_web_page_preview": "true"}).encode()
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+    opener = urllib.request.build_opener(_NoTelegramRedirect())
+    try:
+        with opener.open(request, timeout=5) as response:
+            result = json.loads(response.read(32_000))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            try: delay = int(json.loads(exc.read(32_000)).get("parameters", {}).get("retry_after", 5))
+            except (ValueError, TypeError, AttributeError): delay = 5
+            raise TelegramRetry(delay) from None
+        if 400 <= exc.code < 500:
+            raise TelegramRejected() from None
+        raise TelegramUncertain() from None
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        raise TelegramUncertain() from None
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        error = result.get("error_code") if isinstance(result, dict) else None
+        if error == 429:
+            try: delay = int(result.get("parameters", {}).get("retry_after", 5))
+            except (ValueError, TypeError, AttributeError): delay = 5
+            raise TelegramRetry(delay)
+        raise TelegramRejected()
+
+
+def deliver_telegram_once(db_path: Path | str, sender=None) -> bool:
+    """Claim and deliver one queue item. Only known 429 rejection is retried."""
+    if not telegram_delivery_configured():
+        return False
+    token = os.environ["NARYADAI_TELEGRAM_BOT_TOKEN"].strip()
+    with connect(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("UPDATE telegram_outbox SET status='uncertain',last_error='worker_restart_uncertain',send_started_at=NULL "
+                   "WHERE status='sending' AND send_started_at<?", (iso(utcnow()-timedelta(seconds=60)),))
+        db.execute("UPDATE telegram_outbox SET status='expired',last_error='expired_before_delivery' "
+                   "WHERE status IN ('queued_local','retrying') AND created_at<?", (iso(utcnow()-timedelta(hours=24)),))
+        row = db.execute("""SELECT q.*,b.chat_id FROM telegram_outbox q
+            JOIN telegram_bindings b ON b.user_id=q.recipient_user_id
+            JOIN users u ON u.id=q.recipient_user_id AND u.is_active=1
+            WHERE q.status IN ('queued_local','retrying') AND (q.next_attempt_at IS NULL OR q.next_attempt_at<=?)
+            ORDER BY q.id LIMIT 1""", (iso(),)).fetchone()
+        if not row:
+            db.commit(); return False
+        db.execute("UPDATE telegram_outbox SET status='sending',attempts=attempts+1,next_attempt_at=NULL,send_started_at=? WHERE id=?", (iso(),row["id"]))
+        db.commit()
+    try:
+        (sender or telegram_send_message)(token, row["chat_id"], json.loads(row["payload_json"]).get("text", ""))
+        status, err, next_at = "delivered", None, None
+    except TelegramRetry as exc:
+        with connect(db_path) as db:
+            attempts = db.execute("SELECT attempts FROM telegram_outbox WHERE id=?", (row["id"],)).fetchone()[0]
+            if attempts < 4:
+                status, err, next_at = "retrying", "provider_rate_limit", iso(utcnow()+timedelta(seconds=exc.delay_seconds))
+            else:
+                status, err, next_at = "failed", "retry_limit", None
+    except TelegramRejected:
+        status, err, next_at = "failed", "provider_rejected", None
+    except Exception:
+        # A transport timeout can happen after Telegram accepted a message. Do not retry blindly.
+        status, err, next_at = "uncertain", "delivery_uncertain", None
+    with connect(db_path) as db:
+        db.execute("UPDATE telegram_outbox SET status=?,last_error=?,next_attempt_at=?,sent_at=?,send_started_at=NULL WHERE id=?",
+                   (status, err, next_at, iso() if status == "delivered" else None, row["id"]))
+        db.commit()
+    return True
+
+
+def telegram_delivery_loop(db_path: Path, stopped: threading.Event) -> None:
+    while not stopped.wait(1):
+        if not telegram_delivery_configured():
+            try:
+                with connect(db_path) as db:
+                    db.execute("UPDATE telegram_outbox SET status='uncertain',last_error='worker_restart_uncertain',send_started_at=NULL "
+                               "WHERE status='sending' AND send_started_at<?", (iso(utcnow()-timedelta(seconds=60)),))
+                    db.commit()
+            except Exception:
+                pass
+            continue
+        try:
+            for _ in range(10):
+                if not deliver_telegram_once(db_path): break
+        except Exception:
+            continue
 
 
 def notify(db: sqlite3.Connection, user_ids: set[int], order_id: int, message: str) -> None:
@@ -475,47 +654,97 @@ def bounded_setting(name: str, default: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
-def llm_review(text: str, context: dict | None = None) -> dict:
-    """OpenAI-compatible adapter via explicit environment settings; never fabricates an AI result."""
-    endpoint = os.environ.get("NARYADAI_LLM_API_URL", "").strip()
+GEMINI_OPENAI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+LLM_REVIEW_SCHEMA = {
+    "type":"object", "additionalProperties":False,
+    "properties":{"verdict":{"type":"string","enum":["accepted","comments","rework"]},
+                  "summary":{"type":"string"},"issues":{"type":"array","items":{"type":"string"}},
+                  "confidence":{"type":"number","minimum":0,"maximum":1},
+                  "needs_master_attention":{"type":"boolean"}},
+    "required":["verdict","summary","issues","confidence","needs_master_attention"]}
+LLM_SUMMARY_SCHEMA = {"type":"object","additionalProperties":False,
+    "properties":{"summary":{"type":"string"}},"required":["summary"]}
+
+
+def llm_settings() -> tuple[str, str, str] | None:
+    if os.environ.get("NARYADAI_LLM_ENABLED", "").strip() != "1":
+        return None
+    endpoint = os.environ.get("NARYADAI_LLM_API_URL", "").strip() or GEMINI_OPENAI_ENDPOINT
     key = os.environ.get("NARYADAI_LLM_API_KEY", "").strip()
     model = os.environ.get("NARYADAI_LLM_MODEL", "").strip()
-    if not endpoint or not key or not model:
-        return rules_review(text, "rules-only: configuration_missing")
+    if not endpoint.startswith("https://") or not key or not model:
+        return None
+    return endpoint, key, model
+
+
+def llm_json_completion(prompt: str, schema_name: str, schema: dict) -> tuple[dict, str]:
+    settings = llm_settings()
+    if not settings:
+        raise ValueError("configuration_unavailable")
+    endpoint, key, model = settings
+    response_format = {"type":"json_schema", "json_schema":{"name":schema_name,"strict":True,"schema":schema}}
+    body = json.dumps({"model":model,"messages":[{"role":"user","content":prompt}],
+                       "response_format":response_format},ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(endpoint,data=body,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},method="POST")
+    try:
+        with urllib.request.build_opener(_NoTelegramRedirect()).open(req,timeout=12) as response:
+            result = json.loads(response.read(128_000))
+    except urllib.error.HTTPError:
+        raise ValueError("provider_http_error") from None
+    content = result["choices"][0]["message"]["content"]
+    parsed = json.loads(content) if isinstance(content,str) else content
+    if not isinstance(parsed,dict):
+        raise ValueError("unexpected_json_shape")
+    return parsed, model
+
+
+def llm_review(text: str, context: dict | None = None) -> dict:
+    """Explicitly enabled OpenAI-compatible/Gemini adapter; validation fails closed to rules-only."""
+    has_config = bool(os.environ.get("NARYADAI_LLM_API_KEY", "").strip() or os.environ.get("NARYADAI_LLM_MODEL", "").strip())
+    if os.environ.get("NARYADAI_LLM_ENABLED", "").strip() != "1":
+        mode = "rules-only: disabled" if has_config else "rules-only: configuration_missing"
+        return rules_review(text, mode)
+    if not llm_settings():
+        return rules_review(text, "rules-only: incomplete_configuration")
     prompt = ("Проверь только текст отчёта ремонтного наряда: ясность, выполненную работу, результат, полноту и внутренние противоречия. "
               "Выбери verdict из accepted, comments, rework. Не оценивай допуск к опасной работе, безопасность оборудования, пригодность к пуску "
-              "или право выполнять работу. Отсутствие обязательных фото/материалов будет проверено серверными правилами отдельно. "
-              "Ответь JSON-объектом: verdict, summary, issues (массив строк), confidence (число 0..1 о надёжности именно текстовой проверки) "
-              "и needs_master_attention (boolean). Если уверенность низкая или недостаточно данных, снизь confidence. Это подсказка, мастер решает окончательно. "
-              "Не делай выводов о безопасности или соответствии нормам, если нормы не переданы.\n\nДанные наряда:\n" +
-              json.dumps(context or {},ensure_ascii=False)[:3000] + "\n\nТекст отчёта:\n" + text[:8000])
-    body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}], "response_format": {"type": "json_object"}}, ensure_ascii=False).encode()
-    req = urllib.request.Request(endpoint, data=body, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
+              "или право выполнять работу. Отсутствие обязательных фото/материалов проверяется серверными правилами отдельно. "
+              "Это только подсказка по тексту; мастер решает окончательно. Не придумывай нормы и не делай выводов о безопасности.\n\nТолько текст отчёта:\n" + text[:8000])
     try:
-        with urllib.request.urlopen(req, timeout=18) as response:
-            result = json.loads(response.read(128_000))
-        content = result["choices"][0]["message"]["content"]
-        parsed = json.loads(content) if isinstance(content, str) else content
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
-            raise ValueError("unexpected response shape")
-        parsed["mode"] = f"llm:{model}"
-        parsed["summary"] = parsed["summary"][:4000]
-        if not isinstance(parsed.get("issues", []), list) or any(not isinstance(item, str) for item in parsed.get("issues", [])):
-            raise ValueError("unexpected issue shape")
-        parsed["issues"] = [item[:1000] for item in parsed.get("issues", [])[:20]]
-        try:
-            confidence = float(parsed.get("confidence"))
-            if not 0 <= confidence <= 1: raise ValueError("confidence out of range")
-            parsed["confidence"] = confidence
-        except (TypeError, ValueError):
-            parsed["confidence"] = 0.0
-            parsed["confidence_missing"] = True
-        if parsed.get("verdict") not in {"accepted", "comments", "rework"}:
-            parsed["verdict"] = "comments" if parsed["issues"] else "accepted"
-        return parsed
-    except (urllib.error.URLError, TimeoutError, ValueError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-        # No claim of AI success when remote call fails.
-        return rules_review(text, "rules-only: adapter_error", note=type(exc).__name__)
+        parsed, model = llm_json_completion(prompt,"naryadai_text_review",LLM_REVIEW_SCHEMA)
+        required = set(LLM_REVIEW_SCHEMA["required"])
+        if set(parsed) != required or parsed.get("verdict") not in {"accepted","comments","rework"}:
+            raise ValueError("unexpected_fields_or_verdict")
+        if not isinstance(parsed["summary"],str) or not parsed["summary"].strip():
+            raise ValueError("invalid_summary")
+        if not isinstance(parsed["issues"],list) or len(parsed["issues"])>20 or any(not isinstance(item,str) for item in parsed["issues"]):
+            raise ValueError("invalid_issues")
+        confidence = parsed["confidence"]
+        if isinstance(confidence,bool) or not isinstance(confidence,(int,float)) or not math.isfinite(confidence) or not 0<=confidence<=1:
+            raise ValueError("invalid_confidence")
+        if not isinstance(parsed["needs_master_attention"],bool):
+            raise ValueError("invalid_master_flag")
+        issues = [item[:1000] for item in parsed["issues"]]
+        result = {"mode":f"llm:{model}","verdict":parsed["verdict"],"summary":parsed["summary"][:4000],
+                  "issues":issues,"confidence":float(confidence),
+                  "needs_master_attention":bool(parsed["needs_master_attention"] or parsed["verdict"]!="accepted" or issues or confidence<0.55)}
+        return result
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError,
+            KeyError, IndexError, TypeError, OverflowError, json.JSONDecodeError) as exc:
+        return rules_review(text,"rules-only: adapter_error",note=type(exc).__name__)
+
+
+def llm_report_summary(aggregate: dict) -> tuple[str, str]:
+    settings = llm_settings()
+    if not settings:
+        raise ValueError("configuration_unavailable")
+    prompt = ("Составь короткое резюме производственного отчёта на русском языке. Используй только переданные агрегированные счётчики; "
+              "не придумывай причины, оценку безопасности или рекомендации по допуску. Данные синтетические. Ответь только по заданной JSON-схеме.\n"+
+              json.dumps(aggregate,ensure_ascii=False,sort_keys=True))
+    parsed, model = llm_json_completion(prompt,"naryadai_aggregate_summary",LLM_SUMMARY_SCHEMA)
+    if set(parsed) != {"summary"} or not isinstance(parsed["summary"],str) or not parsed["summary"].strip():
+        raise ValueError("invalid_summary")
+    return parsed["summary"][:1200], f"llm:{model}"
 
 
 def rules_review(text: str, mode: str, note: str | None = None) -> dict:
@@ -865,11 +1094,17 @@ class AppHandler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path == "/api/login":
                 return self.login()
+            if path == "/api/telegram/webhook":
+                return self.telegram_webhook()
             user = self.require_auth()
             if user["role"] == "manager" and path != "/api/logout":
                 raise ApiError(403,"Кабинет руководителя доступен только для просмотра")
             if path == "/api/logout":
                 return self.logout(user)
+            if path == "/api/telegram/pair":
+                return self.telegram_pair(user)
+            if path == "/api/telegram/unpair":
+                return self.telegram_unpair(user)
             match = re.fullmatch(r"/api/orders/(\d+)/action", path)
             if match:
                 return self.order_action(user, int(match.group(1)))
@@ -901,6 +1136,81 @@ class AppHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.log_error("POST failed: %s", type(exc).__name__)
             self.send_json({"error": "Внутренняя ошибка сервера"}, 500)
+
+    def telegram_status(self, db: sqlite3.Connection, user: sqlite3.Row) -> None:
+        binding = db.execute("SELECT linked_at FROM telegram_bindings WHERE user_id=?", (user["id"],)).fetchone()
+        counts = {r["status"]: r["n"] for r in db.execute(
+            "SELECT status,COUNT(*) AS n FROM telegram_outbox WHERE recipient_user_id=? GROUP BY status", (user["id"],))}
+        self.send_json({"enabled": telegram_delivery_configured(), "paired": bool(binding),
+                        "linked_at": binding["linked_at"] if binding else None,
+                        "delivery_counts": counts, "pairing_ttl_minutes": 10})
+
+    def telegram_pair(self, user: sqlite3.Row) -> None:
+        if user["role"] not in ("master", "worker"):
+            raise ApiError(403, "Для этой роли привязка недоступна")
+        if not telegram_delivery_configured():
+            raise ApiError(409, "Telegram выключен или его настройки не заданы")
+        with connect(self.server.db_path) as db:
+            code, expires_at = create_telegram_pairing(db, user["id"])
+            audit(db, user["id"], None, "telegram_pairing_created", {"expires_at": expires_at})
+            db.commit()
+        self.send_json({"pairing_code": code, "command": f"/start {code}", "expires_at": expires_at,
+                        "single_use": True})
+
+    def telegram_unpair(self, user: sqlite3.Row) -> None:
+        with connect(self.server.db_path) as db:
+            db.execute("DELETE FROM telegram_bindings WHERE user_id=?", (user["id"],))
+            db.execute("DELETE FROM telegram_pairings WHERE user_id=?", (user["id"],))
+            audit(db, user["id"], None, "telegram_unpaired", {})
+            db.commit()
+        self.send_json({"ok": True})
+
+    def telegram_webhook(self) -> None:
+        if not telegram_delivery_configured():
+            return self.send_json({"error": "not found"}, 404)
+        expected = os.environ["NARYADAI_TELEGRAM_WEBHOOK_SECRET"].strip()
+        supplied = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(supplied, expected):
+            return self.send_json({"error": "not found"}, 404)
+        try:
+            update = self.read_json(32_000)
+        except ApiError:
+            return self.send_json({"ok": True})
+        message = update.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("text"), str):
+            return self.send_json({"ok": True})
+        chat = message.get("chat") or {}; sender = message.get("from") or {}
+        if not isinstance(chat, dict) or not isinstance(sender, dict):
+            return self.send_json({"ok": True})
+        if chat.get("type") != "private" or not isinstance(chat.get("id"), int) or chat.get("id") <= 0:
+            return self.send_json({"ok": True})
+        if not isinstance(sender.get("id"), int) or sender.get("is_bot") is True or sender.get("id") != chat.get("id"):
+            return self.send_json({"ok": True})
+        match = re.fullmatch(r"/start(?:@[A-Za-z0-9_]{1,32})?\s+([A-F0-9]{12})", message["text"].strip())
+        if not match:
+            return self.send_json({"ok": True})
+        chat_id = str(chat["id"]); code_hash = hashlib.sha256(match.group(1).encode()).hexdigest()
+        with connect(self.server.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            pairing = db.execute("SELECT * FROM telegram_pairings WHERE code_hash=? AND consumed_at IS NULL", (code_hash,)).fetchone()
+            expires = parse_time(pairing["expires_at"]) if pairing else None
+            account = db.execute("SELECT role,is_active FROM users WHERE id=?", (pairing["user_id"],)).fetchone() if pairing else None
+            if pairing and expires and expires > utcnow() and account and account["is_active"] and account["role"] in ("master", "worker"):
+                try:
+                    db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
+                               "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
+                               (pairing["user_id"], chat_id, chat_id, iso()))
+                    db.execute("UPDATE telegram_pairings SET consumed_at=? WHERE code_hash=? AND consumed_at IS NULL", (iso(), code_hash))
+                    enqueue_telegram_message(db, pairing["user_id"], "pair_linked",
+                                             "Telegram привязан к НарядAI. Уведомления содержат только код и статус наряда.",
+                                             f"pair:{pairing['user_id']}:{chat_id}")
+                    audit(db, pairing["user_id"], None, "telegram_paired", {})
+                    db.commit()
+                except sqlite3.IntegrityError:
+                    db.rollback()
+            else:
+                db.rollback()
+        self.send_json({"ok": True})
 
     def login(self) -> None:
         body = self.read_json(20_000)
@@ -942,6 +1252,8 @@ class AppHandler(BaseHTTPRequestHandler):
             maybe_escalate(db)
             if path == "/api/bootstrap":
                 return self.bootstrap(db, user)
+            if path == "/api/telegram/status":
+                return self.telegram_status(db, user)
             if path == "/api/reports":
                 return self.reports(db, user)
             if path == "/api/audit":
@@ -1108,14 +1420,28 @@ class AppHandler(BaseHTTPRequestHandler):
         closed = sum(1 for r in items if r["status"] == "closed")
         summary_text = (f"За {start_day} — {end_day} завершено {closed} из {len(items)} нарядов; трудозатраты {hours} ч" +
                         (f"; чаще указан код {top['fault_code']} на {top['equipment']}" if top and top["fault_code"] else "."))
+        summary_mode = "rules-only"
+        llm_summary_available = (user["role"] in ("master", "manager") and len(items) >= 5
+            and os.environ.get("NARYADAI_LLM_REPORT_SUMMARY", "").strip() == "1" and bool(llm_settings()))
+        if query.get("include_ai_summary", [""])[0] == "1" and llm_summary_available:
+            # Only counts and totals leave the server; no report text, names, equipment, fault codes or rows.
+            aggregate = {"date_from":start_day,"date_to":end_day,"period_days":days,"brigade_filter":brigade or "all",
+                         "shift_filter":shift_code or "all","issued":issued,"completed":len(items),"closed":closed,
+                         "labor_hours":hours,"late_completions":late,"current_overdue_orders":overdue,"pause_minutes":pause_total}
+            try:
+                summary_text, summary_mode = llm_report_summary(aggregate)
+            except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError,
+                    KeyError, IndexError, TypeError, OverflowError, json.JSONDecodeError):
+                summary_mode = "rules-only: adapter_error"
         summary = {"date_from":start_day,"date_to":end_day,"period_days":days,"brigade":brigade or "все",
                    "shift_code":shift_code or "все","shift_is_synthetic":True,"issued":issued,"completed":len(items),
                    "closed":closed,"labor_hours":hours,"late_completions":late,"current_overdue_orders":overdue,
                    "pause_minutes":pause_total,"pause_minutes_note":"Пауза вычислена только по событиям журнала и не является подтверждённым простоем оборудования.",
-                   "synthetic":True,"summary_mode":"rules-only"}
+                    "synthetic":True,"summary_mode":summary_mode}
         for group in worker_totals.values(): group["labor_hours"] = round(group["labor_hours"], 2)
         return self.send_json({"summary":summary,"items":items,"worker_totals":list(worker_totals.values()),
-                               "material_totals":list(materials.values()),"ai_summary":summary_text})
+                               "material_totals":list(materials.values()),"ai_summary":summary_text,
+                               "ai_summary_mode":summary_mode,"ai_summary_available":llm_summary_available})
 
     def order_history(self, db: sqlite3.Connection, order_id: int, user: sqlite3.Row) -> list[dict]:
         rows = db.execute("""SELECT a.event,a.payload_json,a.created_at,u.display_name AS actor_name
@@ -1637,6 +1963,8 @@ def main() -> None:
     stopped = threading.Event()
     timer = threading.Thread(target=watchdog_loop,args=(server.db_path,stopped),daemon=True,name="naryadai-watchdog")
     timer.start()
+    telegram_worker = threading.Thread(target=telegram_delivery_loop,args=(server.db_path,stopped),daemon=True,name="naryadai-telegram")
+    telegram_worker.start()
     print(f"НарядAI доступен: http://{args.host}:{args.port}")
     print("Демо-пароль для всех аккаунтов: demo123 · демоданные полностью синтетические")
     try: server.serve_forever(poll_interval=0.25)
