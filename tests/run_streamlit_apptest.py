@@ -6,6 +6,7 @@ import logging
 import os
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,7 @@ LABELS = {
     "close": _u("041f 0440 0438 043d 044f 0442 044c 0020 0438 0020 0437 0430 043a 0440 044b 0442 044c"),
     "save_rating": _u("0421 043e 0445 0440 0430 043d 0438 0442 044c 0020 043e 0446 0435 043d 043a 0443"),
     "make_report": _u("0421 0444 043e 0440 043c 0438 0440 043e 0432 0430 0442 044c"),
+    "register_downtime": "Сохранить интервал",
     "section": _u("0420 0430 0437 0434 0435 043b"),
 }
 
@@ -121,6 +123,11 @@ class StreamlitApiAppTest(unittest.TestCase):
         self.assertTrue(any(item.label == LABELS["create"] for item in master.button))
         self.assertFalse(any(item.label == LABELS["create"] for item in worker.button))
         self.assertFalse(any(item.label == LABELS["create"] for item in manager.button))
+        worker_metrics = {item.label for item in worker.metric}
+        self.assertIn("Рейтинг / 100", worker_metrics)
+        worker_frames = [item.value for item in worker.dataframe if hasattr(item.value, "columns")]
+        self.assertTrue(any({"Фактор", "Значение / 100", "Базовый вес, %"}.issubset(frame.columns) for frame in worker_frames))
+        self.assertTrue(any({"Отказы — события", "Обоснованы мастером", "Необоснованы мастером", "Pending · ждут решения мастера"}.issubset(frame.columns) for frame in worker_frames))
         dashboard_metrics = {item.label for item in manager.metric}
         self.assertTrue({"Ожидают", "Приняты / в работе", "Проверка / доработка", "Закрыты мастером"}.issubset(dashboard_metrics))
 
@@ -134,12 +141,44 @@ class StreamlitApiAppTest(unittest.TestCase):
         self.assertEqual(denied.status_code, 403)
 
         section = next(item for item in manager.radio if item.label == LABELS["section"])
+        section.set_value(section.options[1]).run()
+        self.assertFalse(manager.exception, self.exceptions(manager))
+        team_frames = [item.value for item in manager.dataframe if hasattr(item.value, "columns")]
+        self.assertTrue(any("Общий рейтинг / 100" in frame.columns for frame in team_frames))
+        self.assertTrue(any("Качество закрытых нарядов" in frame.columns for frame in team_frames))
+        self.assertTrue(any("Pending · ждут решения мастера" in frame.columns for frame in team_frames))
+
         section.set_value(section.options[-1]).run()
         self.assertFalse(manager.exception, self.exceptions(manager))
         self.click(manager, "make_report")
         self.assertGreaterEqual(len(manager.dataframe), 3)
         report_metrics = {item.label for item in manager.metric}
-        self.assertTrue({"Исполнено", "Закрыто мастером", "Просрочено", "Трудозатраты, ч"}.issubset(report_metrics))
+        self.assertTrue({"Исполнено", "Закрыто мастером", "Просрочено", "Трудозатраты, ч", "Отказы по событиям"}.issubset(report_metrics))
+
+    def test_master_registers_equipment_downtime_from_streamlit_report(self) -> None:
+        master=self.new_app("master01","master")
+        section=next(item for item in master.radio if item.label==LABELS["section"])
+        section.set_value(section.options[-1]).run()
+        self.assertFalse(master.exception,self.exceptions(master))
+        equipment=next(item for item in master.selectbox if item.label=="Оборудование")
+        now_utc=datetime.now(timezone.utc).replace(second=0,microsecond=0)
+        started=now_utc-timedelta(hours=2);ended=now_utc-timedelta(hours=1)
+        equipment.set_value(equipment.options[0])
+        dates={item.label:item for item in master.date_input}
+        dates["Начало · дата UTC"].set_value(started.date())
+        dates["Окончание · дата UTC"].set_value(ended.date())
+        clocks={item.label:item for item in master.time_input}
+        clocks["Начало · время UTC"].set_value(started.time())
+        clocks["Окончание · время UTC"].set_value(ended.time())
+        reason=next(item for item in master.text_input if item.label=="Причина регистрации")
+        reason.set_value("Synthetic maintenance stop")
+        master.run()
+        self.assertFalse(master.exception,self.exceptions(master))
+        self.click(master,"register_downtime")
+        params=f"date_from={started.date().isoformat()}&date_to={ended.date().isoformat()}"
+        data=self.api_json(master,"/api/equipment/downtime?"+params)
+        self.assertGreaterEqual(data["minutes"],60)
+        self.assertTrue(any(item["reason"]=="Synthetic maintenance stop" for item in data["intervals"]))
 
     def test_area_change_refreshes_equipment_before_form_submission(self) -> None:
         master = self.new_app("master01", "master")

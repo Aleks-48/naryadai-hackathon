@@ -6,6 +6,7 @@ import io
 import http.cookiejar
 import json
 import os
+import sqlite3
 import struct
 import tempfile
 import threading
@@ -102,6 +103,69 @@ class RuntimeConfigurationTest(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, {"NARYADAI_HOST":"0.0.0.0", "NARYADAI_PORT":"8765", "PORT":"10000"}):
             self.assertEqual(app.default_server_host(), "0.0.0.0")
             self.assertEqual(app.default_server_port(), 8765)
+
+    def test_legacy_equipment_table_migrates_idempotently_without_losing_rows(self):
+        with tempfile.TemporaryDirectory(prefix="naryadai-legacy-") as temp:
+            root = Path(temp)
+            db_path = root / "legacy.sqlite3"
+            legacy=sqlite3.connect(db_path)
+            try:
+                legacy.execute("CREATE TABLE equipment(id INTEGER PRIMARY KEY,code TEXT UNIQUE NOT NULL,name TEXT NOT NULL,area_id INTEGER NOT NULL)")
+                legacy.execute("INSERT INTO equipment(id,code,name,area_id) VALUES (77,'LEGACY-77','Старый актив',1)")
+                legacy.execute("INSERT INTO equipment(id,code,name,area_id) VALUES (78,'EQ-999','Щековая дробилка 01',1)")
+                legacy.commit()
+            finally:
+                legacy.close()
+            original_media = app.MEDIA
+            app.MEDIA = root / "media"
+            try:
+                app.init_db(db_path)
+                with app.connect(db_path) as upgraded:
+                    upgraded.execute("UPDATE equipment SET equipment_type='unknown' WHERE code='EQ-001'")
+                    # Simulate the broad code/name heuristic from the previous app version.
+                    upgraded.execute("UPDATE equipment SET equipment_type='crusher' WHERE code='EQ-999'")
+                    upgraded.commit()
+                app.init_db(db_path)
+                with app.connect(db_path) as migrated:
+                    self.assertEqual(tuple(migrated.execute("SELECT code,name FROM equipment WHERE id=77").fetchone()),
+                                     ("LEGACY-77","Старый актив"))
+                    legacy=migrated.execute("SELECT equipment_type FROM equipment WHERE id=77").fetchone()
+                    self.assertEqual(legacy["equipment_type"],"unknown")
+                    self.assertEqual(migrated.execute("SELECT equipment_type FROM equipment WHERE id=78").fetchone()[0],"unknown")
+                    self.assertEqual(migrated.execute("SELECT equipment_type FROM equipment WHERE code='EQ-001'").fetchone()[0],"crusher")
+                    self.assertEqual(migrated.execute("SELECT COUNT(*) FROM equipment_downtime").fetchone()[0],0)
+                    self.assertEqual(migrated.execute("SELECT COUNT(*) FROM norm_catalog").fetchone()[0],20)
+                    self.assertIn("idempotency_key",{row[1] for row in migrated.execute("PRAGMA table_info(equipment_downtime)")})
+            finally:
+                app.MEDIA = original_media
+
+    def test_equipment_downtime_shift_windows_clip_and_count_once(self):
+        start=app.datetime(2026,10,4,tzinfo=app.timezone.utc)
+        end=start+timedelta(days=1)
+        row={"equipment_id":1,"equipment_code":"EQ-TEST","equipment":"Synthetic asset",
+             "started_at":app.iso(start),"ended_at":app.iso(end),"reason":"Synthetic test",
+             "recorded_by":"Master","created_at":app.iso(start)}
+        self.assertEqual(app.summarize_equipment_downtime([row],start,end)["minutes"],1440)
+        for shift in ("A","B","C"):
+            result=app.summarize_equipment_downtime([row],start,end,shift)
+            self.assertEqual(result["minutes"],480,shift)
+
+        short_rows=[]
+        for index in range(3):
+            left=start+timedelta(minutes=index*2)
+            short_rows.append({**row,"started_at":app.iso(left),"ended_at":app.iso(left+timedelta(seconds=40))})
+        short_summary=app.summarize_equipment_downtime(short_rows,start,end)
+        self.assertEqual(short_summary["minutes"],2)
+        self.assertEqual(short_summary["equipment"][0]["downtime_minutes"],2)
+
+        split_start=start+timedelta(hours=5,minutes=59,seconds=30)
+        split_row={**row,"started_at":app.iso(split_start),"ended_at":app.iso(split_start+timedelta(seconds=60))}
+        whole=app.summarize_equipment_downtime([split_row],start,end)["minutes"]
+        shift_c=app.summarize_equipment_downtime([split_row],start,end,"C")["minutes"]
+        shift_a=app.summarize_equipment_downtime([split_row],start,end,"A")["minutes"]
+        self.assertEqual(whole,1)
+        self.assertEqual((shift_c,shift_a),(0.5,0.5))
+        self.assertEqual(shift_c+shift_a,whole)
 
 
 class LocalAPITest(unittest.TestCase):
@@ -440,6 +504,29 @@ class LocalAPITest(unittest.TestCase):
             self.assertEqual(score["factors"]["unjustified_refusal"],100.0)
             self.assertEqual(score["evidence"]["unjustified_rejections"],0)
 
+        pending_order=self.create_order(master)
+        self.assertEqual(self.action(worker,pending_order["id"],"reject",reason="Awaiting master review")[0],200)
+        with app.connect(self.db_path) as db:
+            pending_score=app.worker_rating(db,self.worker_id)
+        self.assertEqual(pending_score["evidence"]["rejections"],score["evidence"]["rejections"]+1)
+        self.assertEqual(pending_score["evidence"]["classified_rejections"],score["evidence"]["classified_rejections"])
+        self.assertEqual(pending_score["evidence"]["pending_rejections"],score["evidence"]["pending_rejections"]+1)
+        self.assertEqual(pending_score["evidence"]["justified_rejections"],score["evidence"]["justified_rejections"])
+        self.assertEqual(pending_score["evidence"]["unjustified_rejections"],score["evidence"]["unjustified_rejections"])
+        self.assertEqual(pending_score["factors"]["unjustified_refusal"],score["factors"]["unjustified_refusal"])
+
+        self.assertEqual(master.call(f"/api/orders/{pending_order['id']}/rating","POST",{
+            "unjustified_refusal":True,"reason":"Master review found no basis for refusal."})[0],200)
+        with app.connect(self.db_path) as db:
+            classified_score=app.worker_rating(db,self.worker_id)
+        self.assertEqual(classified_score["evidence"]["classified_rejections"],pending_score["evidence"]["classified_rejections"]+1)
+        self.assertEqual(classified_score["evidence"]["unjustified_rejections"],pending_score["evidence"]["unjustified_rejections"]+1)
+        self.assertEqual(classified_score["evidence"]["justified_rejections"],pending_score["evidence"]["justified_rejections"])
+        self.assertEqual(classified_score["evidence"]["pending_rejections"],pending_score["evidence"]["pending_rejections"]-1)
+        expected_factor=round((1-classified_score["evidence"]["unjustified_rejections"]/
+            classified_score["evidence"]["classified_rejections"])*100,1)
+        self.assertEqual(classified_score["factors"]["unjustified_refusal"],expected_factor)
+
     def test_model_low_confidence_explicitly_requires_master(self):
         model={"mode":"external-test","summary":"test","issues":[],"verdict":"accepted","confidence":0.35}
         with unittest.mock.patch.object(app,"llm_review",return_value=model):
@@ -752,6 +839,38 @@ class LocalAPITest(unittest.TestCase):
         self.assertTrue(profile["user"]["specialty"])
         self.assertEqual(profile["my_rating"]["period_from"],"2026-09-01")
 
+        # Refusal totals follow audit event time and shift, not the worker profile schedule.
+        today=app.utcnow().date().isoformat()
+        report_url=f"/api/reports?date_from={today}&date_to={today}&shift_code=A"
+        baseline=worker.call(report_url)[1]["summary"]["refusals"]
+        manager=self.client("manager")
+        manager_baseline=manager.call(report_url)[1]["summary"]["refusals"]
+        refused=self.create_order(master)
+        self.assertEqual(self.action(worker,refused["id"],"reject",reason="Synthetic test refusal")[0],200)
+        cancelled=self.create_order(master)
+        self.assertEqual(self.action(master,cancelled["id"],"cancel",reason="Synthetic test cancellation")[0],200)
+        event_time=f"{today}T07:30:00Z"  # Synthetic UTC shift A regardless of profile shift.
+        with app.connect(self.db_path) as db:
+            original_shift=db.execute("SELECT shift_code FROM users WHERE id=?",(self.worker_id,)).fetchone()[0]
+        def restore_shift():
+            with app.connect(self.db_path) as db:
+                db.execute("UPDATE users SET shift_code=? WHERE id=?",(original_shift,self.worker_id))
+                db.commit()
+        self.addCleanup(restore_shift)
+        with app.connect(self.db_path) as db:
+            db.execute("UPDATE users SET shift_code='B' WHERE id=?",(self.worker_id,))
+            db.execute("UPDATE audit SET created_at=? WHERE order_id=? AND event='reject'",(event_time,refused["id"]))
+            db.execute("UPDATE audit SET created_at=? WHERE order_id=? AND event='cancel'",(event_time,cancelled["id"]))
+            db.commit()
+        by_event_shift=worker.call(report_url)
+        self.assertEqual(by_event_shift[0],200,by_event_shift[1])
+        self.assertEqual(by_event_shift[1]["summary"]["refusals"],baseline+1)
+        self.assertEqual(by_event_shift[1]["summary"]["refusal_basis"],"audit_event.created_at_utc")
+        self.assertEqual(worker.call(report_url.replace("shift_code=A","shift_code=B"))[1]["summary"]["refusals"],baseline)
+        manager_report=manager.call(report_url)
+        self.assertEqual(manager_report[0],200,manager_report[1])
+        self.assertEqual(manager_report[1]["summary"]["refusals"],manager_baseline+1)
+
     def test_pwa_shell_has_mobile_and_offline_assets(self):
         for path in ("/","/sw.js","/static/app.js","/static/styles.css","/static/sw.js","/static/manifest.webmanifest","/static/icon-192.png","/static/icon-512.png"):
             request=urllib.request.Request(self.base+path)
@@ -762,7 +881,7 @@ class LocalAPITest(unittest.TestCase):
                 if path=="/": self.assertIn("manifest.webmanifest",body)
                 if path=="/sw.js":
                     self.assertIn("cache.addAll",body)
-                    self.assertIn("naryadai-shell-v5",body)
+                    self.assertIn("naryadai-shell-v7",body)
                 if path.endswith("styles.css"): self.assertIn("max-width:760px",body)
                 if path.endswith("/manifest.webmanifest"):
                     manifest=json.loads(body)
@@ -935,6 +1054,199 @@ class LocalAPITest(unittest.TestCase):
                 db.execute("UPDATE users SET is_active=1 WHERE id=?",(self.worker_id,))
                 db.execute("DELETE FROM telegram_outbox WHERE event='inactive_recipient_test'")
                 db.commit()
+
+    def test_equipment_downtime_permissions_idempotency_and_non_overlapping_report(self):
+        master=self.client("master01");worker=self.client("worker01");manager=self.client("manager")
+        with app.connect(self.db_path) as db:
+            equipment_ids=[row[0] for row in db.execute("SELECT id FROM equipment ORDER BY id LIMIT 2")]
+            audit_before=db.execute("SELECT COUNT(*) FROM audit WHERE event='equipment_downtime_registered'").fetchone()[0]
+        start=(app.utcnow()-timedelta(hours=4)).replace(second=0,microsecond=0)
+        intervals=[(equipment_ids[0],start,start+timedelta(hours=1),"Основание: остановка узла"),
+                   (equipment_ids[0],start+timedelta(minutes=30),start+timedelta(minutes=90),"Основание: подтверждённый простой"),
+                   (equipment_ids[1],start+timedelta(minutes=90),start+timedelta(minutes=120),"Основание: регистрация смены")]
+        saved=[]
+        for index,(equipment_id,left,right,reason) in enumerate(intervals):
+            payload={"equipment_id":equipment_id,"started_at":app.iso(left),"ended_at":app.iso(right),
+                "reason":reason,"idempotency_key":f"downtime-test-{index:02d}"}
+            status,response=master.call("/api/equipment/downtime","POST",payload)
+            self.assertEqual(status,201,response);saved.append(payload)
+            if index==0:
+                repeat=master.call("/api/equipment/downtime","POST",payload)
+                self.assertEqual(repeat[0],200,repeat[1]);self.assertTrue(repeat[1]["duplicate"])
+                changed={**payload,"reason":"Другая причина регистрации"}
+                self.assertEqual(master.call("/api/equipment/downtime","POST",changed)[0],409)
+        invalid={**saved[0],"idempotency_key":"downtime-invalid","ended_at":saved[0]["started_at"]}
+        self.assertEqual(master.call("/api/equipment/downtime","POST",invalid)[0],400)
+        no_zone={**saved[0],"idempotency_key":"downtime-no-zone","started_at":"2026-10-04T10:00:00"}
+        self.assertEqual(master.call("/api/equipment/downtime","POST",no_zone)[0],400)
+        self.assertEqual(worker.call("/api/equipment/downtime","POST",saved[0])[0],403)
+        self.assertEqual(manager.call("/api/equipment/downtime","POST",saved[0])[0],403)
+        self.assertEqual(worker.call("/api/equipment/downtime?date_from=2026-10-01&date_to=2026-10-31")[0],403)
+        self.assertEqual(manager.call("/api/equipment/downtime?date_from=2026-10-01&date_to=2026-10-31")[0],200)
+        date_from=start.date().isoformat();date_to=(start+timedelta(hours=2)).date().isoformat()
+        report_status,report=master.call(f"/api/reports?date_from={date_from}&date_to={date_to}")
+        self.assertEqual(report_status,200,report)
+        self.assertEqual(report["summary"]["equipment_downtime_minutes"],120)
+        self.assertEqual(report["summary"]["pause_minutes"],0)
+        self.assertEqual(len(report["equipment_downtime_intervals"]),3)
+        self.assertEqual(sorted(x["downtime_minutes"] for x in report["equipment_downtime_by_equipment"]),[30,90])
+        worker_report=worker.call(f"/api/reports?date_from={date_from}&date_to={date_to}")[1]
+        self.assertIsNone(worker_report["summary"]["equipment_downtime_minutes"])
+        with app.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM equipment_downtime WHERE idempotency_key='downtime-test-00'").fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE event='equipment_downtime_registered'").fetchone()[0],audit_before+3)
+
+    def test_equipment_downtime_api_preserves_seconds_across_totals_and_shift_boundary(self):
+        master=self.client("master01")
+        with app.connect(self.db_path) as db:
+            equipment_ids=[row[0] for row in db.execute("SELECT id FROM equipment ORDER BY id LIMIT 2")]
+        day=(app.utcnow().date()-timedelta(days=3))
+        base=app.datetime.combine(day,app.datetime.min.time(),app.timezone.utc)
+        intervals=[]
+        for index in range(3):
+            left=base+timedelta(minutes=index*2)
+            intervals.append((equipment_ids[0],left,left+timedelta(seconds=40)))
+        split=app.datetime.combine(day,app.datetime.min.time(),app.timezone.utc)+timedelta(hours=5,minutes=59,seconds=30)
+        intervals.append((equipment_ids[1],split,split+timedelta(seconds=60)))
+        for index,(equipment_id,left,right) in enumerate(intervals):
+            status,response=master.call("/api/equipment/downtime","POST",{
+                "equipment_id":equipment_id,"started_at":app.iso(left),"ended_at":app.iso(right),
+                "reason":"Synthetic second precision check","idempotency_key":f"downtime-seconds-{index:02d}"})
+            self.assertEqual(status,201,response)
+        whole_status,whole=master.call(f"/api/reports?date_from={day}&date_to={day}")
+        self.assertEqual(whole_status,200,whole)
+        self.assertEqual(whole["summary"]["equipment_downtime_minutes"],3)
+        whole_by_equipment={row["equipment_id"]:row["downtime_minutes"] for row in whole["equipment_downtime_by_equipment"]}
+        self.assertEqual(whole_by_equipment[equipment_ids[0]],2)
+        self.assertEqual(whole_by_equipment[equipment_ids[1]],1)
+        c_status,shift_c=master.call(f"/api/reports?date_from={day}&date_to={day}&shift_code=C")
+        a_status,shift_a=master.call(f"/api/reports?date_from={day}&date_to={day}&shift_code=A")
+        self.assertEqual((c_status,a_status),(200,200))
+        self.assertEqual(shift_c["summary"]["equipment_downtime_minutes"],2.5)
+        self.assertEqual(shift_a["summary"]["equipment_downtime_minutes"],0.5)
+        c_split=next(row for row in shift_c["equipment_downtime_by_equipment"] if row["equipment_id"]==equipment_ids[1])
+        a_split=next(row for row in shift_a["equipment_downtime_by_equipment"] if row["equipment_id"]==equipment_ids[1])
+        self.assertEqual((c_split["downtime_minutes"],a_split["downtime_minutes"]),(0.5,0.5))
+        self.assertEqual(c_split["downtime_minutes"]+a_split["downtime_minutes"],whole_by_equipment[equipment_ids[1]])
+        with app.connect(self.db_path) as db:
+            test_ids={row[0] for row in db.execute("SELECT id FROM equipment_downtime WHERE idempotency_key LIKE 'downtime-seconds-%'")}
+            for audit_row in db.execute("SELECT id,payload_json FROM audit WHERE event='equipment_downtime_registered'").fetchall():
+                if json.loads(audit_row["payload_json"]).get("downtime_id") in test_ids:
+                    db.execute("DELETE FROM audit WHERE id=?",(audit_row["id"],))
+            db.execute("DELETE FROM equipment_downtime WHERE idempotency_key LIKE 'downtime-seconds-%'")
+            db.commit()
+
+    def test_synthetic_norm_provenance_unknown_and_actual_hours_stay_separate_from_deadline(self):
+        master=self.client("master01");worker=self.client("worker01")
+        bootstrap=master.call("/api/bootstrap")[1]
+        catalog=bootstrap["constants"]["norm_catalog"]
+        self.assertEqual(len(catalog),20)
+        self.assertTrue(all(row["is_synthetic"]==1 and row["source_name"] and row["source_version"] and row["source_note"] for row in catalog))
+        self.assertTrue(all(row["unit"] for row in catalog))
+        equipment_type=next(row["equipment_type"] for row in bootstrap["constants"]["equipment"] if row["id"]==self.equipment_id)
+        self.assertNotEqual(equipment_type,"unknown")
+        order=self.create_order(master)
+        self.assertEqual(order["norm_reference"]["status"],"synthetic_reference")
+        expected=order["norm_reference"]["labor"]["quantity"]
+        self.assertIsNotNone(order["due_at"])
+        self.assertAlmostEqual((app.parse_time(order["due_at"])-app.parse_time(order["issued_at"])).total_seconds(),6*3600,delta=5)
+        self.assertIsNone(order["norm_reference"]["labor"]["actual_hours"])
+        self.assertNotIn("rating",order["norm_reference"])
+        self.assertTrue(order["norm_reference"]["is_synthetic"])
+        self.assertEqual(self.action(worker,order["id"],"accept")[0],200)
+        self.assertEqual(self.action(worker,order["id"],"start")[0],200)
+        result=self.action(worker,order["id"],"complete",completion_text="Выполнен осмотр и записан результат проверки узла.",
+            fault_code_id=self.fault_id,labor_hours=0.5,materials=[],materials_not_used=True)
+        self.assertEqual(result[0],200,result[1])
+        detail=master.call(f"/api/orders/{order['id']}")[1]["order"]
+        self.assertEqual(detail["norm_reference"]["labor"]["actual_hours"],0.5)
+        self.assertEqual(detail["norm_reference"]["labor"]["difference_hours"],round(0.5-expected,2))
+        day=app.utcnow().date().isoformat()
+        report=master.call(f"/api/reports?date_from={day}&date_to={day}")[1]
+        reported=next(item for item in report["items"] if item["id"]==order["id"])
+        self.assertEqual(reported["labor_hours"],0.5)
+        self.assertEqual(reported["norm_reference"]["labor"]["quantity"],expected)
+        with app.connect(self.db_path) as db:
+            area_id=db.execute("SELECT id FROM areas ORDER BY id LIMIT 1").fetchone()[0]
+            unknown_id=db.execute("INSERT INTO equipment(code,name,area_id,equipment_type) VALUES ('EQ-UNKNOWN-TEST','Imported synthetic asset',?,'unknown')",
+                (area_id,)).lastrowid
+        status,unknown=master.call("/api/orders","POST",{"title":"Unknown reference test","description":"A synthetic asset with no mapped equipment type.",
+            "work_type":"planned","priority":"planned","area_id":area_id,"equipment_id":unknown_id,"worker_id":self.worker_id,"norm_hours":8})
+        self.assertEqual(status,201,unknown)
+        self.assertEqual(unknown["order"]["norm_reference"]["status"],"unknown")
+        self.assertIsNone(unknown["order"]["norm_reference"]["labor"]["quantity"])
+        self.assertIn("unknown",unknown["order"]["norm_reference"]["note"])
+
+    def test_legacy_seeded_completion_without_material_evidence_stays_unknown(self):
+        master=self.client("master02")
+        with app.connect(self.db_path) as db:
+            legacy=db.execute("""SELECT o.id,o.completed_at,o.materials_not_used
+                FROM orders o WHERE o.code='DEMO-0002'""").fetchone()
+            self.assertIsNotNone(legacy)
+            self.assertIsNotNone(legacy["completed_at"])
+            self.assertEqual(legacy["materials_not_used"],0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM order_materials WHERE order_id=?",(legacy["id"],)).fetchone()[0],0)
+        detail_status,detail=master.call(f"/api/orders/{legacy['id']}")
+        self.assertEqual(detail_status,200,detail)
+        reference=detail["order"]["norm_reference"]
+        self.assertEqual(reference["materials_evidence_status"],"unknown")
+        self.assertEqual(reference["reported_actual_materials"],[])
+        belt=next(item for item in reference["materials"] if item["sku"]=="MAT-003")
+        self.assertIsNone(belt["actual_quantity"])
+        self.assertIsNone(belt["difference_quantity"])
+        report_date=app.parse_time(legacy["completed_at"]).date().isoformat()
+        report_status,report=master.call(f"/api/reports?date_from={report_date}&date_to={report_date}")
+        self.assertEqual(report_status,200,report)
+        report_reference=next(item for item in report["items"] if item["code"]=="DEMO-0002")["norm_reference"]
+        self.assertEqual(report_reference["materials_evidence_status"],"unknown")
+        belt=next(item for item in report_reference["materials"] if item["sku"]=="MAT-003")
+        self.assertIsNone(belt["actual_quantity"])
+        self.assertIsNone(belt["difference_quantity"])
+
+    def test_materials_not_used_conflict_rejects_completion_atomically(self):
+        master=self.client("master01");worker=self.client("worker01")
+        order=self.create_order(master)
+        self.assertEqual(self.action(worker,order["id"],"accept")[0],200)
+        self.assertEqual(self.action(worker,order["id"],"start")[0],200)
+        with app.connect(self.db_path) as db:
+            material_id=db.execute("SELECT id FROM materials ORDER BY id LIMIT 1").fetchone()[0]
+        status,response=self.action(worker,order["id"],"complete",completion_text="Recorded a synthetic repair result and checked the completed unit.",
+            fault_code_id=self.fault_id,labor_hours=1.5,materials=[{"material_id":material_id,"quantity":3.5}],materials_not_used=True)
+        self.assertEqual(status,400,response)
+        with app.connect(self.db_path) as db:
+            saved=db.execute("SELECT status,completed_at,labor_hours,materials_not_used FROM orders WHERE id=?",(order["id"],)).fetchone()
+            self.assertEqual(tuple(saved),("in_progress",None,None,0))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM order_materials WHERE order_id=?",(order["id"],)).fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='complete'",(order["id"],)).fetchone()[0],0)
+
+    def test_legacy_material_conflict_preserves_reported_consumption_without_variance(self):
+        master=self.client("master01");manager=self.client("manager")
+        order=self.create_order(master)
+        material=order["norm_reference"]["materials"][0]
+        completed_at=app.iso()
+        with app.connect(self.db_path) as db:
+            db.execute("UPDATE orders SET status='closed',completed_at=?,closed_at=?,materials_not_used=1 WHERE id=?",
+                (completed_at,completed_at,order["id"]))
+            db.execute("INSERT INTO order_materials(order_id,material_id,quantity) VALUES (?,?,?)",
+                (order["id"],material["material_id"],3.5))
+            db.commit()
+        detail_status,detail=master.call(f"/api/orders/{order['id']}")
+        self.assertEqual(detail_status,200,detail)
+        self.assertEqual(detail["order"]["materials"][0]["quantity"],3.5)
+        reference=detail["order"]["norm_reference"]
+        self.assertEqual(reference["materials_evidence_status"],"conflict")
+        self.assertEqual(reference["reported_actual_materials"][0]["quantity"],3.5)
+        matched=next(item for item in reference["materials"] if item["material_id"]==material["material_id"])
+        self.assertEqual(matched["actual_quantity"],3.5)
+        self.assertIsNone(matched["difference_quantity"])
+        self.assertNotIn("rating",reference)
+        today=app.utcnow().date().isoformat()
+        report_status,report=manager.call(f"/api/reports?date_from={today}&date_to={today}")
+        self.assertEqual(report_status,200,report)
+        report_reference=next(item for item in report["items"] if item["id"]==order["id"])["norm_reference"]
+        self.assertEqual(report_reference["materials_evidence_status"],"conflict")
+        self.assertEqual(report_reference["reported_actual_materials"][0]["quantity"],3.5)
+        self.assertIsNone(next(item for item in report_reference["materials"] if item["material_id"]==material["material_id"])["difference_quantity"])
 
 
 if __name__ == "__main__":
