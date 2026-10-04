@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import http.client
 import io
 import http.cookiejar
 import json
@@ -83,6 +84,11 @@ class Client:
 
 
 class RuntimeConfigurationTest(unittest.TestCase):
+    def test_blank_llm_endpoint_uses_documented_gemini_default(self):
+        with unittest.mock.patch.dict(os.environ, {"NARYADAI_LLM_ENABLED":"1", "NARYADAI_LLM_API_URL":"",
+                "NARYADAI_LLM_API_KEY":"unit-test-key", "NARYADAI_LLM_MODEL":"gemini-test"}):
+            self.assertEqual(app.llm_settings(), (app.GEMINI_OPENAI_ENDPOINT, "unit-test-key", "gemini-test"))
+
     def test_local_bind_stays_loopback_and_port_falls_back_to_platform_port(self):
         with unittest.mock.patch.dict(os.environ, {"NARYADAI_HOST":"", "NARYADAI_PORT":"", "PORT":"10000"}):
             host = app.default_server_host()
@@ -105,7 +111,9 @@ class LocalAPITest(unittest.TestCase):
         root = Path(cls.temp.name)
         cls.db_path = root / "test.sqlite3"
         app.MEDIA = root / "media"
-        env = {"NARYADAI_LLM_API_URL": "", "NARYADAI_LLM_API_KEY": "", "NARYADAI_LLM_MODEL": ""}
+        env = {"NARYADAI_LLM_API_URL": "", "NARYADAI_LLM_API_KEY": "", "NARYADAI_LLM_MODEL": "",
+               "NARYADAI_LLM_ENABLED":"", "NARYADAI_LLM_REPORT_SUMMARY":"",
+               "NARYADAI_TELEGRAM_ENABLED":"", "NARYADAI_TELEGRAM_BOT_TOKEN":"", "NARYADAI_TELEGRAM_WEBHOOK_SECRET":""}
         cls.env_patch = unittest.mock.patch.dict(os.environ, env)
         cls.env_patch.start()
         app.init_db(cls.db_path)
@@ -441,6 +449,105 @@ class LocalAPITest(unittest.TestCase):
         self.assertTrue(result["master_confirmation_required"])
         self.assertTrue(any("низкую уверенность" in issue for issue in result["issues"]))
 
+    def test_gemini_json_schema_adapter_is_opt_in_and_validates_response(self):
+        report = {"verdict":"accepted","summary":"Текст описывает работу и результат.","issues":[],
+                  "confidence":0.92,"needs_master_attention":False}
+        class Response:
+            def __init__(self, payload): self.payload=payload
+            def __enter__(self): return self
+            def __exit__(self,*args): return False
+            def read(self,limit): return json.dumps(self.payload).encode()
+        class Opener:
+            def __init__(self,payload): self.payload=payload;self.request=None;self.timeout=None
+            def open(self,request,timeout): self.request=request;self.timeout=timeout;return Response(self.payload)
+        opener=Opener({"choices":[{"message":{"content":json.dumps(report,ensure_ascii=False)}}]})
+        settings={"NARYADAI_LLM_ENABLED":"1","NARYADAI_LLM_API_URL":app.GEMINI_OPENAI_ENDPOINT,
+                  "NARYADAI_LLM_API_KEY":"unit-test-key","NARYADAI_LLM_MODEL":"gemini-3.8-flash"}
+        with unittest.mock.patch.dict(os.environ,settings), unittest.mock.patch.object(app.urllib.request,"build_opener",return_value=opener):
+            result=app.llm_review("Подшипник заменён, вибрация устранена; контрольный запуск стабилен.")
+        self.assertEqual(result["mode"],"llm:gemini-3.8-flash")
+        self.assertEqual(result["verdict"],"accepted")
+        self.assertFalse(result["needs_master_attention"])
+        self.assertEqual(opener.timeout,12)
+        self.assertEqual(opener.request.full_url,app.GEMINI_OPENAI_ENDPOINT)
+        self.assertEqual(opener.request.get_header("Authorization"),"Bearer unit-test-key")
+        request_body=json.loads(opener.request.data)
+        self.assertEqual(request_body["response_format"]["type"],"json_schema")
+        self.assertTrue(request_body["response_format"]["json_schema"]["strict"])
+        self.assertEqual(set(request_body["response_format"]["json_schema"]["schema"]["required"]),
+                         {"verdict","summary","issues","confidence","needs_master_attention"})
+        with unittest.mock.patch.dict(os.environ,{**settings,"NARYADAI_LLM_ENABLED":""}):
+            disabled=app.llm_review("Нормальный пример текста достаточной длины.")
+        self.assertEqual(disabled["mode"],"rules-only: disabled")
+        opener.payload={"choices":[{"message":{"content":json.dumps({**report,"confidence":True})}}]}
+        with unittest.mock.patch.dict(os.environ,settings), unittest.mock.patch.object(app.urllib.request,"build_opener",return_value=opener):
+            invalid=app.llm_review("Подшипник заменён, вибрация устранена; контрольный запуск стабилен.")
+        self.assertEqual(invalid["mode"],"rules-only: adapter_error")
+        opener.payload={"choices":[{"message":{"content":json.dumps({"summary":"За период исполнено несколько нарядов."},ensure_ascii=False)}}]}
+        aggregate={"date_from":"2026-07-01","completed":12,"closed":10,"labor_hours":35.5}
+        with unittest.mock.patch.dict(os.environ,settings), unittest.mock.patch.object(app.urllib.request,"build_opener",return_value=opener):
+            summary,mode=app.llm_report_summary(aggregate)
+        self.assertEqual(mode,"llm:gemini-3.8-flash")
+        self.assertEqual(summary,"За период исполнено несколько нарядов.")
+        summary_body=json.loads(opener.request.data)
+        self.assertEqual(summary_body["response_format"]["json_schema"]["name"],"naryadai_aggregate_summary")
+        self.assertIn('"completed": 12',summary_body["messages"][0]["content"])
+        self.assertNotIn("worker",summary_body["messages"][0]["content"])
+
+    def test_llm_incomplete_read_and_huge_confidence_fall_back_to_rules(self):
+        settings={"NARYADAI_LLM_ENABLED":"1","NARYADAI_LLM_API_URL":app.GEMINI_OPENAI_ENDPOINT,
+                  "NARYADAI_LLM_API_KEY":"unit-test-key","NARYADAI_LLM_MODEL":"gemini-test"}
+        class IncompleteResponse:
+            def __enter__(self): return self
+            def __exit__(self,*args): return False
+            def read(self,limit): raise http.client.IncompleteRead(b"{",10)
+        class IncompleteOpener:
+            def open(self,request,timeout): return IncompleteResponse()
+        with unittest.mock.patch.dict(os.environ,settings), unittest.mock.patch.object(app.urllib.request,"build_opener",return_value=IncompleteOpener()):
+            truncated=app.llm_review("synthetic completion text with sufficient detail for rules-only review")
+        self.assertEqual(truncated["mode"],"rules-only: adapter_error")
+        self.assertEqual(truncated["note"],"IncompleteRead")
+
+        report={"verdict":"accepted","summary":"Synthetic response","issues":[],"confidence":10**400,
+                "needs_master_attention":False}
+        payload={"choices":[{"message":{"content":json.dumps(report)}}]}
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self,*args): return False
+            def read(self,limit): return json.dumps(payload).encode()
+        class Opener:
+            def open(self,request,timeout): return Response()
+        with unittest.mock.patch.dict(os.environ,settings), unittest.mock.patch.object(app.urllib.request,"build_opener",return_value=Opener()):
+            oversized=app.llm_review("synthetic completion text with sufficient detail for rules-only review")
+        self.assertEqual(oversized["mode"],"rules-only: adapter_error")
+        self.assertEqual(oversized["note"],"OverflowError")
+
+    def test_optional_report_summary_sends_only_aggregates_on_explicit_request(self):
+        manager=self.client("manager")
+        seen=[]
+        config={"NARYADAI_LLM_ENABLED":"1","NARYADAI_LLM_API_KEY":"test-key",
+                "NARYADAI_LLM_MODEL":"gemini-test","NARYADAI_LLM_API_URL":app.GEMINI_OPENAI_ENDPOINT,
+                "NARYADAI_LLM_REPORT_SUMMARY":"1"}
+        with unittest.mock.patch.dict(os.environ,config), unittest.mock.patch.object(app,"llm_report_summary",side_effect=lambda data:(seen.append(data) or ("Сводка по итоговым счётчикам.","llm:gemini-test"))) as llm:
+            base="/api/reports?date_from=2026-07-01&date_to=2026-10-04"
+            ordinary=manager.call(base)
+            self.assertEqual(ordinary[0],200,ordinary[1])
+            self.assertEqual(ordinary[1]["ai_summary_mode"],"rules-only")
+            self.assertEqual(llm.call_count,0)
+            opted=manager.call(base+"&include_ai_summary=1")
+        self.assertEqual(opted[0],200,opted[1])
+        self.assertEqual(opted[1]["ai_summary_mode"],"llm:gemini-test")
+        self.assertTrue(seen)
+        self.assertGreaterEqual(opted[1]["summary"]["completed"],5)
+        self.assertTrue(set(seen[0]).issubset({"date_from","date_to","period_days","brigade_filter","shift_filter","issued",
+            "completed","closed","labor_hours","late_completions","current_overdue_orders","pause_minutes"}))
+        self.assertFalse(any("worker" in key or "equipment" in key or "text" in key for key in seen[0]))
+        with unittest.mock.patch.dict(os.environ,config), unittest.mock.patch.object(app,"llm_report_summary",
+                side_effect=http.client.IncompleteRead(b"{",10)):
+            degraded=manager.call(base+"&include_ai_summary=1")
+        self.assertEqual(degraded[0],200,degraded[1])
+        self.assertEqual(degraded[1]["ai_summary_mode"],"rules-only: adapter_error")
+
     def test_rejection_reassignment_cancellation_and_group_offer(self):
         master=self.client("master01");worker=self.client("worker01");replacement=self.client("worker02")
         order=self.create_order(master)
@@ -514,7 +621,7 @@ class LocalAPITest(unittest.TestCase):
                 if path=="/": self.assertIn("manifest.webmanifest",body)
                 if path=="/sw.js":
                     self.assertIn("cache.addAll",body)
-                    self.assertIn("naryadai-shell-v3",body)
+                    self.assertIn("naryadai-shell-v5",body)
                 if path.endswith("styles.css"): self.assertIn("max-width:760px",body)
                 if path.endswith("/manifest.webmanifest"):
                     manifest=json.loads(body)
@@ -539,6 +646,154 @@ class LocalAPITest(unittest.TestCase):
                     self.assertIn("canvas.toBlob",body)
                     self.assertIn("insertJpegExif",body)
                     self.assertIn("EXIF не подтверждает",body)
+
+    def telegram_webhook(self, body: dict, secret: str = "webhook-test-secret"):
+        request = urllib.request.Request(self.base + "/api/telegram/webhook", data=json.dumps(body).encode(),
+            headers={"Content-Type":"application/json", "X-Telegram-Bot-Api-Secret-Token":secret}, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response: return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error: return error.code, json.loads(error.read())
+
+    def test_telegram_pairing_is_opt_in_private_and_one_time(self):
+        worker = self.client("worker01")
+        self.assertFalse(worker.call("/api/telegram/status")[1]["enabled"])
+        self.assertEqual(worker.call("/api/telegram/pair", "POST", {})[0], 409)
+        manager = self.client("manager")
+        with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"test-token",
+                "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"webhook-test-secret"}):
+            self.assertEqual(manager.call("/api/telegram/pair", "POST", {})[0], 403)
+            paired = worker.call("/api/telegram/pair", "POST", {})
+            self.assertEqual(paired[0], 200, paired[1])
+            code = paired[1]["pairing_code"]
+            self.assertEqual(len(code), 12)
+            self.assertEqual(paired[1]["command"], "/start " + code)
+            with app.connect(self.db_path) as db:
+                stored_hash = db.execute("SELECT code_hash FROM telegram_pairings WHERE user_id=?", (self.worker_id,)).fetchone()[0]
+                self.assertEqual(stored_hash, app.hashlib.sha256(code.encode()).hexdigest())
+            update = {"update_id": 7001, "message":{"message_id":1,"from":{"id":7812345},
+                "chat":{"id":7812345,"type":"private"},"text":"/start "+code}}
+            with app.connect(self.db_path) as db:
+                original = db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?", (self.worker_id,)).fetchone()
+                original_chat_id = original["chat_id"] if original else None
+            group_update = {**update, "message":{**update["message"], "chat":{"id":-1007812345,"type":"group"}}}
+            self.assertEqual(self.telegram_webhook(group_update)[0], 200)
+            spoofed_update = {**update, "message":{**update["message"], "from":{"id":7812346}}}
+            self.assertEqual(self.telegram_webhook(spoofed_update)[0], 200)
+            with app.connect(self.db_path) as db:
+                binding = db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?", (self.worker_id,)).fetchone()
+                self.assertEqual(binding["chat_id"] if binding else None, original_chat_id)
+                self.assertIsNone(db.execute("SELECT consumed_at FROM telegram_pairings WHERE user_id=?", (self.worker_id,)).fetchone()[0])
+            self.assertEqual(self.telegram_webhook(update)[0], 200)
+            # A bad webhook secret is indistinguishable from an unknown path.
+            with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"test-token",
+                    "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"webhook-test-secret"}):
+                bad_secret = self.telegram_webhook(update, "wrong-secret")
+                self.assertEqual(bad_secret[0], 404)
+                self.assertEqual(self.telegram_webhook(update)[0], 200)
+                self.assertTrue(worker.call("/api/telegram/status")[1]["paired"])
+                # Same /start cannot move or re-link the account to another chat.
+                update["message"]["chat"]["id"] = 7812346
+                update["message"]["from"]["id"] = 7812346
+                self.assertEqual(self.telegram_webhook(update)[0], 200)
+                with app.connect(self.db_path) as db:
+                    binding = db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?", (self.worker_id,)).fetchone()
+                    self.assertEqual(binding["chat_id"], "7812345")
+            self.assertEqual(worker.call("/api/telegram/unpair", "POST", {})[0], 200)
+            self.assertFalse(worker.call("/api/telegram/status")[1]["paired"])
+
+    def test_telegram_outbox_whitelists_events_deduplicates_and_fake_delivers(self):
+        master = self.client("master01")
+        order = self.create_order(master)
+        sent = []
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox")
+            app.audit(db, None, order["id"], "issued", {"reason":"PRIVATE REASON", "api_key":"TOP-SECRET"})
+            audit_id = db.execute("SELECT MAX(id) FROM audit WHERE order_id=? AND event='issued'", (order["id"],)).fetchone()[0]
+            app.queue_telegram_event(db, audit_id, order["id"], "issued")
+            row = db.execute("SELECT * FROM telegram_outbox").fetchone()
+            payload = json.loads(row["payload_json"])
+            self.assertEqual(row["status"], "queued_local")
+            self.assertEqual(row["recipient_user_id"], self.worker_id)
+            self.assertEqual(payload.keys(), {"text"})
+            self.assertNotIn("PRIVATE REASON", payload["text"])
+            self.assertNotIn("TOP-SECRET", payload["text"])
+            self.assertNotIn("worker01", payload["text"])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0], 1)
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
+                       "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
+                       (self.worker_id, "7812345", "7812345", app.iso()))
+            db.commit()
+        with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
+                "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}):
+            self.assertTrue(app.deliver_telegram_once(self.db_path, sender=lambda token, chat, text: sent.append((token,chat,text))))
+        self.assertEqual(sent[0][0:2], ("fake-token", "7812345"))
+        self.assertIn(order["code"], sent[0][2])
+        with app.connect(self.db_path) as db:
+            row = db.execute("SELECT status,attempts,last_error FROM telegram_outbox").fetchone()
+            self.assertEqual((row["status"],row["attempts"],row["last_error"]),("delivered",1,None))
+            # Idempotent enqueue means a duplicate audit event does not create another send.
+            app.queue_telegram_event(db, audit_id, order["id"], "issued")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0], 1)
+            app.audit(db, None, order["id"], "start", {})
+            master_id = db.execute("SELECT assigned_master_id FROM orders WHERE id=?", (order["id"],)).fetchone()[0]
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
+                       "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
+                       (master_id, "7812346", "7812346", app.iso()))
+            db.commit()
+        def rate_limited(token, chat, text):
+            raise app.TelegramRetry(1)
+        with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
+                "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}):
+            for attempt in range(4):
+                self.assertTrue(app.deliver_telegram_once(self.db_path, sender=rate_limited))
+                with app.connect(self.db_path) as db:
+                    db.execute("UPDATE telegram_outbox SET next_attempt_at=? WHERE status='retrying'", (app.iso(app.utcnow()-timedelta(seconds=2)),))
+                    db.commit()
+        with app.connect(self.db_path) as db:
+            limited = db.execute("SELECT status,attempts,last_error FROM telegram_outbox WHERE recipient_user_id=?", (master_id,)).fetchone()
+            self.assertEqual((limited["status"],limited["attempts"],limited["last_error"]),("failed",4,"retry_limit"))
+            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at) VALUES (?,?,?,?,?)",
+                       (master_id,"uncertain_test",json.dumps({"text":"test"}),"queued_local",app.iso()))
+            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at,send_started_at) VALUES (?,?,?,?,?,?)",
+                       (master_id,"restart_test",json.dumps({"text":"test"}),"sending",app.iso(),app.iso(app.utcnow()-timedelta(minutes=2))))
+            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at) VALUES (?,?,?,?,?)",
+                       (master_id,"stale_test",json.dumps({"text":"test"}),"queued_local",app.iso(app.utcnow()-timedelta(hours=25))))
+            db.commit()
+        with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
+                "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}):
+            self.assertTrue(app.deliver_telegram_once(self.db_path, sender=lambda *_: (_ for _ in ()).throw(TimeoutError("unknown delivery"))))
+            self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *_:self.fail("stale event must not be sent")))
+        with app.connect(self.db_path) as db:
+            statuses={r["event"]:r["status"] for r in db.execute("SELECT event,status FROM telegram_outbox WHERE event IN ('restart_test','stale_test')")}
+            self.assertEqual(statuses,{"restart_test":"uncertain","stale_test":"expired"})
+            uncertain = db.execute("SELECT status,attempts,last_error FROM telegram_outbox WHERE event='uncertain_test'").fetchone()
+            self.assertEqual((uncertain["status"],uncertain["attempts"],uncertain["last_error"]),("uncertain",1,"delivery_uncertain"))
+
+    def test_telegram_delivery_skips_inactive_bound_recipient(self):
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox WHERE event='inactive_recipient_test'")
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
+                       "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
+                       (self.worker_id,"7812399","7812399",app.iso()))
+            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at) VALUES (?,?,?,?,?)",
+                       (self.worker_id,"inactive_recipient_test",json.dumps({"text":"synthetic test"}),"queued_local",app.iso()))
+            db.execute("UPDATE users SET is_active=0 WHERE id=?",(self.worker_id,))
+            db.commit()
+        sent=[]
+        settings={"NARYADAI_TELEGRAM_ENABLED":"1","NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
+                  "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}
+        try:
+            with unittest.mock.patch.dict(os.environ,settings):
+                self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *args:sent.append(args)))
+            self.assertEqual(sent,[])
+            with app.connect(self.db_path) as db:
+                row=db.execute("SELECT status,attempts FROM telegram_outbox WHERE event='inactive_recipient_test'").fetchone()
+                self.assertEqual((row["status"],row["attempts"]),("queued_local",0))
+        finally:
+            with app.connect(self.db_path) as db:
+                db.execute("UPDATE users SET is_active=1 WHERE id=?",(self.worker_id,))
+                db.execute("DELETE FROM telegram_outbox WHERE event='inactive_recipient_test'")
+                db.commit()
 
 
 if __name__ == "__main__":

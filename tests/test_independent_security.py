@@ -140,9 +140,12 @@ class IndependentSecurityQA(unittest.TestCase):
         import os
         shapes=[{'choices':[]},{'choices':[{'message':{'content':json.dumps({'summary':[], 'issues':[]})}}]},
                 {'choices':[{'message':{'content':json.dumps({'summary':'ok', 'issues':[{'bad':'shape'}]})}}]}]
-        env={'NARYADAI_LLM_API_URL':'https://example.invalid/v1/chat/completions','NARYADAI_LLM_API_KEY':'synthetic-test-only','NARYADAI_LLM_MODEL':'synthetic'}
+        env={'NARYADAI_LLM_ENABLED':'1','NARYADAI_LLM_API_URL':app.GEMINI_OPENAI_ENDPOINT,
+             'NARYADAI_LLM_API_KEY':'synthetic-test-only','NARYADAI_LLM_MODEL':'synthetic'}
         for shape in shapes:
-            with self.subTest(shape=shape), unittest.mock.patch.dict(os.environ,env), unittest.mock.patch.object(app.urllib.request,'urlopen',return_value=io.BytesIO(json.dumps(shape).encode())):
+            opener=unittest.mock.Mock()
+            opener.open.return_value=io.BytesIO(json.dumps(shape).encode())
+            with self.subTest(shape=shape), unittest.mock.patch.dict(os.environ,env), unittest.mock.patch.object(app.urllib.request,'build_opener',return_value=opener):
                 result=app.llm_review('Выполнена проверка, результат стабилен.')
                 self.assertEqual(result['mode'],'rules-only: adapter_error')
 

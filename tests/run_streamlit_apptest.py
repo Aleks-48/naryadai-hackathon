@@ -121,6 +121,8 @@ class StreamlitApiAppTest(unittest.TestCase):
         self.assertTrue(any(item.label == LABELS["create"] for item in master.button))
         self.assertFalse(any(item.label == LABELS["create"] for item in worker.button))
         self.assertFalse(any(item.label == LABELS["create"] for item in manager.button))
+        dashboard_metrics = {item.label for item in manager.metric}
+        self.assertTrue({"Ожидают", "Приняты / в работе", "Проверка / доработка", "Закрыты мастером"}.issubset(dashboard_metrics))
 
         csrf = manager.session_state["csrf"]
         denied = self.app_session(manager).post(
@@ -136,6 +138,8 @@ class StreamlitApiAppTest(unittest.TestCase):
         self.assertFalse(manager.exception, self.exceptions(manager))
         self.click(manager, "make_report")
         self.assertGreaterEqual(len(manager.dataframe), 3)
+        report_metrics = {item.label for item in manager.metric}
+        self.assertTrue({"Исполнено", "Закрыто мастером", "Просрочено", "Трудозатраты, ч"}.issubset(report_metrics))
 
     def test_area_change_refreshes_equipment_before_form_submission(self) -> None:
         master = self.new_app("master01", "master")

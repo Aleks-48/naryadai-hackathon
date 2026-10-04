@@ -13,19 +13,21 @@ const deferred = () => {let resolve,reject;const promise=new Promise((a,b)=>{res
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function element(value='') {
   const classes=new Set();
-  return {value,disabled:false,checked:false,dataset:{},options:[],children:[],events:{},attrs:{},innerHTML:'',textContent:'',id:'',scrollTop:0,isConnected:true,
+  return {value,disabled:false,checked:false,dataset:{},options:[],children:[],events:{},attrs:{},controls:new Map(),innerHTML:'',textContent:'',id:'',scrollTop:0,isConnected:true,parentElement:null,
     classList:{add:x=>classes.add(x),remove:x=>classes.delete(x),toggle:(x,v)=>{if(v===undefined)v=!classes.has(x);v?classes.add(x):classes.delete(x)},contains:x=>classes.has(x)},
     addEventListener(name,fn){this.events[name]=fn},setAttribute(k,v){this.attrs[k]=v},
-    append(node){this.children.push(node)},remove(){this.isConnected=false},focus(){this.focused=true},
-    contains(node){return this===node||this.children.includes(node)},querySelector(){return null},querySelectorAll(){return []}};
+    append(node){this.children.push(node);node.parentElement=this;node.isConnected=true},remove(){this.isConnected=false;if(this.parentElement)this.parentElement.children=this.parentElement.children.filter(x=>x!==this)},focus(){this.focused=true},
+    contains(node){return this===node||this.children.includes(node)},querySelector(selector){if(!this.innerHTML.includes(selector.replace(/[\[\]]/g,'').split('=')[0]))return null;if(!this.controls.has(selector))this.controls.set(selector,element());return this.controls.get(selector)},querySelectorAll(){return []}};
 }
 function harness() {
   const nodes=new Map(), groups=new Map();
   const get=selector=>{if(!nodes.has(selector))nodes.set(selector,element());return nodes.get(selector)};
-  const document={activeElement:null,body:element(),querySelector:s=>nodes.get(s)||null,querySelectorAll:s=>groups.get(s)||[],createElement:()=>element(),addEventListener(){},removeEventListener(){}};
-  ['#app','#login-screen','#detail-drawer','#drawer-backdrop','#view-root','#toast-region','#offline-banner'].forEach(get);
-  const globals={document,console,navigator:{onLine:true},location:{protocol:'http:',hostname:'example.invalid'},window:{addEventListener(){}},URLSearchParams,setTimeout:()=>0,clearInterval(){},setInterval:()=>1,performance:{now:()=>0},fetch:()=>Promise.reject(new Error('Unexpected real fetch')),FileReader:class{},prompt:()=>null};
-  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','loadReport','loadAudit','render','runAction','exifPayload','insertJpegExif'];
+  const documentListeners=new Map(),body=element();
+  const document={activeElement:null,body,querySelector:s=>{const direct=nodes.get(s);if(direct?.isConnected)return direct;if(s.startsWith('#'))return body.children.find(n=>n.id===s.slice(1)&&n.isConnected)||null;return null},querySelectorAll:s=>groups.get(s)||[],createElement:()=>element(),addEventListener(name,fn){documentListeners.set(name,fn)},removeEventListener(name,fn){if(documentListeners.get(name)===fn)documentListeners.delete(name)}};
+  ['#app','#login-screen','#detail-drawer','#drawer-backdrop','#view-root','#toast-region','#offline-banner','#telegram-button'].forEach(get);
+  const localStorageWrites=[],logs=[];
+  const globals={document,console:{log:(...x)=>logs.push(x),warn:(...x)=>logs.push(x),error:(...x)=>logs.push(x)},localStorage:{setItem:(...x)=>localStorageWrites.push(x),removeItem:(...x)=>localStorageWrites.push(x),getItem:()=>null},navigator:{onLine:true},location:{protocol:'http:',hostname:'example.invalid'},window:{addEventListener(){}},URLSearchParams,setTimeout:()=>0,clearInterval(){},setInterval:()=>1,performance:{now:()=>0},fetch:()=>Promise.reject(new Error('Unexpected real fetch')),FileReader:class{},prompt:()=>null};
+  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','loadReport','loadAudit','render','runAction','showTelegram','exifPayload','insertJpegExif'];
   const expose=`globalThis.app={S,${names.join(',')},override(overrides){${['api','refresh','renderDrawer','render','syncChrome','compressImage','renderReportResult'].map(n=>`if(overrides.${n})${n}=overrides.${n};`).join('')}}};`;
   const source=fs.readFileSync(sourcePath,'utf8').replace(/\n  bindGlobal\(\);[\s\S]*?\n\}\)\(\);\s*$/,`\n  ${expose}\n})();`);
   vm.runInNewContext(source,globals,{filename:sourcePath});
@@ -34,7 +36,7 @@ function harness() {
   app.S.orderId=101;
   app.S.data={constants:{areas:[],equipment:[],users:[],fault_codes:[],materials:[]},free_workers:[]};
   app.override({syncChrome(){}});
-  return {app,get,nodes,groups,document,globals};
+  return {app,get,nodes,groups,document,globals,localStorageWrites,logs,documentListeners};
 }
 function completionInputs(h) {
   h.get('#completion-text').value='Заменили уплотнение и проверили результат';
@@ -171,4 +173,44 @@ test('old-session API responses cannot log out a newer session',async()=>{
   const h=harness(),pending=deferred();h.globals.fetch=()=>pending.promise;
   const request=h.app.api('/api/bootstrap');h.app.logoutLocal();h.app.S.me={id:9};pending.resolve({status:401,ok:false,headers:{get:()=> 'application/json'},json:async()=>({error:'expired'})});
   await assert.rejects(request);assert.equal(h.app.S.me.id,9);
+});
+
+test('Telegram repeated trigger cancels a pending status request without reopening',async()=>{
+  const h=harness(),pending=deferred();let calls=0;
+  h.app.override({api:async()=>{calls++;return pending.promise}});
+  const opening=h.app.showTelegram();assert.ok(h.document.querySelector('#telegram-popover'));
+  await h.app.showTelegram();assert.equal(h.document.querySelector('#telegram-popover'),null);
+  pending.resolve({enabled:true,paired:false});await opening;
+  assert.equal(calls,1);assert.equal(h.document.querySelector('#telegram-popover'),null);
+});
+
+test('Telegram cancel control closes the popover and discards a late status response',async()=>{
+  const h=harness(),pending=deferred();h.app.override({api:()=>pending.promise});
+  const opening=h.app.showTelegram(),node=h.document.querySelector('#telegram-popover');
+  node.querySelector('[data-telegram-cancel]').events.click({currentTarget:node.querySelector('[data-telegram-cancel]')});
+  assert.equal(h.document.querySelector('#telegram-popover'),null);
+  pending.resolve({enabled:true,paired:false});await opening;
+  assert.equal(h.document.querySelector('#telegram-popover'),null);
+});
+
+test('Telegram logout invalidates a pending status response in a later session',async()=>{
+  const h=harness(),pending=deferred();h.app.override({api:()=>pending.promise});
+  const opening=h.app.showTelegram();h.app.logoutLocal();h.app.S.me={id:9,role:'worker'};
+  pending.resolve({enabled:true,paired:false});await opening;
+  assert.equal(h.document.querySelector('#telegram-popover'),null);
+  assert.equal(h.app.S.telegramOutsideHandler,null);
+});
+
+test('Telegram logout discards late status and never renders a stale pairing code',async()=>{
+  const h=harness(),pair=deferred();
+  h.app.override({api:async(path)=>path.endsWith('/status')?{enabled:true,paired:false}:pair.promise});
+  await h.app.showTelegram();
+  const node=h.document.querySelector('#telegram-popover'),button=node.querySelector('[data-telegram-pair]');
+  const action=button.events.click({currentTarget:button});
+  h.app.logoutLocal();h.app.S.me={id:22,role:'worker'};
+  pair.resolve({command:'/start PRIVATE-ONCE-CODE',expires_at:'2026-10-04T12:00:00Z'});await action;
+  assert.equal(h.document.querySelector('#telegram-popover'),null);
+  assert.equal(h.localStorageWrites.length,0);
+  assert.equal(JSON.stringify(h.logs).includes('PRIVATE-ONCE-CODE'),false);
+  assert.equal(h.document.body.children.some(child=>child.innerHTML.includes('PRIVATE-ONCE-CODE')),false);
 });
