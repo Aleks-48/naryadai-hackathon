@@ -49,6 +49,21 @@ PRIORITY_LABELS = {"planned": "Плановый", "normal": "Обычный", "h
 DEMO_PASSWORD = "demo123"
 SHIFT_WINDOWS_UTC = {"A": (6, 14), "B": (14, 22), "C": (22, 6)}
 SHIFT_LABELS = {"A": "A · 06:00–14:00 UTC", "B": "B · 14:00–22:00 UTC", "C": "C · 22:00–06:00 UTC"}
+EQUIPMENT_TYPE_LABELS = {"crusher":"Дробилка","conveyor":"Конвейер","pump":"Насос",
+                          "compressor":"Компрессор","fan":"Вентилятор","unknown":"Неизвестно"}
+DEMO_EQUIPMENT_TYPES = (
+    ("crusher", "Щековая дробилка"), ("conveyor", "Ленточный конвейер"),
+    ("pump", "Насос шламовый"), ("compressor", "Компрессор винтовой"),
+    ("fan", "Вентилятор вытяжной"),
+)
+DEMO_EQUIPMENT_SEED_PAIRS = tuple(
+    (f"EQ-{index + 1:03d}", f"{label} {index // len(DEMO_EQUIPMENT_TYPES) + 1:02d}", equipment_type)
+    for index in range(25)
+    for equipment_type, label in (DEMO_EQUIPMENT_TYPES[index % len(DEMO_EQUIPMENT_TYPES)],)
+)
+DEMO_NORM_SOURCE = "NaryadAI synthetic demo catalogue"
+DEMO_NORM_VERSION = "synthetic-example-v1"
+DEMO_NORM_NOTE = "Учебный синтетический пример интерфейса. Не является утверждённой нормой, регламентом производства, основанием для закупки или решения по безопасности."
 
 
 def utcnow() -> datetime:
@@ -110,6 +125,68 @@ def date_window(from_value: str | None, to_value: str | None, default_days: int 
     return iso(start), iso(until), start_day.isoformat(), end_day.isoformat(), days
 
 
+def downtime_windows(start: datetime, until: datetime, shift_code: str | None = None) -> list[tuple[datetime, datetime]]:
+    """Return UTC windows; optional shift filtering uses the explicit UTC shift schedule."""
+    if not shift_code:
+        return [(start, until)]
+    windows: list[tuple[datetime, datetime]] = []
+    day = start.date() - timedelta(days=1) if shift_code == "C" else start.date()
+    last_day = until.date()
+    while day <= last_day:
+        if shift_code == "A":
+            left = datetime.combine(day, datetime.min.time(), timezone.utc) + timedelta(hours=6)
+            right = left + timedelta(hours=8)
+        elif shift_code == "B":
+            left = datetime.combine(day, datetime.min.time(), timezone.utc) + timedelta(hours=14)
+            right = left + timedelta(hours=8)
+        else:
+            left = datetime.combine(day, datetime.min.time(), timezone.utc) + timedelta(hours=22)
+            right = left + timedelta(hours=8)
+        clipped = (max(start, left), min(until, right))
+        if clipped[0] < clipped[1]:
+            windows.append(clipped)
+        day += timedelta(days=1)
+    return windows
+
+
+def summarize_equipment_downtime(rows: list[sqlite3.Row], start: datetime, until: datetime,
+                                 shift_code: str | None = None) -> dict:
+    """Clip intervals and union per asset in seconds, converting only final totals to minutes."""
+    windows = downtime_windows(start, until, shift_code)
+    grouped: dict[int, dict] = {}
+    visible_intervals: list[dict] = []
+    for row in rows:
+        row_start, row_end = parse_time(row["started_at"]), parse_time(row["ended_at"])
+        if not row_start or not row_end or row_start >= row_end:
+            continue
+        clipped_parts = [(max(row_start, left), min(row_end, right)) for left, right in windows]
+        clipped_parts = [(left, right) for left, right in clipped_parts if left < right]
+        if not clipped_parts:
+            continue
+        equipment_id = int(row["equipment_id"])
+        asset = grouped.setdefault(equipment_id, {"equipment_id": equipment_id, "equipment_code": row["equipment_code"],
+            "equipment": row["equipment"], "intervals": []})
+        asset["intervals"].extend(clipped_parts)
+        visible_intervals.append({"equipment_id": equipment_id, "equipment_code": row["equipment_code"],
+            "equipment": row["equipment"], "started_at": row["started_at"], "ended_at": row["ended_at"],
+            "reason": row["reason"], "recorded_by": row["recorded_by"], "created_at": row["created_at"]})
+    equipment_totals = []
+    total_seconds = 0.0
+    for asset in grouped.values():
+        merged: list[list[datetime]] = []
+        for left, right in sorted(asset.pop("intervals")):
+            if merged and left <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], right)
+            else:
+                merged.append([left, right])
+        seconds = sum(max(0.0, (right-left).total_seconds()) for left, right in merged)
+        total_seconds += seconds
+        equipment_totals.append({**asset, "downtime_minutes": round(seconds / 60, 3)})
+    equipment_totals.sort(key=lambda x: x["equipment_code"])
+    visible_intervals.sort(key=lambda x: (x["started_at"], x["equipment_code"]))
+    return {"minutes": round(total_seconds / 60, 3), "equipment": equipment_totals, "intervals": visible_intervals}
+
+
 class ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc, tb):
         try:
@@ -145,13 +222,28 @@ def init_db(path: Path | str = DB_PATH) -> None:
         CREATE TABLE IF NOT EXISTS areas (id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL);
         CREATE TABLE IF NOT EXISTS equipment (
             id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
-            area_id INTEGER NOT NULL REFERENCES areas(id)
+            area_id INTEGER NOT NULL REFERENCES areas(id), equipment_type TEXT NOT NULL DEFAULT 'unknown'
+        );
+        CREATE TABLE IF NOT EXISTS equipment_downtime (
+            id INTEGER PRIMARY KEY, equipment_id INTEGER NOT NULL REFERENCES equipment(id),
+            started_at TEXT NOT NULL, ended_at TEXT NOT NULL, reason TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE, recorded_by INTEGER NOT NULL REFERENCES users(id),
+            created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS fault_codes (
             id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, label TEXT NOT NULL, category TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS materials (
             id INTEGER PRIMARY KEY, sku TEXT UNIQUE NOT NULL, name TEXT NOT NULL, unit TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS norm_catalog (
+            id INTEGER PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('labor','material')),
+            work_type TEXT NOT NULL CHECK(work_type IN ('planned','unscheduled')),
+            equipment_type TEXT NOT NULL, material_id INTEGER REFERENCES materials(id),
+            quantity REAL NOT NULL CHECK(quantity>0), unit TEXT NOT NULL,
+            source_name TEXT NOT NULL, source_version TEXT NOT NULL, source_note TEXT NOT NULL,
+            is_synthetic INTEGER NOT NULL DEFAULT 1 CHECK(is_synthetic=1),
+            CHECK((kind='labor' AND material_id IS NULL) OR (kind='material' AND material_id IS NOT NULL))
         );
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL, title TEXT NOT NULL,
@@ -223,6 +315,7 @@ def init_db(path: Path | str = DB_PATH) -> None:
         CREATE INDEX IF NOT EXISTS idx_orders_assignee_status ON orders(assigned_to,status);
         CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
         CREATE INDEX IF NOT EXISTS idx_audit_order ON audit(order_id,created_at);
+        CREATE INDEX IF NOT EXISTS idx_equipment_downtime_period ON equipment_downtime(equipment_id,started_at,ended_at);
         """)
         user_columns = {r[1] for r in db.execute("PRAGMA table_info(users)")}
         for name, definition in (("specialty", "TEXT NOT NULL DEFAULT 'Механика'"),
@@ -230,6 +323,23 @@ def init_db(path: Path | str = DB_PATH) -> None:
                                  ("shift_code", "TEXT NOT NULL DEFAULT 'A'")):
             if name not in user_columns:
                 db.execute(f"ALTER TABLE users ADD COLUMN {name} {definition}")
+        equipment_columns = {r[1] for r in db.execute("PRAGMA table_info(equipment)")}
+        if "equipment_type" not in equipment_columns:
+            db.execute("ALTER TABLE equipment ADD COLUMN equipment_type TEXT NOT NULL DEFAULT 'unknown'")
+        # Revert the earlier broad prefix guess on non-seed legacy rows; keep only exact seed identities.
+        prefixes_by_type = dict(DEMO_EQUIPMENT_TYPES)
+        exact_seed_identities = {(code,name) for code,name,_ in DEMO_EQUIPMENT_SEED_PAIRS}
+        for asset in db.execute("SELECT id,code,name,equipment_type FROM equipment").fetchall():
+            prefix = prefixes_by_type.get(asset["equipment_type"])
+            if (asset["code"],asset["name"]) not in exact_seed_identities and prefix \
+                    and re.fullmatch(r"EQ-[0-9]{3}",asset["code"]) and asset["name"].startswith(prefix + " "):
+                db.execute("UPDATE equipment SET equipment_type='unknown' WHERE id=?",(asset["id"],))
+        # Backfill only exact code/name pairs emitted by this deterministic demo seed.
+        for code, name, equipment_type in DEMO_EQUIPMENT_SEED_PAIRS:
+            db.execute("UPDATE equipment SET equipment_type=? WHERE equipment_type IN ('unknown','') AND code=? AND name=?",
+                       (equipment_type,code,name))
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_norm_labor_unique ON norm_catalog(work_type,equipment_type) WHERE kind='labor'")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_norm_material_unique ON norm_catalog(work_type,equipment_type,material_id) WHERE kind='material'")
         photo_columns = {r[1] for r in db.execute("PRAGMA table_info(photos)")}
         if "duplicate_type" not in photo_columns:
             db.execute("ALTER TABLE photos ADD COLUMN duplicate_type TEXT NOT NULL DEFAULT 'none'")
@@ -249,6 +359,7 @@ def init_db(path: Path | str = DB_PATH) -> None:
         db.execute("CREATE INDEX IF NOT EXISTS idx_photos_sha256 ON photos(sha256)")
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             seed_demo(db)
+        seed_synthetic_norm_catalog(db)
 
 
 def password_record(password: str, salt: bytes | None = None) -> tuple[str, str]:
@@ -269,16 +380,12 @@ def seed_demo(db: sqlite3.Connection) -> None:
     for name in ["Дробильно-сортировочный участок", "Конвейерный участок", "Насосная", "Компрессорная"]:
         db.execute("INSERT INTO areas(name) VALUES (?)", (name,))
     areas = db.execute("SELECT id,name FROM areas ORDER BY id").fetchall()
-    equip_names = [
-        ("Дробилка", "Щековая дробилка"), ("Конвейер", "Ленточный конвейер"),
-        ("Насос", "Насос шламовый"), ("Компрессор", "Компрессор винтовой"),
-        ("Вентилятор", "Вентилятор вытяжной"),
-    ]
+    equip_names = DEMO_EQUIPMENT_TYPES
     for i in range(25):
-        family, label = equip_names[i % len(equip_names)]
+        equipment_type, label = equip_names[i % len(equip_names)]
         area = areas[i % len(areas)]
-        db.execute("INSERT INTO equipment(code,name,area_id) VALUES (?,?,?)",
-                   (f"EQ-{i+1:03d}", f"{label} {i // len(equip_names)+1:02d}", area["id"]))
+        db.execute("INSERT INTO equipment(code,name,area_id,equipment_type) VALUES (?,?,?,?)",
+                   (f"EQ-{i+1:03d}", f"{label} {i // len(equip_names)+1:02d}", area["id"],equipment_type))
     code_labels = [
         "Вибрация выше обычной", "Шум подшипникового узла", "Износ уплотнения", "Утечка рабочей жидкости",
         "Перегрев электродвигателя", "Проскальзывание ленты", "Смещение ленты", "Нарушение натяжения",
@@ -421,6 +528,37 @@ def seed_demo(db: sqlite3.Connection) -> None:
     db.execute("INSERT INTO audit(actor_id,order_id,event,payload_json,created_at) VALUES (NULL,NULL,'demo_seed',?,?)",
                (json.dumps({"orders": 550, "synthetic": True, "seed": 20261002, "history":540,"walkthrough":10}), iso()))
     db.commit()
+
+
+def seed_synthetic_norm_catalog(db: sqlite3.Connection) -> None:
+    """Seed explicit UX-only examples; these values are not sourced from a plant standard."""
+    labor_examples = {
+        "crusher":{"planned":1.5,"unscheduled":2.5}, "conveyor":{"planned":1.0,"unscheduled":2.0},
+        "pump":{"planned":1.0,"unscheduled":2.0}, "compressor":{"planned":1.5,"unscheduled":2.5},
+        "fan":{"planned":1.0,"unscheduled":1.5},
+    }
+    material_examples = {
+        "crusher":{"planned":("MAT-006",0.10),"unscheduled":("MAT-001",1.0)},
+        "conveyor":{"planned":("MAT-004",1.0),"unscheduled":("MAT-003",1.0)},
+        "pump":{"planned":("MAT-006",0.10),"unscheduled":("MAT-002",1.0)},
+        "compressor":{"planned":("MAT-005",1.0),"unscheduled":("MAT-007",4.0)},
+        "fan":{"planned":("MAT-006",0.10),"unscheduled":("MAT-001",1.0)},
+    }
+    materials = {row["sku"]:dict(row) for row in db.execute("SELECT id,sku,name,unit FROM materials")}
+    for equipment_type, work_types in labor_examples.items():
+        for work_type, quantity in work_types.items():
+            db.execute("""INSERT OR IGNORE INTO norm_catalog
+                (kind,work_type,equipment_type,material_id,quantity,unit,source_name,source_version,source_note,is_synthetic)
+                VALUES ('labor',?,?,NULL,?,'ч/наряд',?,?,?,1)""",
+                (work_type,equipment_type,quantity,DEMO_NORM_SOURCE,DEMO_NORM_VERSION,DEMO_NORM_NOTE))
+            sku, material_quantity = material_examples[equipment_type][work_type]
+            material = materials.get(sku)
+            if material:
+                db.execute("""INSERT OR IGNORE INTO norm_catalog
+                    (kind,work_type,equipment_type,material_id,quantity,unit,source_name,source_version,source_note,is_synthetic)
+                    VALUES ('material',?,?,?,?,?,?,?,?,1)""",
+                    (work_type,equipment_type,material["id"],material_quantity,material["unit"],
+                     DEMO_NORM_SOURCE,DEMO_NORM_VERSION,DEMO_NORM_NOTE))
 
 
 def audit(db: sqlite3.Connection, actor_id: int | None, order_id: int | None, event: str, payload: dict) -> None:
@@ -1058,9 +1196,16 @@ def worker_rating(db: sqlite3.Connection, worker_id: int, from_date: str | None 
     rework_repeat = round(max(0,1-len(penalized_ids)/max(1,review_count))*100,1) if review_count else None
     points = round(sum(float(r["complexity"] or 1) for r in closed),2)
     quantity_complexity = round(min(100, points/12*100),1) if closed else None
-    rejected = db.execute("SELECT COUNT(DISTINCT a.id) FROM audit a WHERE a.actor_id=? AND a.event='reject' AND a.created_at>=? AND a.created_at<?", (worker_id,since,until)).fetchone()[0]
-    unjustified = db.execute("SELECT COUNT(DISTINCT a.id) FROM rejection_reviews rr JOIN audit a ON a.id=rr.reject_audit_id WHERE rr.worker_id=? AND rr.unjustified=1 AND a.created_at>=? AND a.created_at<?", (worker_id,since,until)).fetchone()[0]
-    refusal_score = round((1-unjustified/rejected)*100,1) if rejected else None
+    rejection_rows = db.execute("""SELECT a.id,rr.unjustified FROM audit a
+        LEFT JOIN rejection_reviews rr ON rr.reject_audit_id=a.id
+        WHERE a.actor_id=? AND a.event='reject' AND a.created_at>=? AND a.created_at<?""",
+        (worker_id,since,until)).fetchall()
+    rejected = len(rejection_rows)
+    unjustified = sum(1 for row in rejection_rows if row["unjustified"] == 1)
+    justified = sum(1 for row in rejection_rows if row["unjustified"] == 0)
+    pending = rejected - justified - unjustified
+    classified = justified + unjustified
+    refusal_score = round((1-unjustified/classified)*100,1) if classified else None
     factors = {"quality": quality,"on_time": on_time,"rework_repeat": rework_repeat,
                "quantity_complexity": quantity_complexity,"unjustified_refusal": refusal_score}
     observed = [(name,value,RATING_WEIGHTS[name]) for name,value in factors.items() if value is not None]
@@ -1072,16 +1217,96 @@ def worker_rating(db: sqlite3.Connection, worker_id: int, from_date: str | None 
                         "confirmed_repeat_failures":repeat_count,"unattributed_repeat_failures":legacy_repeat_count,
                         "repeat_penalty_status":"explicit_master_link_only","repeat_attributions":repeat_attributions,
                         "orders_with_rework_or_repeat":len(penalized_ids),"complexity_points":points,"rejections":rejected,
-                        "unjustified_rejections":unjustified,"observed_weight":denominator}}
+                        "classified_rejections":classified,"justified_rejections":justified,
+                        "unjustified_rejections":unjustified,"pending_rejections":pending,
+                        "observed_weight":denominator}}
 
 
-def order_dict(db: sqlite3.Connection, row: sqlite3.Row, include_history: bool = False) -> dict:
+def synthetic_order_reference(db: sqlite3.Connection, work_type: str, equipment_type: str,
+                              actual_materials: list[dict] | None = None, actual_materials_known: bool = False,
+                              materials_not_used: bool = False, actual_labor_hours: float | None = None,
+                              reference_cache: dict[tuple[str,str],list[dict]] | None = None) -> dict:
+    key=(work_type,equipment_type)
+    if reference_cache is not None and key in reference_cache:
+        rows=reference_cache[key]
+    else:
+        rows = [dict(row) for row in db.execute("""SELECT n.kind,n.quantity,n.unit,n.source_name,n.source_version,n.source_note,
+            m.id AS material_id,m.sku,m.name AS material_name
+            FROM norm_catalog n LEFT JOIN materials m ON m.id=n.material_id
+            WHERE n.work_type=? AND n.equipment_type=? ORDER BY n.kind,m.sku""",key).fetchall()]
+        if reference_cache is not None: reference_cache[key]=rows
+    labor_row = next((row for row in rows if row["kind"]=="labor"),None)
+    material_rows = [row for row in rows if row["kind"]=="material"]
+    reported_actual_materials = [dict(item) for item in (actual_materials or [])]
+    has_reported_material_rows = bool(reported_actual_materials)
+    materials_evidence_conflict = bool(materials_not_used and has_reported_material_rows)
+    if materials_evidence_conflict:
+        materials_evidence_status = "conflict"
+        materials_evidence_note = "Конфликт записей: сохранённые строки расхода показаны как сообщённые факты; отклонение не рассчитывается."
+    elif not actual_materials_known or not (has_reported_material_rows or materials_not_used):
+        materials_evidence_status = "unknown"
+        materials_evidence_note = "Нет строк расхода и явного подтверждения отсутствия материалов; фактический расход и отклонение неизвестны."
+    elif materials_not_used:
+        materials_evidence_status = "confirmed_not_used"
+        materials_evidence_note = "Исполнитель явно подтвердил, что материалы не использовались."
+    else:
+        materials_evidence_status = "reported_usage"
+        materials_evidence_note = "Расход отражён в сохранённых строках материалов."
+    if not rows:
+        return {"status":"unknown","is_synthetic":True,"work_type":work_type,"equipment_type":equipment_type,
+            "equipment_type_label":EQUIPMENT_TYPE_LABELS.get(equipment_type,EQUIPMENT_TYPE_LABELS["unknown"]),
+            "labor":{"status":"unknown","quantity":None,"unit":"ч/наряд","actual_hours":actual_labor_hours,"difference_hours":None},
+            "materials":[],"materials_evidence_status":materials_evidence_status,"materials_evidence_note":materials_evidence_note,
+            "reported_actual_materials":reported_actual_materials,"unreferenced_actual_materials":reported_actual_materials,
+            "source_name":None,"source_version":None,
+            "note":"Нет применимой записи для сочетания типа работы и equipment_type. Значение unknown; автоматический вывод и штраф не применяются."}
+    source = rows[0]
+    actual_by_id = {int(item["id"]):float(item["quantity"]) for item in (actual_materials or []) if item.get("id") is not None}
+    reference_ids = {int(row["material_id"]) for row in material_rows if row["material_id"] is not None}
+    material_references = []
+    for row in material_rows:
+        material_id = int(row["material_id"])
+        if not actual_materials_known:
+            actual_quantity = None
+        elif materials_evidence_conflict:
+            actual_quantity = actual_by_id.get(material_id)
+        elif materials_evidence_status == "unknown":
+            actual_quantity = None
+        elif materials_not_used:
+            actual_quantity = 0.0
+        else:
+            actual_quantity = actual_by_id.get(material_id,0.0)
+        reference_quantity = float(row["quantity"])
+        material_references.append({"material_id":material_id,"sku":row["sku"],"name":row["material_name"],
+            "reference_quantity":reference_quantity,"actual_quantity":actual_quantity,"unit":row["unit"],
+            "difference_quantity":round(actual_quantity-reference_quantity,3) if actual_quantity is not None and not materials_evidence_conflict else None,
+            "source_name":row["source_name"],"source_version":row["source_version"],"source_note":row["source_note"]})
+    labor_quantity = float(labor_row["quantity"]) if labor_row else None
+    return {"status":"synthetic_reference","is_synthetic":True,"work_type":work_type,"equipment_type":equipment_type,
+        "equipment_type_label":EQUIPMENT_TYPE_LABELS.get(equipment_type,EQUIPMENT_TYPE_LABELS["unknown"]),
+        "labor":{"status":"known_synthetic" if labor_row else "unknown","quantity":labor_quantity,"unit":labor_row["unit"] if labor_row else "ч/наряд",
+            "actual_hours":actual_labor_hours,"difference_hours":round(actual_labor_hours-labor_quantity,2) if actual_labor_hours is not None and labor_quantity is not None else None,
+            "source_name":labor_row["source_name"] if labor_row else None,"source_version":labor_row["source_version"] if labor_row else None,
+            "source_note":labor_row["source_note"] if labor_row else None},
+        "materials":material_references,
+        "materials_evidence_status":materials_evidence_status,"materials_evidence_note":materials_evidence_note,
+        "reported_actual_materials":reported_actual_materials,
+        "unreferenced_actual_materials":[item for item in (actual_materials or []) if int(item.get("id",-1)) not in reference_ids],
+        "source_name":source["source_name"],"source_version":source["source_version"],
+        "note":source["source_note"]+" Сравнение фактического и условного значения не влияет на рейтинг и не является основанием для решения по безопасности."}
+
+
+def order_dict(db: sqlite3.Connection, row: sqlite3.Row, include_history: bool = False,
+               reference_cache: dict[tuple[str,str],list[dict]] | None = None) -> dict:
     area = db.execute("SELECT name FROM areas WHERE id=?", (row["area_id"],)).fetchone()[0]
-    equipment = db.execute("SELECT code,name FROM equipment WHERE id=?", (row["equipment_id"],)).fetchone()
+    equipment = db.execute("SELECT code,name,equipment_type FROM equipment WHERE id=?", (row["equipment_id"],)).fetchone()
     worker = db.execute("SELECT id,display_name,brigade,specialty,qualification_level,shift_code FROM users WHERE id=?", (row["assigned_to"],)).fetchone()
     master = db.execute("SELECT id,display_name FROM users WHERE id=?", (row["assigned_master_id"],)).fetchone()
     fault = db.execute("SELECT code,label FROM fault_codes WHERE id=?", (row["fault_code_id"],)).fetchone() if row["fault_code_id"] else None
     materials = [dict(r) for r in db.execute("SELECT m.id,m.sku,m.name,m.unit,om.quantity FROM order_materials om JOIN materials m ON m.id=om.material_id WHERE om.order_id=? ORDER BY m.sku", (row["id"],))]
+    reference = synthetic_order_reference(db,row["work_type"],equipment["equipment_type"],materials,
+        actual_materials_known=bool(row["completed_at"]),materials_not_used=bool(row["materials_not_used"]),
+        actual_labor_hours=row["labor_hours"],reference_cache=reference_cache)
     photos = [dict(r) for r in db.execute("SELECT id,file_name,phase,media_type,size_bytes,duplicate,duplicate_type,uploaded_at,metadata_json FROM photos WHERE order_id=? ORDER BY id", (row["id"],))]
     for photo in photos:
         photo["metadata"] = json.loads(photo.pop("metadata_json"))
@@ -1110,7 +1335,8 @@ def order_dict(db: sqlite3.Connection, row: sqlite3.Row, include_history: bool =
     data.update({"status_label": STATUS_LABELS[row["status"]], "priority_label": PRIORITY_LABELS.get(row["priority"], row["priority"]), "is_overdue": bool(is_late),
                  "work_type_label": "Плановый" if row["work_type"] == "planned" else "Внеплановый",
                  "area": area, "equipment": dict(equipment), "worker": {**dict(worker), "on_shift": shift_is_active(worker["shift_code"])}, "master": dict(master),
-                 "fault_code": dict(fault) if fault else None, "materials": materials, "photos": photos,
+                  "fault_code": dict(fault) if fault else None, "materials": materials, "photos": photos,
+                  "norm_reference":reference,
                   "cycle_minutes": cycle_minutes, "paused_minutes": downtime,
                   "active_work_minutes": max(0,cycle_minutes-downtime) if cycle_minutes is not None else None,
                  "acceptance_limit_minutes": 3 if row["priority"] == "emergency" else 10})
@@ -1226,6 +1452,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 raise ApiError(403,"Кабинет руководителя доступен только для просмотра")
             if path == "/api/logout":
                 return self.logout(user)
+            if path == "/api/equipment/downtime":
+                return self.register_equipment_downtime(user)
             if path == "/api/telegram/pair":
                 return self.telegram_pair(user)
             if path == "/api/telegram/unpair":
@@ -1381,6 +1609,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 return self.telegram_status(db, user)
             if path == "/api/reports":
                 return self.reports(db, user)
+            if path == "/api/equipment/downtime":
+                return self.equipment_downtime_report(db, user)
             if path == "/api/audit":
                 if user["role"] not in ("master", "manager"):
                     raise ApiError(403, "Журнал доступен мастеру и руководителю")
@@ -1432,7 +1662,8 @@ class AppHandler(BaseHTTPRequestHandler):
         elif user["role"] == "master":
             where, args = "WHERE o.assigned_master_id=?", [user["id"]]
         rows = db.execute(f"SELECT o.* FROM orders o {where} ORDER BY CASE o.priority WHEN 'emergency' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, o.due_at,o.id DESC", args).fetchall()
-        orders = [order_dict(db, r) for r in rows]
+        norm_reference_cache: dict[tuple[str,str],list[dict]] = {}
+        orders = [order_dict(db, r, reference_cache=norm_reference_cache) for r in rows]
         notifications = [dict(r) for r in db.execute("SELECT n.id,n.message,n.created_at,n.read_at,n.order_id,o.code AS order_code FROM notifications n LEFT JOIN orders o ON o.id=n.order_id WHERE n.user_id=? ORDER BY n.id DESC LIMIT 25", (user["id"],))]
         members = []
         if user["role"] in ("master", "manager"):
@@ -1463,6 +1694,10 @@ class AppHandler(BaseHTTPRequestHandler):
             "equipment": [dict(r) for r in db.execute("SELECT e.*,a.name AS area FROM equipment e JOIN areas a ON a.id=e.area_id ORDER BY e.code")],
             "fault_codes": [dict(r) for r in db.execute("SELECT * FROM fault_codes ORDER BY code")],
             "materials": [dict(r) for r in db.execute("SELECT * FROM materials ORDER BY sku")],
+            "norm_catalog": [dict(r) for r in db.execute("""SELECT n.id,n.kind,n.work_type,n.equipment_type,n.material_id,
+                m.sku,m.name AS material_name,n.quantity,n.unit,n.source_name,n.source_version,n.source_note,n.is_synthetic
+                FROM norm_catalog n LEFT JOIN materials m ON m.id=n.material_id
+                ORDER BY n.work_type,n.equipment_type,n.kind,m.sku""")],
             "users": [dict(r) for r in db.execute("SELECT id,display_name,role,brigade,specialty,qualification_level,shift_code FROM users ORDER BY role,display_name")]
         }
         free_workers = [dict(r) for r in db.execute("""SELECT u.id,u.username,u.display_name,u.brigade,u.specialty,u.qualification_level,u.shift_code,
@@ -1506,10 +1741,16 @@ class AppHandler(BaseHTTPRequestHandler):
         if brigade: where.append("u.brigade=?"); params.append(brigade)
         if shift_code: where.append("u.shift_code=?"); params.append(shift_code)
         items = [dict(r) for r in db.execute(f"""SELECT o.id,o.code,o.title,o.status,o.created_at,o.completed_at,o.closed_at,o.issued_at,o.due_at,
-                    o.labor_hours,o.completion_text,o.rating,o.rating_reason,o.reject_reason,u.display_name AS worker,u.brigade,u.shift_code,
-                    fc.code AS fault_code,e.name AS equipment
+                    o.work_type,o.materials_not_used,o.labor_hours,o.completion_text,o.rating,o.rating_reason,o.reject_reason,u.display_name AS worker,u.brigade,u.shift_code,
+                    fc.code AS fault_code,e.code AS equipment_code,e.name AS equipment,e.equipment_type
                     FROM orders o JOIN users u ON u.id=o.assigned_to JOIN equipment e ON e.id=o.equipment_id
                     LEFT JOIN fault_codes fc ON fc.id=o.fault_code_id WHERE {' AND '.join(where)} ORDER BY o.completed_at""", params)]
+        norm_reference_cache: dict[tuple[str,str],list[dict]] = {}
+        for item in items:
+            actual_materials = [dict(r) for r in db.execute("SELECT m.id,m.sku,m.name,m.unit,om.quantity FROM order_materials om JOIN materials m ON m.id=om.material_id WHERE om.order_id=? ORDER BY m.sku",(item["id"],))]
+            item["norm_reference"] = synthetic_order_reference(db,item["work_type"],item["equipment_type"],actual_materials,
+                actual_materials_known=True,materials_not_used=bool(item["materials_not_used"]),
+                actual_labor_hours=item["labor_hours"],reference_cache=norm_reference_cache)
         hours = round(sum(r["labor_hours"] or 0 for r in items), 2)
         top = max(items, key=lambda r: sum(1 for x in items if x["fault_code"] and x["fault_code"] == r["fault_code"]), default=None)
         late = sum(1 for r in items if r["due_at"] and r["completed_at"] and r["completed_at"] > r["due_at"])
@@ -1527,6 +1768,24 @@ class AppHandler(BaseHTTPRequestHandler):
                 elif event["event"] == "resume" and pause_start and at:
                     pause_total += max(0, int((at-pause_start).total_seconds()//60)); pause_start = None
             if pause_start and end_time: pause_total += max(0, int((end_time-pause_start).total_seconds()//60))
+        if user["role"] in ("master", "manager"):
+            downtime_scope = "WHERE d.started_at<? AND d.ended_at>?"
+            downtime_args: list = [until, start]
+            if user["role"] == "master":
+                downtime_scope += " AND d.recorded_by=?"; downtime_args.append(user["id"])
+            downtime_rows = db.execute("""SELECT d.*,e.code AS equipment_code,e.name AS equipment,u.display_name AS recorded_by
+                FROM equipment_downtime d JOIN equipment e ON e.id=d.equipment_id
+                JOIN users u ON u.id=d.recorded_by """ + downtime_scope + " ORDER BY d.started_at", downtime_args).fetchall()
+            equipment_downtime = summarize_equipment_downtime(downtime_rows, parse_time(start), parse_time(until), shift_code)
+            equipment_downtime_minutes = equipment_downtime["minutes"]
+            equipment_downtime_equipment = equipment_downtime["equipment"]
+            equipment_downtime_intervals = equipment_downtime["intervals"]
+            equipment_downtime_note = "Простой учитывает только явно зарегистрированные интервалы UTC; перекрытия объединены по каждому оборудованию. Фильтр бригады на оборудование не распространяется."
+        else:
+            equipment_downtime_minutes = None
+            equipment_downtime_equipment = []
+            equipment_downtime_intervals = []
+            equipment_downtime_note = "Журнал простоя оборудования доступен только мастеру и руководителю."
         if item_ids:
             placeholders = ",".join("?" for _ in item_ids)
             for row in db.execute(f"""SELECT m.sku,m.name,m.unit,SUM(om.quantity) AS quantity FROM order_materials om
@@ -1542,6 +1801,22 @@ class AppHandler(BaseHTTPRequestHandler):
                             [start, until, *scope_args]).fetchone()[0]
         overdue = db.execute("SELECT COUNT(*) FROM orders o JOIN users u ON u.id=o.assigned_to WHERE o.status IN ('issued','accepted','queued','in_progress','paused','rework') AND o.due_at<?" + scope_sql,
                              [iso(), *scope_args]).fetchone()[0]
+        refusal_where = ["a.event='reject'", "a.actor_id IS NOT NULL", "a.created_at>=?", "a.created_at<?"]
+        refusal_args: list = [start, until]
+        if user["role"] == "worker":
+            refusal_where.append("a.actor_id=?"); refusal_args.append(user["id"])
+        elif user["role"] == "master":
+            refusal_where.append("o.assigned_master_id=?"); refusal_args.append(user["id"])
+        if brigade:
+            refusal_where.append("actor.brigade=?"); refusal_args.append(brigade)
+        refusal_rows = db.execute(f"""SELECT DISTINCT a.id,a.created_at FROM audit a
+                    JOIN orders o ON o.id=a.order_id JOIN users actor ON actor.id=a.actor_id
+                    WHERE {' AND '.join(refusal_where)}""", refusal_args).fetchall()
+        refusals = 0
+        for refusal in refusal_rows:
+            event_time = parse_time(refusal["created_at"])
+            if event_time and (not shift_code or active_shift_code(event_time) == shift_code):
+                refusals += 1
         closed = sum(1 for r in items if r["status"] == "closed")
         summary_text = (f"За {start_day} — {end_day} завершено {closed} из {len(items)} нарядов; трудозатраты {hours} ч" +
                         (f"; чаще указан код {top['fault_code']} на {top['equipment']}" if top and top["fault_code"] else "."))
@@ -1552,7 +1827,7 @@ class AppHandler(BaseHTTPRequestHandler):
             # Only counts and totals leave the server; no report text, names, equipment, fault codes or rows.
             aggregate = {"date_from":start_day,"date_to":end_day,"period_days":days,"brigade_filter":brigade or "all",
                          "shift_filter":shift_code or "all","issued":issued,"completed":len(items),"closed":closed,
-                         "labor_hours":hours,"late_completions":late,"current_overdue_orders":overdue,"pause_minutes":pause_total}
+                    "labor_hours":hours,"late_completions":late,"current_overdue_orders":overdue,"pause_minutes":pause_total}
             try:
                 summary_text, summary_mode = llm_report_summary(aggregate)
             except (urllib.error.URLError, http.client.HTTPException, TimeoutError, OSError, ValueError,
@@ -1560,18 +1835,91 @@ class AppHandler(BaseHTTPRequestHandler):
                 summary_mode = "rules-only: adapter_error"
         summary = {"date_from":start_day,"date_to":end_day,"period_days":days,"brigade":brigade or "все",
                    "shift_code":shift_code or "все","shift_is_synthetic":True,"issued":issued,"completed":len(items),
+                   "refusals":refusals,"refusal_basis":"audit_event.created_at_utc",
+                   "refusals_note":"Отказы считаются по событиям audit reject за UTC-период; отмены мастером не включены. Для счётчика отказов фильтр смены использует время события, а не shift_code профиля.",
                    "closed":closed,"labor_hours":hours,"late_completions":late,"current_overdue_orders":overdue,
-                   "pause_minutes":pause_total,"pause_minutes_note":"Пауза вычислена только по событиям журнала и не является подтверждённым простоем оборудования.",
+                    "pause_minutes":pause_total,"pause_minutes_note":"Пауза вычислена только по событиям журнала и не является подтверждённым простоем оборудования.",
+                    "equipment_downtime_minutes":equipment_downtime_minutes,
+                    "equipment_downtime_note":equipment_downtime_note,
                     "synthetic":True,"summary_mode":summary_mode}
         for group in worker_totals.values(): group["labor_hours"] = round(group["labor_hours"], 2)
         return self.send_json({"summary":summary,"items":items,"worker_totals":list(worker_totals.values()),
                                "material_totals":list(materials.values()),"ai_summary":summary_text,
+                               "equipment_downtime_by_equipment":equipment_downtime_equipment,
+                               "equipment_downtime_intervals":equipment_downtime_intervals,
                                "ai_summary_mode":summary_mode,"ai_summary_available":llm_summary_available})
+
+    def equipment_downtime_report(self, db: sqlite3.Connection, user: sqlite3.Row) -> None:
+        if user["role"] not in ("master", "manager"):
+            raise ApiError(403, "Интервалы простоя оборудования доступны мастеру и руководителю")
+        query = parse_qs(urlparse(self.path).query)
+        start, until, start_day, end_day, _ = date_window(query.get("date_from", [None])[0],
+            query.get("date_to", [None])[0], default_days=1)
+        shift_code = query.get("shift_code", [""])[0] or None
+        if shift_code and shift_code not in SHIFT_WINDOWS_UTC:
+            raise ApiError(400, "Неизвестная смена")
+        scope = "WHERE d.started_at<? AND d.ended_at>?"
+        args: list = [until, start]
+        if user["role"] == "master":
+            scope += " AND d.recorded_by=?"; args.append(user["id"])
+        rows = db.execute("""SELECT d.*,e.code AS equipment_code,e.name AS equipment,u.display_name AS recorded_by
+            FROM equipment_downtime d JOIN equipment e ON e.id=d.equipment_id
+            JOIN users u ON u.id=d.recorded_by """ + scope + " ORDER BY d.started_at DESC", args).fetchall()
+        result = summarize_equipment_downtime(rows, parse_time(start), parse_time(until), shift_code)
+        self.send_json({**result,"date_from":start_day,"date_to":end_day,"shift_code":shift_code or "все",
+            "synthetic":True,"note":"Только явно зарегистрированные интервалы UTC; пересечения объединены по каждому оборудованию."})
 
     def order_history(self, db: sqlite3.Connection, order_id: int, user: sqlite3.Row) -> list[dict]:
         rows = db.execute("""SELECT a.event,a.payload_json,a.created_at,u.display_name AS actor_name
                              FROM audit a LEFT JOIN users u ON u.id=a.actor_id WHERE a.order_id=? ORDER BY a.id""", (order_id,)).fetchall()
         return [{**dict(r), "payload": json.loads(r["payload_json"])} for r in rows]
+
+    def register_equipment_downtime(self, user: sqlite3.Row) -> None:
+        if user["role"] != "master":
+            raise ApiError(403, "Регистрировать простой оборудования может только мастер")
+        body = self.read_json(8_000)
+        try:
+            equipment_id = int(body.get("equipment_id"))
+        except (TypeError, ValueError):
+            raise ApiError(400, "Выберите оборудование")
+        started = parse_time(str(body.get("started_at", "")))
+        ended = parse_time(str(body.get("ended_at", "")))
+        if not started or not ended:
+            raise ApiError(400, "Укажите начало и окончание с часовым поясом, например UTC с суффиксом Z")
+        started, ended = started.astimezone(timezone.utc), ended.astimezone(timezone.utc)
+        if started >= ended:
+            raise ApiError(400, "Окончание должно быть позже начала")
+        if ended - started > timedelta(days=31):
+            raise ApiError(400, "Один интервал ограничен 31 сутками")
+        reason = str(body.get("reason", "")).strip()[:500]
+        if len(reason) < 4:
+            raise ApiError(400, "Укажите причину регистрации (не менее 4 символов)")
+        idempotency_key = str(body.get("idempotency_key", "")).strip()
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{8,100}", idempotency_key):
+            raise ApiError(400, "Для безопасного повтора нужен idempotency_key длиной 8–100 символов")
+        started_value, ended_value = iso(started), iso(ended)
+        with connect(self.server.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT * FROM equipment_downtime WHERE idempotency_key=?", (idempotency_key,)).fetchone()
+            if existing:
+                if (existing["equipment_id"], existing["started_at"], existing["ended_at"], existing["reason"], existing["recorded_by"]) != \
+                   (equipment_id, started_value, ended_value, reason, user["id"]):
+                    raise ApiError(409, "Этот idempotency_key уже использован с другими данными")
+                db.commit()
+                return self.send_json({"item": dict(existing), "duplicate": True})
+            equipment = db.execute("SELECT id FROM equipment WHERE id=?", (equipment_id,)).fetchone()
+            if not equipment:
+                raise ApiError(400, "Оборудование не найдено")
+            created_at = iso()
+            cur = db.execute("""INSERT INTO equipment_downtime
+                (equipment_id,started_at,ended_at,reason,idempotency_key,recorded_by,created_at)
+                VALUES (?,?,?,?,?,?,?)""", (equipment_id, started_value, ended_value, reason, idempotency_key, user["id"], created_at))
+            downtime_id = cur.lastrowid
+            audit(db, user["id"], None, "equipment_downtime_registered", {"downtime_id": downtime_id,
+                "equipment_id": equipment_id, "started_at": started_value, "ended_at": ended_value, "reason": reason})
+            db.commit()
+            return self.send_json({"item": dict(db.execute("SELECT * FROM equipment_downtime WHERE id=?", (downtime_id,)).fetchone()),
+                                   "duplicate": False}, 201)
 
     def create_order(self, user: sqlite3.Row) -> None:
         if user["role"] != "master": raise ApiError(403, "Новый наряд может выдать мастер")
@@ -1725,7 +2073,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Код неисправности не найден")
                 material_values = body.get("materials", [])
                 if not isinstance(material_values, list): raise ApiError(400, "Материалы должны быть списком")
-                materials_not_used = bool(body.get("materials_not_used"))
+                materials_not_used_value = body.get("materials_not_used", False)
+                if not isinstance(materials_not_used_value, bool):
+                    raise ApiError(400, "materials_not_used должен быть логическим значением")
+                materials_not_used = materials_not_used_value
+                if materials_not_used and material_values:
+                    raise ApiError(400, "Нельзя одновременно указать расход материалов и подтвердить, что материалы не использовались")
                 if not material_values and not materials_not_used: raise ApiError(400, "Добавьте использованные материалы либо подтвердите, что материалы не использовались")
                 if len(text_value) < 20: raise ApiError(400, "Опишите выполненную работу и результат (не менее 20 символов)")
                 photo_rows = db.execute("SELECT COUNT(*) AS total,SUM(CASE WHEN duplicate=0 THEN 1 ELSE 0 END) AS unique_count FROM photos WHERE order_id=? AND phase='after'", (order_id,)).fetchone()

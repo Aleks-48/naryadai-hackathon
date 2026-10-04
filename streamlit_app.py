@@ -7,7 +7,8 @@ import json
 import os
 import tempfile
 import threading
-from datetime import date
+import uuid
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 from typing import Any
@@ -499,14 +500,143 @@ def create_order(constants: dict[str, Any], workers: list[dict[str, Any]]) -> No
             type_col, priority_col, hours_col = st.columns([1, 1, .8])
             work_type = type_col.selectbox("Тип", ["planned", "unscheduled"], format_func=lambda x: {"planned":"Плановая", "unscheduled":"Внеплановая"}[x])
             priority = priority_col.selectbox("Приоритет", ["normal", "high", "emergency", "planned"], format_func=lambda x: {"normal":"Обычный", "high":"Высокий", "emergency":"Аварийный", "planned":"Плановый"}[x])
-            hours = hours_col.number_input("Срок, часов", 0.5, 720.0, 8.0, step=0.5)
+            hours = hours_col.number_input("До дедлайна, часов", 0.5, 720.0, 8.0, step=0.5)
             if st.form_submit_button("Выдать через API", type="primary"):
                 body = {"title": title, "description": description, "area_id": area_id, "equipment_id": equipment_id,
                         "worker_id": user_id, "work_type": work_type, "priority": priority, "norm_hours": hours}
                 api("POST", "/api/orders", body); st.success("Наряд сохранён на сервере."); st.rerun()
+        selected_equipment=next((item for item in choices if item["id"]==equipment_id),None)
+        if selected_equipment:
+            catalog=constants.get("norm_catalog",[])
+            applicable=[item for item in catalog if item["work_type"]==work_type and item["equipment_type"]==selected_equipment.get("equipment_type","unknown")]
+            if applicable:
+                st.caption("Учебный синтетический ориентир. Он не задаёт дедлайн, не является утверждённой нормой и не влияет на рейтинг.")
+                st.dataframe([{"Тип":row["kind"],"Ориентир":row.get("material_name") or "Труд", "Количество":row["quantity"],
+                    "Единица":row["unit"],"Источник":row["source_name"],"Версия":row["source_version"]} for row in applicable],width="stretch",hide_index=True)
+            else:
+                st.info("Ориентир: unknown для этого сочетания типа работы и оборудования. Автоматическое сравнение не выполняется.")
 
 
-def reports_panel() -> None:
+RATING_FACTORS = (
+    ("quality", "Качество закрытых нарядов", 40),
+    ("on_time", "Соблюдение срока", 20),
+    ("rework_repeat", "Доработки и подтверждённые повторы", 20),
+    ("quantity_complexity", "Объём и сложность", 10),
+    ("unjustified_refusal", "Обоснованность отказов", 10),
+)
+
+
+def rating_factor_rows(detail: dict[str, Any] | None) -> list[dict[str, Any]]:
+    factors = (detail or {}).get("factors") or {}
+    weights = (detail or {}).get("factor_weights") or {}
+    return [{
+        "Фактор": label,
+        "Значение / 100": factors.get(key),
+        "Базовый вес, %": weights.get(key, weight),
+    } for key, label, weight in RATING_FACTORS]
+
+
+def rating_value(detail: dict[str, Any] | None) -> float | str:
+    score = (detail or {}).get("score")
+    return score if score is not None else "Нет данных"
+
+
+def refusal_classification_row(detail: dict[str, Any] | None) -> dict[str, Any]:
+    evidence = (detail or {}).get("evidence") or {}
+    return {
+        "Отказы — события": evidence.get("rejections", 0),
+        "Обоснованы мастером": evidence.get("justified_rejections", 0),
+        "Необоснованы мастером": evidence.get("unjustified_rejections", 0),
+        "Pending · ждут решения мастера": evidence.get("pending_rejections", 0),
+    }
+
+
+def worker_rating_panel(detail: dict[str, Any] | None) -> None:
+    st.subheader("Мой общий рейтинг")
+    st.metric("Рейтинг / 100", rating_value(detail))
+    if not detail:
+        st.caption("Рейтинг пока недоступен.")
+        return
+    st.dataframe(rating_factor_rows(detail), width="stretch", hide_index=True)
+    st.subheader("Классификация отказов")
+    st.dataframe([refusal_classification_row(detail)], width="stretch", hide_index=True)
+    st.caption("Pending — отказ без решения мастера. Он исключён из фактора рейтинга до классификации и не считается ни обоснованным, ни необоснованным.")
+    st.caption(
+        f"Период {detail.get('period_from')} — {detail.get('period_to')} (UTC). "
+        "Оценка общая за период, по отдельным нарядам баллы не выставляются. "
+        "Факторы без данных исключаются, веса остальных нормализуются."
+    )
+
+
+def team_rating_rows(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for member in members:
+        detail = member.get("rating_detail") or {}
+        factors = detail.get("factors") or {}
+        refusal_counts = refusal_classification_row(detail)
+        rows.append({
+            "Исполнитель": member.get("display_name"),
+            "Бригада": member.get("brigade"),
+            "Занятость": member.get("availability_label"),
+            "Специализация": member.get("specialty"),
+            "Квалификация": member.get("qualification_level"),
+            "Смена профиля": member.get("shift_code"),
+            "Активные наряды": member.get("active_orders"),
+            "Общий рейтинг / 100": detail.get("score"),
+            **{label: factors.get(key) for key, label, _ in RATING_FACTORS},
+            **refusal_counts,
+        })
+    return rows
+
+
+def reports_panel(user: dict[str, Any], constants: dict[str, Any]) -> None:
+    if user["role"] == "master":
+        st.subheader("Зарегистрировать простой оборудования")
+        st.caption("Закрытый интервал времени устройства, который сервер нормализует в UTC. Это отдельный журнал, не пауза исполнителя и не доказательство неисправности/исправности.")
+        equipment = constants.get("equipment", [])
+        now_utc = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        default_start = now_utc-timedelta(hours=1)
+        with st.form("equipment-downtime"):
+            equipment_by_id = {int(row["id"]): row for row in equipment}
+            selected_equipment = st.selectbox("Оборудование",list(equipment_by_id),
+                format_func=lambda value: f"{equipment_by_id[value]['code']} · {equipment_by_id[value]['name']}")
+            c1,c2=st.columns(2)
+            start_day=c1.date_input("Начало · дата UTC",value=default_start.date())
+            start_clock=c1.time_input("Начало · время UTC",value=default_start.time())
+            end_day=c2.date_input("Окончание · дата UTC",value=now_utc.date())
+            end_clock=c2.time_input("Окончание · время UTC",value=now_utc.time())
+            reason=st.text_input("Причина регистрации",max_chars=500,placeholder="Краткое основание внесения интервала")
+            register=st.form_submit_button("Сохранить интервал")
+        if register:
+            started=datetime.combine(start_day,start_clock,tzinfo=timezone.utc)
+            ended=datetime.combine(end_day,end_clock,tzinfo=timezone.utc)
+            if started>=ended:
+                st.error("Окончание должно быть позже начала.")
+            else:
+                payload={"equipment_id":selected_equipment,"started_at":started.isoformat().replace("+00:00","Z"),
+                    "ended_at":ended.isoformat().replace("+00:00","Z"),"reason":reason.strip()}
+                fingerprint=json.dumps(payload,sort_keys=True,ensure_ascii=False)
+                if st.session_state.get("downtime_fingerprint")!=fingerprint:
+                    st.session_state.downtime_fingerprint=fingerprint
+                    st.session_state.downtime_key=uuid.uuid4().hex
+                payload["idempotency_key"]=st.session_state.downtime_key
+                try:
+                    result=api("POST","/api/equipment/downtime",payload)
+                    st.success("Интервал сохранён." if not result.get("duplicate") else "Повтор распознан; дубликат не создан.")
+                    st.session_state.pop("downtime_fingerprint",None);st.session_state.pop("downtime_key",None)
+                except RuntimeError as error:
+                    st.error(str(error))
+    st.subheader("Синтетический каталог материалов и трудовых ориентиров")
+    catalog=constants.get("norm_catalog",[])
+    if catalog:
+        st.dataframe([{"Тип работы":row["work_type"],"Тип оборудования":row["equipment_type"],
+            "Вид":row["kind"],"Материал":row.get("material_name") or "Труд",
+            "Артикул":row.get("sku"),"Количество":row["quantity"],"Единица":row["unit"],
+            "Источник":row["source_name"],"Версия":row["source_version"],"Комментарий":row["source_note"]}
+            for row in catalog],width="stretch",hide_index=True)
+        st.caption("Все количества — только синтетические учебные значения. Они не являются нормой заказчика, не определяют дедлайн, не оценивают сотрудника и не влияют на рейтинг.")
+    else:
+        st.info("Каталог отсутствует: значение unknown, автоматическое сравнение не выполняется.")
     with st.form("reports"):
         c1,c2=st.columns(2)
         from_day=c1.date_input("С", value=date.today());to_day=c2.date_input("По", value=date.today())
@@ -520,19 +650,45 @@ def reports_panel() -> None:
         summary=data["summary"]
         with st.container(key="report-summary"):
             st.subheader("Итоги периода")
-            metric_columns=st.columns(4)
+            metric_columns=st.columns(6 if user["role"] in ("master","manager") else 5)
             metric_columns[0].metric("Исполнено",summary.get("completed",0))
             metric_columns[1].metric("Закрыто мастером",summary.get("closed",0))
             metric_columns[2].metric("Просрочено",summary.get("late_completions",0))
             metric_columns[3].metric("Трудозатраты, ч",summary.get("labor_hours",0))
-            st.caption(f"{summary.get('date_from')} — {summary.get('date_to')} · {summary.get('summary_mode','rules-only')} · {summary.get('pause_minutes_note','')}")
+            metric_columns[4].metric("Отказы по событиям",summary.get("refusals",0))
+            if user["role"] in ("master","manager"):
+                metric_columns[5].metric("Простой оборудования, мин",summary.get("equipment_downtime_minutes",0))
+            st.caption(f"{summary.get('date_from')} — {summary.get('date_to')} · {summary.get('summary_mode','rules-only')} · {summary.get('refusals_note','')} · {summary.get('pause_minutes_note','')} · {summary.get('equipment_downtime_note','')}")
             st.info(data.get("ai_summary",""))
+        if user["role"] in ("master","manager"):
+            st.subheader("Зарегистрированный простой по оборудованию")
+            st.dataframe(data.get("equipment_downtime_by_equipment",[]),width="stretch",hide_index=True)
+            st.caption("Суммы обрезаны по выбранному UTC-периоду и объединены без перекрывающихся минут на одном оборудовании. Фильтр бригады на интервалы оборудования не действует.")
         st.subheader("По исполнителям")
         st.dataframe(data.get("worker_totals",[]),width="stretch")
         st.subheader("Материалы")
         st.dataframe(data.get("material_totals",[]),width="stretch")
         st.subheader("Наряды периода")
-        st.dataframe(data.get("items",[]),width="stretch")
+        order_rows=[]
+        for item in data.get("items",[]):
+            reference=item.get("norm_reference") or {}
+            labor=reference.get("labor") or {}
+            material_checks=reference.get("materials") or []
+            material_display="; ".join(f"{row.get('sku')}: {row.get('reference_quantity')} {row.get('unit')} / фактически {row.get('actual_quantity') if row.get('actual_quantity') is not None else 'unknown'}" for row in material_checks) or "unknown · нет строки каталога"
+            unreferenced="; ".join(f"{row.get('sku')}: {row.get('quantity')} {row.get('unit')}" for row in reference.get("unreferenced_actual_materials",[])) or "—"
+            evidence_labels={"unknown":"Не подтверждён","confirmed_not_used":"Подтверждено: не использовались",
+                "reported_usage":"Есть строки расхода","conflict":"Конфликт флага и строк"}
+            material_evidence=evidence_labels.get(reference.get("materials_evidence_status"),"Неизвестно")
+            reported_materials="; ".join(f"{row.get('sku')}: {row.get('quantity')} {row.get('unit')}" for row in reference.get("reported_actual_materials",[])) or "-"
+            order_rows.append({"Наряд":item.get("code"),"Оборудование":item.get("equipment"),"Исполнитель":item.get("worker"),
+                "Статус":item.get("status"),"Дедлайн UTC":item.get("due_at"),"Фактические часы":item.get("labor_hours"),
+                "Учебный ориентир, ч/наряд":labor.get("quantity") if reference.get("status")!="unknown" else "unknown",
+                "Материалы · ориентир / факт":material_display,"Без строки каталога":unreferenced,
+                "Свидетельство расхода":material_evidence,
+                "Записанные фактические материалы":reported_materials,
+                "Источник/версия":reference.get("source_name") or "нет записи", "Оценка":item.get("rating")})
+        st.dataframe(order_rows,width="stretch",hide_index=True)
+        st.caption("Дедлайн, фактические трудозатраты и синтетический ориентир — разные поля. Сравнение справочное и не влияет на рейтинг.")
 
 
 @st.fragment(run_every=5.0)
@@ -633,13 +789,15 @@ def main() -> None:
         st.info("Синтетическая демонстрация. ИИ и фото не являются допуском к опасной работе и не подтверждают исправность оборудования.")
         if EMBEDDED_MODE:
             st.warning("Общие демо-аккаунты, наряды и синтетические фото видны другим участникам; перезапуск может очистить данные. Используйте только встроенные образцы.")
+        if user["role"] == "worker":
+            worker_rating_panel(bootstrap.get("my_rating"))
         if page == "Отчёт":
-            reports_panel()
+            reports_panel(user,constants)
             return
         if page == "Команда":
             st.subheader("Занятость команды")
-            st.dataframe([ {k:x.get(k) for k in ("display_name","brigade","availability_label","specialty","qualification_level","shift_code","active_orders")} for x in bootstrap.get("members",[]) ], width="stretch")
-            st.caption("Доступность, квалификация и график смен показаны для синтетических профилей.")
+            st.dataframe(team_rating_rows(bootstrap.get("members",[])), width="stretch", hide_index=True)
+            st.caption("Рейтинг общий за период UTC; значения факторов и базовые веса приведены отдельно. Pending-отказы без решения мастера видны отдельно и не входят в фактор до классификации. Пропущенные факторы исключаются, веса остальных нормализуются. Нарядные оценки не показываются. Доступность и смены относятся к синтетическим профилям.")
         if user["role"] == "master":
             create_order(constants, bootstrap.get("free_workers", []))
         live_orders_panel(user, constants)

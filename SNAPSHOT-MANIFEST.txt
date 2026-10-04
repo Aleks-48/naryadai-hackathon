@@ -1,0 +1,15 @@
+NaryadAI bounded QA source snapshot
+Base commit: a494cce062c59e6218ceaf9040f91f097bae2cb0
+Contains tracked HEAD source plus current tracked worktree changes.
+QA corrections: unknown material consumption remains unknown; contradictory no-use evidence is rejected for new completions and preserved as conflict when already stored; legacy equipment types backfill only exact seed code/name pairs; downtime totals accumulate seconds before minute conversion.
+No Git metadata, runtime database, uploaded media, local environment, or secrets are included. This local snapshot is uncommitted; no push or deployment was performed.
+Changed files:
+  README.md
+  docs/api.md
+  docs/requirements-and-scope.md
+  server.py
+  static/app.js
+  static/sw.js
+  streamlit_app.py
+  tests/run_streamlit_apptest.py
+  tests/test_app.py
