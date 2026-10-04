@@ -107,6 +107,7 @@ body{font-size:16px;line-height:1.45}
 .timeline-item span{font-size:11px;line-height:1.4}
 .demo-note{font-size:11px;line-height:1.5}
 .notification-popover h3{font-size:15px}
+.notification-popover .popover-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}.notification-popover .popover-head h3{margin:0}
 .notification-item{font-size:12px;line-height:1.45}
 .notification-item small{font-size:11px;line-height:1.4}
 

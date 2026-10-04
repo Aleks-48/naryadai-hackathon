@@ -2,7 +2,7 @@
   "use strict";
   const $ = (s, root = document) => root.querySelector(s);
   const $$ = (s, root = document) => [...root.querySelectorAll(s)];
-  const S = { me: null, data: null, view: "home", orderId: null, filter: "all", search: "", areaFilter:"", equipmentFilter:"", workerFilter:"", priorityFilter:"", timer: null, installPrompt: null, report: null, session: 0, refreshRequest: 0, drawerVersion: 0, drawerRequest: 0, drawerOrderId: null, drawerStatus: null, viewVersion: 0, reportRequest: 0, ratingFrom:"", ratingTo:"", ratingShift:"", reportFrom:"", reportTo:"", reportShift:"", reportBrigade:"", completing: new Set(), uploading: new Set(), creatingOrder: false };
+  const S = { me: null, data: null, view: "home", orderId: null, filter: "all", search: "", areaFilter:"", equipmentFilter:"", workerFilter:"", priorityFilter:"", timer: null, installPrompt: null, report: null, session: 0, refreshRequest: 0, drawerVersion: 0, drawerRequest: 0, drawerOrderId: null, drawerStatus: null, viewVersion: 0, reportRequest: 0, telegramRequest: 0, telegramOutsideHandler: null, ratingFrom:"", ratingTo:"", ratingShift:"", reportFrom:"", reportTo:"", reportShift:"", reportBrigade:"", completing: new Set(), uploading: new Set(), creatingOrder: false };
   const STATUS_RU = {issued:"Выдан",accepted:"Принят",queued:"В очереди",rejected:"Отклонён",in_progress:"В работе",paused:"Приостановлен",executed:"Исполнено",ai_review:"Проверка ИИ",rework:"Доработка",closed:"Закрыт"};
   const EVENT_RU = {issued:"Выдал наряд",accept:"Принял наряд",queue:"Поставил в очередь",reject:"Отклонил наряд",start:"Начал работу",pause:"Приостановил работу",resume:"Продолжил работу",complete:"Зафиксировал исполнение",ai_check:"Проверил отчёт",request_rework:"Вернул на доработку",close:"Принял и закрыл",reissue:"Выдал повторно",reassigned:"Переназначил",cancel:"Отменил наряд",priority_changed:"Изменил приоритет",photo_uploaded:"Загрузил фото",rating_adjusted:"Изменил оценку",rejection_classified:"Классифицировал отказ",acceptance_escalated:"Эскалация принятия",deadline_reminder:"Напоминание о сроке",deadline_escalated:"Эскалация просрочки",deadline_repeat:"Повторное сообщение о просрочке"};
   const ESC = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
@@ -37,10 +37,10 @@
   function toast(message, isError=false) {
     const node=document.createElement("div"); node.className=`toast${isError?" error":""}`; node.textContent=message; $("#toast-region").append(node); setTimeout(()=>node.remove(),4200);
   }
-  function logoutLocal(){ S.session++;S.me=null;S.data=null;S.view="home";S.report=null;S.completing.clear();S.uploading.clear();S.creatingOrder=false;closeDrawer();clearInterval(S.timer);$("#notification-popover")?.remove();$("#view-root").innerHTML="";$("#detail-drawer").innerHTML="";$("#app").classList.add("hidden");$("#login-screen").classList.remove("hidden"); }
+  function logoutLocal(){ S.session++;closeTelegramPopover();S.me=null;S.data=null;S.view="home";S.report=null;S.completing.clear();S.uploading.clear();S.creatingOrder=false;closeDrawer();clearInterval(S.timer);$("#notification-popover")?.remove();$("#view-root").innerHTML="";$("#detail-drawer").innerHTML="";$("#app").classList.add("hidden");$("#login-screen").classList.remove("hidden"); }
 
   async function login(event){
-    event.preventDefault(); S.session++; $("#login-error").textContent="";
+    event.preventDefault(); S.session++;closeTelegramPopover(); $("#login-error").textContent="";
     const button=$("#login-form button[type=submit]"); button.disabled=true; button.textContent="Проверяем доступ…";
     try { const result=await api("/api/login","POST",{username:$("#username").value.trim(),password:$("#password").value});
       S.me=result.user; await startApp();
@@ -68,6 +68,7 @@
   }
   function syncChrome(){
     $("#sidebar-name").textContent=S.me.display_name;$("#sidebar-role").textContent=S.me.role_label;$("#top-avatar").textContent=initials(S.me.display_name);$("#sidebar-avatar").textContent=initials(S.me.display_name);
+    $("#telegram-button").classList.toggle("hidden",role()==="manager");
     const unseen=(S.data.notifications||[]).filter(n=>!n.read_at).length; const badge=$("#notification-count"); badge.textContent=unseen;badge.classList.toggle("hidden",!unseen);
     const roleAllowed={worker:["home","orders","reports"],master:["home","orders","team","reports","audit"],manager:["home","orders","team","reports","audit"]}[role()];
     $$(".nav-item").forEach(b=>{b.classList.toggle("hidden",!roleAllowed.includes(b.dataset.view));b.classList.toggle("active",b.dataset.view===S.view);});
@@ -152,17 +153,17 @@
     <section class="panel"><div class="report-controls"><label class="field-label">С <input id="report-from" class="field-input" type="date" value="${ESC(S.reportFrom||today)}"></label><label class="field-label">По <input id="report-to" class="field-input" type="date" value="${ESC(S.reportTo||today)}"></label><label class="field-label">Бригада <select id="report-brigade" class="field-select"><option value="">все</option>${["A","B","C"].map(x=>`<option value="${x}" ${S.reportBrigade===x?"selected":""}>${x}</option>`).join("")}</select></label><label class="field-label">Смена <select id="report-shift" class="field-select"><option value="">все</option>${["A","B","C"].map(x=>`<option value="${x}" ${S.reportShift===x?"selected":""}>${x} · UTC</option>`).join("")}</select></label><button class="button button-primary" id="load-report">Сформировать отчёт</button></div><div id="report-result"><div class="empty-state">Выберите период и сформируйте отчёт.</div></div></section>`;}
   function bindReportControls(){
     $("#load-report")?.addEventListener("click",loadReport);
-    $("#report-result")?.addEventListener("click",()=>{});
+    $("#report-result")?.addEventListener("click",e=>{if(e.target.closest("[data-ai-summary]"))loadReport(true);});
     if(S.report&&$("#report-result"))renderReportResult();
   }
-  async function loadReport(){
+  async function loadReport(includeAiSummary=false){
     const from=$("#report-from")?.value||new Date().toISOString().slice(0,10), to=$("#report-to")?.value||from, brigade=$("#report-brigade")?.value||"", shift=$("#report-shift")?.value||"";
     if(to<from){toast("Дата окончания раньше даты начала.",true);return;}
     S.reportFrom=from;S.reportTo=to;S.reportBrigade=brigade;S.reportShift=shift;
     const c=context(), view=S.viewVersion, request=++S.reportRequest;
     const current=()=>sameSession(c)&&S.view==="reports"&&S.viewVersion===view&&S.reportRequest===request;
     $("#report-result").innerHTML='<div class="loading-state"><span class="loader"></span>Собираем сводку…</div>';
-    try{const result=await api(`/api/reports?date_from=${encodeURIComponent(from)}&date_to=${encodeURIComponent(to)}&brigade=${encodeURIComponent(brigade)}&shift_code=${encodeURIComponent(shift)}`);if(!current())return;S.report=result;renderReportResult();}
+    try{const result=await api(`/api/reports?date_from=${encodeURIComponent(from)}&date_to=${encodeURIComponent(to)}&brigade=${encodeURIComponent(brigade)}&shift_code=${encodeURIComponent(shift)}${includeAiSummary?"&include_ai_summary=1":""}`);if(!current())return;S.report=result;renderReportResult();}
     catch(e){if(current())$("#report-result").innerHTML=`<div class="empty-state">${ESC(e.message)}</div>`;}
   }
   function renderReportResult(){
@@ -174,10 +175,12 @@
     const materialRows=(S.report.material_totals||[]).map(x=>"<tr><td>"+ESC(x.sku)+"</td><td>"+ESC(x.name)+"</td><td>"+x.quantity+" "+ESC(x.unit)+"</td></tr>").join("");
     const headline="<p class=\"demo-note\">"+ESC(summary.date_from)+" — "+ESC(summary.date_to)+" UTC · назначенная синтетическая смена: "+ESC(summary.shift_code)+"</p>";
     const cards="<div class=\"grid report-summary\">"+stat("Выдано",summary.issued,"в периоде","＋")+stat("Исполнено",summary.completed,"зафиксировано исполнителем","▤")+stat("Закрыто",summary.closed,"принято мастером","✓")+stat("Просрочено",summary.late_completions,"среди исполненных","!")+stat("Сейчас просрочено",summary.current_overdue_orders,"открытый срез","◷")+stat("Часы работы",summary.labor_hours,"записанные трудозатраты","◷")+stat("Пауза по журналу",summary.pause_minutes,"это не простой оборудования","Ⅱ")+"</div>";
-    const notice="<div class=\"notice-box\"><strong>Правиловая сводка, не LLM:</strong> "+ESC(S.report.ai_summary||("За "+summary.date_from+" — "+summary.date_to+" закрыто "+summary.closed+" из "+summary.completed+" исполненных нарядов."))+(summary.synthetic?" · синтетические данные":"")+"<br>"+ESC(summary.pause_minutes_note||"")+"</div>";
+    const llmUsed=String(S.report.ai_summary_mode||summary.summary_mode||"").startsWith("llm:");
+    const notice="<div class=\"notice-box\"><strong>"+(llmUsed?"LLM-сводка по агрегатам · "+ESC(S.report.ai_summary_mode):"Правиловая сводка · "+ESC(S.report.ai_summary_mode||"rules-only"))+":</strong> "+ESC(S.report.ai_summary||("За "+summary.date_from+" — "+summary.date_to+" закрыто "+summary.closed+" из "+summary.completed+" исполненных нарядов."))+(summary.synthetic?" · синтетические данные":"")+"<br>"+ESC(summary.pause_minutes_note||"")+"</div>";
+    const aiAction=S.report.ai_summary_available&&!llmUsed?"<div class=\"notice-box\"><span>Дополнительный запрос отправит только агрегированные счётчики периода, без текста нарядов и имён.</span> <button class=\"button button-outline\" data-ai-summary>Сформировать LLM-сводку</button></div>":"";
     const workers=workerRows?"<h3>По исполнителям</h3><div class=\"report-table-wrap\"><table class=\"report-table\"><thead><tr><th>Исполнитель</th><th>Бригада</th><th>Смена · синтетика</th><th>Исполнено</th><th>Закрыто</th><th>Часы</th></tr></thead><tbody>"+workerRows+"</tbody></table></div>":"";
     const materials=materialRows?"<h3>Материалы и количество</h3><div class=\"report-table-wrap\"><table class=\"report-table\"><thead><tr><th>Артикул</th><th>Материал</th><th>Итого</th></tr></thead><tbody>"+materialRows+"</tbody></table></div>":"";
-    $("#report-result").innerHTML=headline+cards+notice+workers+materials+table;
+    $("#report-result").innerHTML=headline+cards+notice+aiAction+workers+materials+table;
   }
   async function loadAudit(){
     const c=context(),view=S.viewVersion;const current=()=>sameSession(c)&&S.view==="audit"&&S.viewVersion===view;
@@ -472,6 +475,7 @@
     $("#drawer-backdrop").addEventListener("click",closeDrawer);
     $("#banner-dismiss").addEventListener("click",()=>$(".synthetic-banner").remove());
     $("#notification-button").addEventListener("click",showNotifications);
+    $("#telegram-button").addEventListener("click",showTelegram);
     window.addEventListener("online",()=>{$("#offline-banner").classList.add("hidden");refresh();});window.addEventListener("offline",()=>$("#offline-banner").classList.remove("hidden"));
     $$(".nav-item").forEach(b=>b.addEventListener("click",()=>navigate(b.dataset.view)));
     window.addEventListener("beforeinstallprompt",e=>{e.preventDefault();S.installPrompt=e;$("#install-button").classList.remove("hidden");});
@@ -483,6 +487,47 @@
     node.innerHTML=`<h3>Уведомления</h3>${list.map(n=>`<div class="notification-item">${ESC(n.message)}<small>${ESC(n.order_code||"Система")} · ${dateFmt(n.created_at)}</small></div>`).join("")||'<div class="empty-state">Новых уведомлений нет.</div>'}`;document.body.append(node);
     if(list.length)api("/api/notifications/read","POST",{}).then(()=>refresh(true)).catch(()=>{});
     setTimeout(()=>{document.addEventListener("click",function outside(e){if(!node.contains(e.target)&&!$("#notification-button").contains(e.target)){node.remove();document.removeEventListener("click",outside);}}, {once:true});},0);
+  }
+  function closeTelegramPopover(){
+    S.telegramRequest++;
+    $("#telegram-popover")?.remove();
+    if(S.telegramOutsideHandler){document.removeEventListener("click",S.telegramOutsideHandler);S.telegramOutsideHandler=null;}
+  }
+  async function showTelegram(){
+    if($("#telegram-popover")){closeTelegramPopover();return;}
+    const request=++S.telegramRequest, session=S.session;
+    const node=document.createElement("div");node.id="telegram-popover";node.className="notification-popover";document.body.append(node);
+    const current=()=>session===S.session&&!!S.me&&request===S.telegramRequest&&node.isConnected;
+    const cancel=()=>{if(request===S.telegramRequest)closeTelegramPopover();};
+    const render=(title,content)=>{
+      if(!current())return false;
+      node.innerHTML=`<div class="popover-head"><h3>${ESC(title)}</h3><button type="button" class="icon-button" data-telegram-cancel aria-label="Закрыть">×</button></div>${content}`;
+      node.querySelector("[data-telegram-cancel]")?.addEventListener("click",cancel);
+      return true;
+    };
+    render("Telegram","<p>Загрузка статуса…</p>");
+    const outside=e=>{if(current()&&!node.contains(e.target)&&!$("#telegram-button").contains(e.target))closeTelegramPopover();};
+    S.telegramOutsideHandler=outside;document.addEventListener("click",outside);
+    try{
+      const status=await api("/api/telegram/status");
+      if(!current())return;
+      const counts=Object.entries(status.delivery_counts||{}).map(([k,v])=>`${ESC(k)}: ${Number(v)||0}`).join(" · ")||"Очередь пуста";
+      const body=!status.enabled?"<p>Доставка отключена. Нужны серверные настройки токена и webhook; ключи не задаются в приложении.</p>":status.paired?
+        `<p>Личный чат Telegram связан. Сводка доставки: ${counts}.</p><button class="button button-outline" data-telegram-unpair>Отвязать чат</button>`:
+        "<p>Получите одноразовый код, затем отправьте его как <code>/start КОД</code> своему настроенному боту в личном чате. Код действует 10 минут.</p><button class=\"button button-primary\" data-telegram-pair>Получить код</button>";
+      render("Telegram",body);
+      node.querySelector("[data-telegram-pair]")?.addEventListener("click",async e=>{
+        const button=e.currentTarget;if(!current())return;button.disabled=true;
+        try{const result=await api("/api/telegram/pair","POST",{});if(!current())return;
+          render("Одноразовый код",`<p>Отправьте своему боту в личном чате:</p><p><code>${ESC(result.command)}</code></p><small>Действует до ${ESC(dateFmt(result.expires_at))}. Не пересылайте код другим.</small>`);
+        }catch(error){if(!current())return;toast(error.message,true);button.disabled=false;}
+      });
+      node.querySelector("[data-telegram-unpair]")?.addEventListener("click",async e=>{
+        const button=e.currentTarget;if(!current())return;button.disabled=true;
+        try{await api("/api/telegram/unpair","POST",{});if(current())render("Telegram","<p>Чат отвязан.</p>");}
+        catch(error){if(!current())return;toast(error.message,true);button.disabled=false;}
+      });
+    }catch(error){if(current()){render("Telegram","<p>Не удалось загрузить статус.</p>");toast(error.message,true);}}
   }
 
   bindGlobal();
