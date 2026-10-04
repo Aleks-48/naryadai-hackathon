@@ -50,7 +50,7 @@
   async function startApp(){
     $("#login-screen").classList.add("hidden");$("#app").classList.remove("hidden");
     const session=S.session;await refresh();if(session!==S.session||!S.me)return;clearInterval(S.timer);S.timer=setInterval(()=>refresh(true),4000);
-    if("serviceWorker" in navigator && (location.protocol==="https:" || location.hostname==="localhost" || location.hostname==="127.0.0.1")) navigator.serviceWorker.register("/static/sw.js").catch(()=>{});
+    if("serviceWorker" in navigator && (location.protocol==="https:" || location.hostname==="localhost" || location.hostname==="127.0.0.1")) navigator.serviceWorker.register("/sw.js",{scope:"/"}).catch(()=>{});
   }
   async function refresh(silent=false){
     if(!S.me)return;
