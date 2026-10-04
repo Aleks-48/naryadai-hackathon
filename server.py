@@ -847,6 +847,8 @@ class AppHandler(BaseHTTPRequestHandler):
             path = urlparse(self.path).path
             if path.startswith("/api/"):
                 return self.api_get(path)
+            if path == "/sw.js":
+                return self.static_file("sw.js")
             if path.startswith("/static/"):
                 return self.static_file(path[len("/static/"):])
             if path in ("/", "/index.html"):
@@ -1612,10 +1614,20 @@ def watchdog_loop(db_path: Path, stopped: threading.Event) -> None:
             continue
 
 
+def default_server_host() -> str:
+    """Keep native runs private; container commands must opt in to a public bind."""
+    return os.environ.get("NARYADAI_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+
+def default_server_port() -> int:
+    """Use an explicit app port first, then the host's standard PORT contract."""
+    return int(os.environ.get("NARYADAI_PORT") or os.environ.get("PORT") or "8765")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Запуск локального MVP НарядAI")
-    parser.add_argument("--host", default=os.environ.get("NARYADAI_HOST", "127.0.0.1"))
-    parser.add_argument("--port", type=int, default=int(os.environ.get("NARYADAI_PORT", "8765")))
+    parser.add_argument("--host", default=default_server_host())
+    parser.add_argument("--port", type=int, default=default_server_port())
     parser.add_argument("--db", default=str(DB_PATH))
     args = parser.parse_args()
     init_db(args.db)

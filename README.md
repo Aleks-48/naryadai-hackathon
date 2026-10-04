@@ -46,7 +46,9 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 node --check .\static\app.js
 ```
 
-Проверки этого релиза: Python — 25/25, Node — 19/19; Streamlit AppTest — 3/3 на Streamlit 1.64.0 с in-process loopback API и временной SQLite. Отдельный smoke-тест стартует только `streamlit run streamlit_app.py` без API-процесса. В этом изменении запуск Docker build и развертывание Cloud не проверялись.
+Проверки этого релиза: Python — 26/26, Node — 19/19; Streamlit AppTest — 3/3 на Streamlit 1.64.0 с in-process loopback API и временной SQLite. Отдельный smoke-тест стартует только `streamlit run streamlit_app.py` без API-процесса. В этом изменении запуск Docker build и развертывание Cloud не проверялись.
+
+Отдельная PWA smoke-проверка на временном HTTP-сервере и свободном порту проверяет `GET /sw.js`, корневой `scope` в клиентской регистрации, `start_url`/`scope` манифеста и получение PNG-иконок 192×192 и 512×512. Это проверка маршрутов и файлов; установку на реальном Android-устройстве не выполняли.
 
 ## Режимы ИИ и интеграции
 
@@ -83,13 +85,20 @@ node --check .\static\app.js
 
 ## Docker
 
-`docker compose up --build` собирает API/PWA и хранит SQLite/фото в именованном volume `naryadai-data`; локальный порт привязан только к `127.0.0.1:8765`. Docker в этой рабочей сессии не запускался. `docker compose down` сохраняет данные; `docker compose down -v` удаляет volume с базой и фото. Переменные пусты, поэтому LLM остаётся в `rules-only`. Внешний HTTPS, push, публичный host и постоянный удалённый диск этим файлом не создаются.
+`docker compose up --build` собирает API/PWA и хранит SQLite/фото в именованном volume `naryadai-data`; локальный порт привязан только к `127.0.0.1:8765`. В этой сессии Docker CLI найден (29.6.2), но Compose-плагина нет, а подключение к Docker daemon недоступно; сборка и запуск образа не проверены. `docker compose down` сохраняет данные; `docker compose down -v` удаляет volume с базой и фото. Переменные пусты, поэтому LLM остаётся в `rules-only`. Внешний HTTPS, push, публичный host и постоянный удалённый диск этим файлом не создаются.
 
 Опциональный UI поверх API: `docker compose --profile demo-ui up --build` (Streamlit на `127.0.0.1:8501`). В Compose задан `NARYADAI_API_URL=http://app:8765`, поэтому роли и данные проверяет отдельный `server.py`, а SQLite и фото лежат в volume API. Если запустить `streamlit_app.py` без `NARYADAI_API_URL`, он сам поднимет один loopback API с временным SQLite и синтетическими образцами.
 
 AppTest проверяет UI через встроенный API без отдельного процесса `server.py`: `python tests/run_streamlit_apptest.py`. Проверки включают выбор участка и оборудования, изоляцию сессий и прав, очередь, паузу, синтетический образец, проверку ИИ, доработку и закрытие. `python tests/run_streamlit_cloud_smoke.py` запускает только команду Streamlit и проверяет HTTP-запуск.
 
 Параметры демонстрации в Streamlit Community Cloud описаны ниже. Развёртывание не выполнялось.
+
+
+### Render Free — только эфемерное демо
+
+После отдельного разрешения на подключение откройте Render Dashboard → New → Web Service и на живом экране GitHub разрешите доступ только к выбранному репозиторию. Выберите runtime Docker, Dockerfile `Dockerfile` и health check path `/api/health`; сервер использует переменную `PORT` Render (по умолчанию 10000). Секреты интеграций оставьте незаданными. Render собирает `Dockerfile`, а не `compose.yaml`: локальные Compose-настройки тома, `read_only` и `tmpfs` там не применяются.
+
+Бесплатный сервис засыпает после периода бездействия и пробуждается с задержкой. Его файловая система эфемерная: SQLite и загруженные фото могут сбрасываться при засыпании, перезапуске или повторном развёртывании; бесплатный план не поддерживает persistent disk. Используйте этот режим только как демо на синтетических данных. Для локального Docker named volume `naryadai-data` сохраняет базу и фото между обычными остановками Compose; `docker compose down -v` удаляет его. См. [Render Web Services](https://render.com/docs/web-services), [Docker on Render](https://render.com/docs/docker) и [ограничения Free](https://render.com/docs/free).
 
 ## Streamlit Community Cloud — только демо
 
