@@ -10,7 +10,7 @@
 .\start.ps1
 ```
 
-Для отдельной установки Python-зависимостей: `python -m pip install -r requirements.txt`. Предоставленное рабочее окружение уже содержит Pillow.
+Для локального запуска API без UI установите Python-зависимость Pillow: `python -m pip install -r requirements-api.txt`. Для Streamlit AppTest и веб-интерфейса используйте закреплённые версии из `requirements-streamlit.txt`; корневой `requirements.txt` предназначен для Streamlit Community Cloud.
 
 Если политика PowerShell блокирует скрипт:
 
@@ -46,7 +46,7 @@ powershell -ExecutionPolicy Bypass -File .\start.ps1
 node --check .\static\app.js
 ```
 
-Полный локальный прогон: `python -m unittest discover -s tests -v` — 25/25 за 72,58 с. В том же прогоне маленький PNG записался за 0,253 с, видимость между двумя HTTP-сессиями — 0,125 с. UI-гонки: `node --test tests/test_frontend_races.js` — 19/19; `node --check static/app.js`, Python `py_compile` и `git diff --check` прошли. Это только локальные тестовые измерения. Реальный браузер, Android, мобильную сеть, Docker build и здесь не проверяли. Streamlit AppTest: 2/2 tests passed on Streamlit 1.64.0 using a temporary SQLite database and real API.
+Проверки этого релиза: Python — 25/25, Node — 19/19; Streamlit AppTest — 3/3 на Streamlit 1.64.0 с in-process loopback API и временной SQLite. Отдельный smoke-тест стартует только `streamlit run streamlit_app.py` без API-процесса. В этом изменении запуск Docker build и развертывание Cloud не проверялись.
 
 ## Режимы ИИ и интеграции
 
@@ -73,7 +73,7 @@ node --check .\static\app.js
 - `static/` — PWA, мобильная вёрстка, панель мастера и экран исполнителя.
 - `tests/test_app.py`, `tests/test_independent_security.py`, `tests/test_frontend_races.js` — API/права, файл/таймеры/аудит и 19 UI-гонок.
 - `docs/` — матрица требований, API-контракт, демосценарий и ограничения.
-- `start.ps1` — локальный запуск; `requirements.txt` — Pillow; `requirements-streamlit.txt` — отдельный необязательный UI; `Dockerfile` и `compose.yaml` — переносимый локальный запуск.
+- `start.ps1` — локальный запуск; `requirements-api.txt` — зависимости API; корневой `requirements.txt` — закреплённые зависимости Cloud; `requirements-streamlit.txt` — набор для Streamlit/Docker; `Dockerfile` и `compose.yaml` — переносимый локальный запуск.
 
 ## Независимая проверка исходников 2 октября 2026
 
@@ -85,8 +85,14 @@ node --check .\static\app.js
 
 `docker compose up --build` собирает API/PWA и хранит SQLite/фото в именованном volume `naryadai-data`; локальный порт привязан только к `127.0.0.1:8765`. Docker в этой рабочей сессии не запускался. `docker compose down` сохраняет данные; `docker compose down -v` удаляет volume с базой и фото. Переменные пусты, поэтому LLM остаётся в `rules-only`. Внешний HTTPS, push, публичный host и постоянный удалённый диск этим файлом не создаются.
 
-Опциональный UI поверх того же API: `docker compose --profile demo-ui up --build` (Streamlit на `127.0.0.1:8501`). Каждый браузерный сеанс создаёт отдельную API-сессию; роли повторно проверяет `server.py`. Streamlit не содержит моков, базы или таймера. При перезапуске UI пользователь входит снова, а SQLite и фото остаются в volume API. Для прямого запуска: установите отдельный необязательный пакет из `requirements-streamlit.txt`, задайте `NARYADAI_API_URL` и запустите `streamlit run streamlit_app.py`.
+Опциональный UI поверх API: `docker compose --profile demo-ui up --build` (Streamlit на `127.0.0.1:8501`). В Compose задан `NARYADAI_API_URL=http://app:8765`, поэтому роли и данные проверяет отдельный `server.py`, а SQLite и фото лежат в volume API. Если запустить `streamlit_app.py` без `NARYADAI_API_URL`, он сам поднимет один loopback API с временным SQLite и синтетическими образцами.
 
-Проверка Streamlit UI через AppTest с временной БД и реальным API: `python tests/run_streamlit_apptest.py`. Тест использует необязательный пакет из `requirements-streamlit.txt` и покрывает роли, изоляцию сессий, запрет доступа к чужому наряду, отчёт руководителя и полный цикл с паузой и доработкой.
+AppTest проверяет UI через встроенный API без отдельного процесса `server.py`: `python tests/run_streamlit_apptest.py`. Проверки включают выбор участка и оборудования, изоляцию сессий и прав, очередь, паузу, синтетический образец, проверку ИИ, доработку и закрытие. `python tests/run_streamlit_cloud_smoke.py` запускает только команду Streamlit и проверяет HTTP-запуск.
 
-Streamlit Cloud или иной внешний UI требует отдельно доступного HTTPS API с постоянным хранилищем; бесплатный host, его сон/перезапуск и сохранность SQLite здесь не подтверждались. Образ не делает деплой и не открывает порт наружу.
+Параметры демонстрации в Streamlit Community Cloud описаны ниже. Развёртывание не выполнялось.
+
+## Streamlit Community Cloud — только демо
+
+Укажите `streamlit_app.py` как entrypoint, выберите Python 3.12 в настройках приложения и оставьте `NARYADAI_API_URL` незаданным. Корневой `requirements.txt` закрепляет локально проверенные версии Streamlit, Requests и Pillow. Приложение один раз запускает канонический `server.py` внутри процесса Streamlit, только на `127.0.0.1` и порту, выбранном ОС; API-порт наружу не публикуется.
+
+Это не production-хостинг. SQLite и фото хранятся во временном каталоге: сон или перезапуск может сбросить их. Демо-аккаунты, наряды и загрузки общие для участников, поэтому используйте только встроенные синтетические изображения и не вводите реальные персональные, производственные или данные безопасности. В этом режиме отключены внешний LLM и доставка Telegram. Картинки служат только для проверки загрузки и не доказывают состояние оборудования. Обновление задано через Streamlit fragment с интервалом 5 секунд; AppTest проверяет обновление после действий, но периодический интервал в реальном браузере и Cloud здесь не измерялся. Развёртывание в Streamlit Community Cloud не выполнялось и там не проверялось.

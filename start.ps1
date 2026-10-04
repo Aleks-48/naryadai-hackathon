@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $preferredPython = 'C:\Users\777\Documents\Codex\2026-09-30\task-2\.venv\Scripts\python.exe'
 $projectServer = Join-Path $PSScriptRoot 'server.py'
 

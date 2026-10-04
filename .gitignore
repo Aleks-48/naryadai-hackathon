@@ -7,3 +7,5 @@ deliverables/
 
 .env.*
 !.env.example
+# Never commit local Streamlit credentials
+.streamlit/secrets.toml
