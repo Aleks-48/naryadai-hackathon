@@ -82,6 +82,22 @@ class Client:
             return error.code,error.read()
 
 
+class RuntimeConfigurationTest(unittest.TestCase):
+    def test_local_bind_stays_loopback_and_port_falls_back_to_platform_port(self):
+        with unittest.mock.patch.dict(os.environ, {"NARYADAI_HOST":"", "NARYADAI_PORT":"", "PORT":"10000"}):
+            host = app.default_server_host()
+            self.assertEqual(host, "127.0.0.1")
+            self.assertEqual(app.default_server_port(), 10000)
+            listener = app.ThreadingHTTPServer((host, 0), app.AppHandler)
+            try:
+                self.assertEqual(listener.server_address[0], "127.0.0.1")
+            finally:
+                listener.server_close()
+        with unittest.mock.patch.dict(os.environ, {"NARYADAI_HOST":"0.0.0.0", "NARYADAI_PORT":"8765", "PORT":"10000"}):
+            self.assertEqual(app.default_server_host(), "0.0.0.0")
+            self.assertEqual(app.default_server_port(), 8765)
+
+
 class LocalAPITest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -489,15 +505,34 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(profile["my_rating"]["period_from"],"2026-09-01")
 
     def test_pwa_shell_has_mobile_and_offline_assets(self):
-        for path in ("/","/static/app.js","/static/styles.css","/static/sw.js","/static/manifest.webmanifest"):
+        for path in ("/","/sw.js","/static/app.js","/static/styles.css","/static/sw.js","/static/manifest.webmanifest","/static/icon-192.png","/static/icon-512.png"):
             request=urllib.request.Request(self.base+path)
             with urllib.request.urlopen(request,timeout=5) as response:
                 self.assertEqual(response.status,200,path)
-                body=response.read().decode("utf-8")
+                raw=response.read()
+                body=raw.decode("utf-8") if path not in ("/static/icon-192.png","/static/icon-512.png") else ""
                 if path=="/": self.assertIn("manifest.webmanifest",body)
+                if path=="/sw.js":
+                    self.assertIn("cache.addAll",body)
+                    self.assertIn("naryadai-shell-v3",body)
                 if path.endswith("styles.css"): self.assertIn("max-width:760px",body)
-                if path.endswith("sw.js"): self.assertIn("cache.addAll",body)
+                if path.endswith("/manifest.webmanifest"):
+                    manifest=json.loads(body)
+                    self.assertEqual(manifest["start_url"],"/")
+                    self.assertEqual(manifest["scope"],"/")
+                    pngs={icon["sizes"]:icon for icon in manifest["icons"] if icon["type"]=="image/png"}
+                    self.assertEqual(pngs["192x192"]["src"],"/static/icon-192.png")
+                    self.assertEqual(pngs["512x512"]["src"],"/static/icon-512.png")
+                    self.assertIn("maskable",pngs["512x512"]["purpose"])
+                if path in ("/static/icon-192.png","/static/icon-512.png"):
+                    with Image.open(io.BytesIO(raw)) as icon:
+                        expected=192 if path.endswith("192.png") else 512
+                        self.assertEqual(icon.size,(expected,expected))
+                        self.assertEqual(icon.format,"PNG")
+                if path.endswith("sw.js"):
+                    self.assertIn("cache.addAll",body)
                 if path.endswith("app.js"):
+                    self.assertIn('register("/sw.js",{scope:"/"})',body)
                     self.assertIn("setInterval(()=>refresh(true),4000)",body)
                     self.assertIn('action:"ai_check"',body)
                     self.assertIn("reader.readAsDataURL(compressed)",body)
