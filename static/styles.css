@@ -10,3 +10,142 @@
 @media(max-width:760px){.login-card{width:min(420px,calc(100vw - 56px));max-width:100%}.login-form,.login-form label{width:100%;max-width:100%;min-width:0}.login-form input,.login-form select,.login-form button{width:100%;max-width:100%;min-width:0}}
 
 .photo-item small{display:block;color:var(--muted);font-size:11px;line-height:1.35;padding:0 10px 9px}
+
+/* Readable default scale: primary content stays comfortable at browser zoom 100%. */
+:root{font-size:16px}
+body{font-size:16px;line-height:1.45}
+.brand-lockup span{font-size:12px}
+.eyebrow{font-size:11px}
+.login-intro p,.art-copy p{font-size:16px;line-height:1.55}
+.login-form label,.field-label{font-size:14px;gap:7px}
+.login-form input,.login-form select,.field-input,.field-select,.field-textarea{font-size:16px;line-height:1.4;padding:12px 13px;min-height:46px}
+.login-form .field-textarea,.field-textarea{min-height:104px}
+.button{font-size:14px;line-height:1.35;min-height:44px;padding:10px 16px}
+.button-wide{min-height:48px;padding:13px 16px}
+.form-error{font-size:13px}
+.login-foot{font-size:12px;line-height:1.45}
+.route-line{font-size:13px}
+.art-card{gap:9px;padding:18px 20px}
+.art-card small{font-size:11px}
+.art-card b{font-size:15px}
+.art-card span{font-size:12px}
+.art-foot{font-size:12px}
+.site-switch b{font-size:13px}.site-switch small{font-size:11px}
+.nav-item{font-size:14px;min-height:44px;height:auto}
+.nav-count{font-size:11px}
+.connection-card b{font-size:12px}.connection-card small{font-size:11px}
+.synthetic-label{font-size:12px}
+.user-mini b{font-size:12px}.user-mini small{font-size:11px}
+.breadcrumbs{font-size:13px}
+.live-chip{font-size:12px}
+.icon-button{width:40px;height:40px}
+.notification-badge{min-width:18px;height:18px;font-size:11px}
+.install-button{font-size:12px}
+.offline-banner{font-size:13px;line-height:1.45}
+.synthetic-banner{padding:13px 15px}
+.synthetic-banner b{font-size:13px}
+.synthetic-banner span{font-size:12px;line-height:1.45}
+.view-root{padding-top:32px}
+.loading-state{font-size:15px}
+.page-heading h1{font-size:28px;line-height:1.2}
+.page-heading p{font-size:14px;line-height:1.45}
+.section-kicker{font-size:11px}
+.stat-head{font-size:13px;line-height:1.35}
+.stat-number{font-size:28px}
+.stat-caption{font-size:11px}
+.panel-title{font-size:16px}
+.panel-subtitle{font-size:12px;line-height:1.4}
+.text-link{font-size:13px}
+.order-row{padding:13px 12px;gap:12px}
+.row-title{gap:8px}.row-title b{font-size:14px;line-height:1.35}
+.row-title code{font-size:11px}
+.row-meta{font-size:12px;line-height:1.4}
+.badge{font-size:11px;padding:5px 8px}
+.priority{font-size:11px}
+.kpi-note b{font-size:13px}.kpi-note span{font-size:12px;line-height:1.4}
+.pattern-row b{font-size:12px;line-height:1.4}.pattern-row span{font-size:11px;line-height:1.4}
+.notice-box{font-size:12px;line-height:1.55}
+.filter-chip,.select-small{font-size:12px;min-height:40px;padding:8px 11px}
+.column-title{font-size:13px;line-height:1.35}.column-title span:last-child{font-size:11px}
+.board-card{padding:13px}
+.board-card h3{font-size:14px;line-height:1.45}
+.board-card p{font-size:12px;line-height:1.45}
+.board-card-foot{font-size:11px;line-height:1.4}
+.team-card{padding:17px}
+.team-avatar{font-size:13px;width:40px;height:40px}
+.team-top b{font-size:13px}.team-top small{font-size:12px;line-height:1.4}
+.team-metrics span{font-size:11px;line-height:1.35}
+.rating-scale{font-size:11px;line-height:1.5}
+.report-table{font-size:12px}
+.report-table th{font-size:12px}.report-table th,.report-table td{padding:11px 9px;line-height:1.4}
+.empty-state{font-size:13px;line-height:1.5}
+.toast{font-size:13px;line-height:1.45}
+.drawer-head{padding:18px 24px}
+.drawer-head small{font-size:11px}
+.drawer-head b{font-size:16px}
+.drawer-close{height:40px;width:40px}
+.drawer-body{padding:20px 24px}
+.detail-title{font-size:24px;line-height:1.25}
+.detail-sub{font-size:13px;line-height:1.5}
+.detail-field{padding:12px}
+.detail-field span{font-size:11px;line-height:1.35}
+.detail-field b{font-size:14px;line-height:1.45;overflow-wrap:anywhere}
+.detail-section{padding:15px}
+.detail-section h3,.action-box h3{font-size:14px;line-height:1.35}
+.detail-section p{font-size:13px;line-height:1.55;overflow-wrap:anywhere}
+.action-box{padding:15px}
+.action-buttons{gap:9px}
+.action-buttons .button{font-size:13px;padding:10px 13px}
+.field-stack{gap:11px}
+.field-textarea{font-size:14px}
+.field-input,.field-select{font-size:14px;padding:11px 12px}
+.upload-input{font-size:12px;max-width:100%}
+.photo-item span{font-size:11px;line-height:1.4}
+.ai-result b{font-size:13px}
+.ai-result p,.ai-result li{font-size:13px;line-height:1.55}
+.timeline-item b{font-size:12px;line-height:1.4}
+.timeline-item span{font-size:11px;line-height:1.4}
+.demo-note{font-size:11px;line-height:1.5}
+.notification-popover h3{font-size:15px}
+.notification-item{font-size:12px;line-height:1.45}
+.notification-item small{font-size:11px;line-height:1.4}
+
+@media(max-width:760px){
+  .breadcrumbs{font-size:12px}
+  .topbar{height:62px}
+  .view-root{padding-top:23px}
+  .page-heading h1{font-size:25px}
+  .synthetic-banner{padding:11px 12px}
+  .stat-card{padding:14px;min-height:100px}
+  .stat-head{font-size:12px}
+  .stat-number{font-size:25px}
+  .row-title b{font-size:13px}
+  .row-meta{font-size:11px}
+  .badge,.priority{font-size:10px}
+  .detail-grid{gap:8px}
+  .detail-field{padding:10px}
+  .detail-field b{font-size:13px}
+  .drawer-body{padding:17px 16px}
+  .drawer-head{padding:15px 16px}
+  .board-columns{scroll-snap-type:x proximity}
+  .board-column{scroll-snap-align:start}
+}
+@media(max-width:390px){
+  .view-root{padding-left:12px;padding-right:12px}
+  .synthetic-banner{margin-left:12px;margin-right:12px}
+  .page-heading h1{font-size:23px}
+  .stat-card{padding:11px;min-height:98px}
+  .stat-head{font-size:11px}
+  .order-row{gap:7px;padding:10px 7px}
+  .row-title{gap:5px}
+  .row-title b{font-size:12px}
+  .row-title code{font-size:10px}
+  .row-meta{font-size:11px}
+  .row-title code{font-size:11px}
+  .row-right{max-width:100px}
+  .badge{font-size:10px;padding:4px 6px}
+  .detail-title{font-size:22px}
+  .detail-field span{font-size:10px}
+  .detail-field b{font-size:12px}
+  .action-buttons .button{font-size:12px;padding:9px 10px}
+}
