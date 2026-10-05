@@ -26,8 +26,8 @@ function harness() {
   const document={activeElement:null,body,querySelector:s=>{const direct=nodes.get(s);if(direct?.isConnected)return direct;if(s.startsWith('#'))return body.children.find(n=>n.id===s.slice(1)&&n.isConnected)||null;return null},querySelectorAll:s=>groups.get(s)||[],createElement:()=>element(),addEventListener(name,fn){documentListeners.set(name,fn)},removeEventListener(name,fn){if(documentListeners.get(name)===fn)documentListeners.delete(name)}};
   ['#app','#login-screen','#detail-drawer','#drawer-backdrop','#view-root','#toast-region','#offline-banner','#telegram-button'].forEach(get);
   const localStorageWrites=[],logs=[];
-  const globals={document,console:{log:(...x)=>logs.push(x),warn:(...x)=>logs.push(x),error:(...x)=>logs.push(x)},localStorage:{setItem:(...x)=>localStorageWrites.push(x),removeItem:(...x)=>localStorageWrites.push(x),getItem:()=>null},navigator:{onLine:true},location:{protocol:'http:',hostname:'example.invalid'},window:{addEventListener(){}},URLSearchParams,setTimeout:()=>0,clearInterval(){},setInterval:()=>1,performance:{now:()=>0},fetch:()=>Promise.reject(new Error('Unexpected real fetch')),FileReader:class{},prompt:()=>null};
-  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','loadReport','loadAudit','render','runAction','showTelegram','exifPayload','insertJpegExif'];
+  const globals={document,console:{log:(...x)=>logs.push(x),warn:(...x)=>logs.push(x),error:(...x)=>logs.push(x)},localStorage:{setItem:(...x)=>localStorageWrites.push(x),removeItem:(...x)=>localStorageWrites.push(x),getItem:()=>null},navigator:{onLine:true},location:{protocol:'http:',hostname:'example.invalid'},window:{addEventListener(){}},URLSearchParams,setTimeout:()=>0,clearInterval(){},setInterval:()=>1,performance:{now:()=>0},fetch:()=>Promise.reject(new Error('Unexpected real fetch')),FileReader:class{},prompt:()=>null,confirm:()=>true};
+  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','detailButtons','reassignmentForm','bindDrawer','loadReport','loadAudit','render','runAction','showTelegram','exifPayload','insertJpegExif'];
   const expose=`globalThis.app={S,${names.join(',')},override(overrides){${['api','refresh','renderDrawer','render','syncChrome','compressImage','renderReportResult'].map(n=>`if(overrides.${n})${n}=overrides.${n};`).join('')}}};`;
   const source=fs.readFileSync(sourcePath,'utf8').replace(/\n  bindGlobal\(\);[\s\S]*?\n\}\)\(\);\s*$/,`\n  ${expose}\n})();`);
   vm.runInNewContext(source,globals,{filename:sourcePath});
@@ -122,6 +122,54 @@ test('late drawer error does not overwrite a new form',async()=>{
 test('template finds equipment options and its matching area',()=>{
   const h=harness();issueInputs(h);const option={value:'3',textContent:'EQ-003 · Насос',dataset:{area:'2'},selected:false};h.get('#issue-equipment').options=[option];
   h.app.bindIssueForm();h.get('#issue-template').events.change({target:{value:'pump'}});assert.equal(h.get('#issue-equipment').value,'3');assert.equal(h.get('#issue-area').value,'2');
+});
+
+test('unscheduled work can be queued but cannot be accepted without a unique before photo',()=>{
+  const h=harness(),order={status:'issued',work_type:'unscheduled',photos:[]};
+  const issued=h.app.detailButtons(order);
+  assert.match(issued,/data-action="accept" disabled/);
+  assert.match(issued,/data-action="queue"(?! disabled)/);
+  h.app.S.me.role='worker';
+  const queued=h.app.detailButtons({...order,status:'queued'});
+  assert.match(queued,/data-action="accept" disabled/);
+  assert.doesNotMatch(h.app.detailButtons({...order,photos:[{phase:'before',duplicate:false}]}),/data-action="accept" disabled/);
+});
+
+test('rejected master detail offers a worker or brigade selector for reassignment',()=>{
+  const h=harness();h.app.S.me.role='master';h.app.S.data.free_workers=[{id:12,username:'worker12',display_name:'Synthetic Worker',availability_label:'Свободен',active_orders:0}];
+  const html=h.app.reassignmentForm({status:'rejected',cancelled_by_master:false});
+  assert.match(html,/<select[^>]+id="reassign-target"/);
+  assert.match(html,/value="worker:12"/);
+  for(const brigade of ['A','B','C'])assert.match(html,new RegExp(`value="brigade:${brigade}"`));
+  assert.match(html,/data-reassign/);
+});
+
+test('reassignment binding preserves its initiating order and prevents double submission',async()=>{
+  const h=harness(),button=element(),pending=deferred(),calls=[];button.dataset={};h.groups.set('[data-reassign]',[button]);
+  h.app.S.me.role='master';h.app.S.orderId=101;h.get('#reassign-target').value='worker:12';h.app.bindDrawer({});
+  h.app.override({api:(path,method,body)=>{calls.push([path,method,body]);return pending.promise},refresh:async()=>{},refreshDrawer:async()=>{}});
+  const first=button.events.click({currentTarget:button}),again=button.events.click({currentTarget:button});
+  assert.equal(calls.length,1);assert.equal(button.disabled,true);
+  const reopenedButton=element();h.nodes.set('[data-reassign]',reopenedButton);h.app.S.drawerVersion++;reopenedButton.disabled=true;
+  pending.resolve({ok:true});await Promise.all([first,again]);
+  assert.equal(calls.length,1);assert.equal(calls[0][0],'/api/orders/101/assign');assert.equal(calls[0][1],'POST');assert.equal(calls[0][2].worker_id,12);
+  assert.equal(h.app.S.orderId,101);assert.equal(reopenedButton.disabled,false);
+});
+
+test('repeat-link controls are bound, single-flight, and discard stale completion',async()=>{
+  const h=harness(),create=element(),revoke=element(),pending=deferred(),calls=[];h.nodes.set('[data-create-repeat]',create);h.nodes.set('[data-revoke-repeat]',revoke);
+  h.app.S.me.role='master';h.app.S.orderId=101;h.get('#repeat-previous').value='88';h.get('#repeat-reason').value='Same fault confirmed by the master';h.get('#repeat-revoke-reason').value='Manual attribution corrected';h.app.bindDrawer({});
+  let refreshes=0;h.app.override({api:(path,method,body)=>{calls.push([path,method,body]);return pending.promise},refresh:async()=>{refreshes++},refreshDrawer:async()=>{}});
+  const first=create.events.click({currentTarget:create}),again=create.events.click({currentTarget:create});
+  assert.equal(calls.length,1);assert.equal(create.disabled,true);
+  h.app.S.orderId=303;pending.resolve({ok:true});await Promise.all([first,again]);
+  assert.equal(calls[0][0],'/api/orders/101/repeat-link');assert.equal(refreshes,0);
+
+  const h2=harness(),create2=element(),revoke2=element();h2.nodes.set('[data-create-repeat]',create2);h2.nodes.set('[data-revoke-repeat]',revoke2);h2.app.S.me.role='master';h2.app.S.orderId=202;
+  h2.get('#repeat-revoke-reason').value='Manual attribution corrected';h2.app.bindDrawer({});let revokeCalls=0;
+  h2.app.override({api:async(path)=>{if(path.endsWith('/revoke'))revokeCalls++;return {ok:true}},refresh:async()=>{},refreshDrawer:async()=>{}});
+  h2.globals.confirm=()=>false;await revoke2.events.click({currentTarget:revoke2});assert.equal(revokeCalls,0);
+  h2.globals.confirm=()=>true;await revoke2.events.click({currentTarget:revoke2});assert.equal(revokeCalls,1);
 });
 
 test('issuance ignores repeated submit and does not reopen after cancellation',async()=>{

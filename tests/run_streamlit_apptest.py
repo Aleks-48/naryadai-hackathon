@@ -221,6 +221,10 @@ class StreamlitApiAppTest(unittest.TestCase):
         self.select_order(worker, order_id)
         self.click(worker, "queue")
         self.assert_status(worker, order_id, "queued")
+        self.select_order(master, order_id)
+        self.click(master, "upload_sample")
+        before_order = self.api_json(master, f"/api/orders/{order_id}")["order"]
+        self.assertTrue(any(photo["phase"] == "before" for photo in before_order.get("photos", [])))
         self.select_order(worker, order_id)
         self.click(worker, "accept_queued")
         self.assert_status(worker, order_id, "accepted")
@@ -247,8 +251,15 @@ class StreamlitApiAppTest(unittest.TestCase):
         worker.text_area[-1].set_value("Draft: checked the synthetic bearing housing and recorded the reading.").run()
         self.assertEqual(worker.text_area[-1].value, "Draft: checked the synthetic bearing housing and recorded the reading.")
         worker.text_area[-1].set_value("Checked the bearing housing and recorded stable vibration after adjustment.")
+        material_picker = next(item for item in worker.multiselect if item.label == "Использованные материалы")
+        material_id = material_picker.options[0]
+        # Select and submit in the same AppTest run. This catches a quantity
+        # widget that is only created by an artificial rerun after form submit.
+        material_picker.set_value([material_id])
         self.click(worker, "complete")
         self.assert_status(worker, order_id, "executed")
+        completed_order = self.api_json(worker, f"/api/orders/{order_id}")["order"]
+        self.assertEqual(completed_order["materials"][0]["quantity"], 1.0)
         self.select_order(worker, order_id)
         self.click(worker, "review")
         self.assert_status(worker, order_id, "ai_review")
@@ -265,7 +276,13 @@ class StreamlitApiAppTest(unittest.TestCase):
         self.click(worker, "start")
         self.select_order(worker, order_id)
         worker.text_area[-1].set_value("Updated report with final measured clearance and verified record.")
+        material_picker = worker.multiselect[-1]
+        material_picker.set_value([material_id]).run()
+        quantity_widget = worker.number_input[-1]
+        quantity_widget.set_value(0.001)
         self.click(worker, "complete")
+        completed_order = self.api_json(worker, f"/api/orders/{order_id}")["order"]
+        self.assertEqual(completed_order["materials"][0]["quantity"], 0.001)
         self.select_order(worker, order_id)
         self.click(worker, "review")
         self.assert_status(worker, order_id, "ai_review")

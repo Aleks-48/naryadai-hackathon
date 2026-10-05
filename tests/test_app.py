@@ -6,8 +6,11 @@ import io
 import http.cookiejar
 import json
 import os
+import random
 import sqlite3
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -38,6 +41,19 @@ def make_photo(fmt="PNG", size=(96,96), capture_time=None, offset=None, backgrou
     if fmt=="JPEG": options["quality"]=88
     if capture_time: options["exif"]=exif
     image.save(output,**options)
+    return output.getvalue()
+
+
+def make_before_photo(background):
+    image=Image.new("RGB",(96,96),background)
+    draw=ImageDraw.Draw(image)
+    rng=random.Random(background[0]*1_000_000+background[1]*1_000+background[2])
+    complement=tuple(255-value for value in background)
+    for y in range(8):
+        for x in range(8):
+            cell_color=background if rng.randrange(2) else complement
+            draw.rectangle((x*12,y*12,(x+1)*12-1,(y+1)*12-1),fill=cell_color)
+    output=io.BytesIO();image.save(output,format="PNG")
     return output.getvalue()
 
 
@@ -85,6 +101,40 @@ class Client:
 
 
 class RuntimeConfigurationTest(unittest.TestCase):
+    def test_legacy_demo_work_type_migration_requires_provenance_and_never_rewrites_rows(self):
+        with sqlite3.connect(":memory:") as db:
+            db.row_factory=sqlite3.Row
+            db.execute("""CREATE TABLE orders(
+                code TEXT PRIMARY KEY,title TEXT,description TEXT,work_type TEXT,priority TEXT,
+                area_id INTEGER,equipment_id INTEGER,fault_code_id INTEGER,assigned_to INTEGER,
+                assigned_master_id INTEGER,status TEXT)""")
+            description="Synthetic template pattern 4. Inspect and record the result."
+            values=("DEMO-0004","Original synthetic title",description,"unscheduled","normal",4,4,17,5,1,"closed")
+            db.execute("INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?)",values)
+            db.execute("INSERT INTO orders VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                       ("REAL-0004","Similar real record",description,"unscheduled","normal",4,4,17,5,1,"closed"))
+            self.assertEqual(app.migrate_legacy_demo_work_types(db),0)
+            self.assertEqual(app.migrate_legacy_demo_work_types(db),0)
+            mutations=(
+                ("title","Edited title"),("description","Edited but similar description"),
+                ("priority","high"),("area_id",3),("equipment_id",3),("fault_code_id",18),
+                ("assigned_to",6),("assigned_master_id",2),("status","rejected"),
+                ("work_type","planned"),
+            )
+            for field,value in mutations:
+                db.execute("SAVEPOINT provenance_case")
+                db.execute("UPDATE orders SET work_type='unscheduled' WHERE code='DEMO-0004'")
+                db.execute(f"UPDATE orders SET {field}=? WHERE code='DEMO-0004'",(value,))
+                db.execute("DELETE FROM app_migrations WHERE name=?",(app.DEMO_HISTORY_WORK_TYPE_MIGRATION,))
+                self.assertEqual(app.migrate_legacy_demo_work_types(db),0,field)
+                actual=db.execute(f"SELECT {field},work_type FROM orders WHERE code='DEMO-0004'").fetchone()
+                self.assertEqual(actual[0],value,field)
+                self.assertEqual(actual["work_type"],value if field=="work_type" else "unscheduled",field)
+                db.execute("ROLLBACK TO provenance_case")
+                db.execute("RELEASE provenance_case")
+            real=db.execute("SELECT work_type FROM orders WHERE code='REAL-0004'").fetchone()[0]
+            self.assertEqual(real,"unscheduled")
+
     def test_blank_llm_endpoint_uses_documented_gemini_default(self):
         with unittest.mock.patch.dict(os.environ, {"NARYADAI_LLM_ENABLED":"1", "NARYADAI_LLM_API_URL":"",
                 "NARYADAI_LLM_API_KEY":"unit-test-key", "NARYADAI_LLM_MODEL":"gemini-test"}):
@@ -209,7 +259,8 @@ class LocalAPITest(unittest.TestCase):
         c.login(name)
         return c
 
-    def create_order(self, master: Client, worker_id: int | None = None, priority: str = "normal") -> dict:
+    def create_order(self, master: Client, worker_id: int | None = None, priority: str = "normal",
+                     before_photo: bool = True) -> dict:
         status, response = master.call("/api/orders", "POST", {
             "title": "Проверка насосного узла",
             "description": "Проверить вибрацию, закрепить узел и записать результат наблюдения.",
@@ -218,13 +269,22 @@ class LocalAPITest(unittest.TestCase):
             "norm_hours": 6,
         })
         self.assertEqual(status, 201, response)
-        return response["order"]
+        order = response["order"]
+        if before_photo:
+            color = ((order["id"] * 37) % 255, (order["id"] * 79) % 255, (order["id"] * 131) % 255)
+            uploaded = self.upload(master, order["id"], make_before_photo(color), phase="before")
+            self.assertEqual(uploaded[0], 201, uploaded[1])
+            self.assertFalse(uploaded[1]["photo"]["duplicate"], uploaded[1])
+            detail_status,detail=master.call(f"/api/orders/{order['id']}")
+            self.assertEqual(detail_status,200,detail)
+            return detail["order"]
+        return order
 
     def action(self, client: Client, order_id: int, action: str, **kwargs):
         return client.call(f"/api/orders/{order_id}/action", "POST", {"action": action, **kwargs})
 
-    def upload(self, client: Client, order_id: int, raw: bytes, mime="image/png", name="photo.png"):
-        payload={"phase":"after","file_name":name,"data_url":f"data:{mime};base64,"+base64.b64encode(raw).decode()}
+    def upload(self, client: Client, order_id: int, raw: bytes, mime="image/png", name="photo.png", phase="after"):
+        payload={"phase":phase,"file_name":name,"data_url":f"data:{mime};base64,"+base64.b64encode(raw).decode()}
         return client.call(f"/api/orders/{order_id}/photos","POST",payload)
 
     def close_planned_order(self, master: Client, worker: Client, title="Плановая проверка узла") -> int:
@@ -239,7 +299,7 @@ class LocalAPITest(unittest.TestCase):
             labor_hours=1.0,materials=[],materials_not_used=True)[0],200)
         checked=self.action(worker,oid,"ai_check")
         self.assertEqual(checked[1]["order"]["status"],"ai_review",checked[1])
-        closed=self.action(master,oid,"close")
+        closed=self.action(master,oid,"close",closure_comment="Плановый результат проверен мастером.")
         self.assertEqual(closed[0],200,closed[1])
         return oid
 
@@ -282,7 +342,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(first_review["mode"],"rules-only: configuration_missing")
         self.assertEqual(first_review["verdict"],"rework")
         self.assertTrue(any("фото" in issue.lower() for issue in first_review["issues"]))
-        self.assertEqual(self.action(master,order_id,"close",reason="Принято")[0],409)
+        self.assertEqual(self.action(master,order_id,"close",closure_comment="Принято мастером")[0],409)
 
         # Rework cycle; binary content, digest duplicate detection and upload latency.
         self.assertEqual(self.action(worker,order_id,"start")[1]["order"]["status"],"in_progress")
@@ -306,7 +366,16 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(second_json["photo_check"]["verifiability_score"],3)
         self.assertTrue(second_json["master_confirmation_required"])
         self.assertEqual(self.action(master,order_id,"close")[0],400)
-        closed=self.action(master,order_id,"close",reason="Фото проверено мастером; дата EXIF неизвестна.")
+        with app.connect(self.db_path) as db:
+            close_audit_before=db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='close'",(order_id,)).fetchone()[0]
+        for invalid_comment in (None,True,7,[],{},"    "):
+            bad_close=self.action(master,order_id,"close",closure_comment=invalid_comment)
+            self.assertEqual(bad_close[0],400,repr(invalid_comment))
+            with app.connect(self.db_path) as db:
+                state=db.execute("SELECT status,closed_at FROM orders WHERE id=?",(order_id,)).fetchone()
+                self.assertEqual(tuple(state),("ai_review",None))
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='close'",(order_id,)).fetchone()[0],close_audit_before)
+        closed=self.action(master,order_id,"close",closure_comment="Фото проверено мастером; дата EXIF неизвестна.")
         self.assertEqual(closed[0],200,closed[1])
         self.assertEqual(closed[1]["order"]["status"],"closed")
 
@@ -314,12 +383,45 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(rated[0],200,rated[1])
         visible=worker.call(f"/api/orders/{order_id}")[1]["order"]
         self.assertEqual(visible["rating"],5)
-        self.assertEqual(visible["photos"][0]["phase"],"after")
+        self.assertTrue(any(photo["phase"]=="after" for photo in visible["photos"]))
         audit=master.call("/api/audit")[1]["items"]
         names={r["event"] for r in audit if r["order_code"]==order["code"]}
         self.assertTrue({"queue","accept","start","pause","resume","complete","ai_check","close","rating_adjusted","photo_uploaded"}.issubset(names))
         self.assertGreaterEqual(upload_seconds,0)
         print(f"\nMeasured local upload request: {upload_seconds:.3f}s (limit 10s)")
+
+    def test_unscheduled_acceptance_waits_for_unique_master_photo(self):
+        master=self.client("master01");worker=self.client("worker01");manager=self.client("manager")
+        order=self.create_order(master,before_photo=False);oid=order["id"]
+        self.assertEqual(manager.call(f"/api/orders/{oid}/action","POST",{"action":"accept"})[0],403)
+        status,response=self.action(worker,oid,"accept")
+        self.assertEqual(status,409,response)
+        self.assertEqual(worker.call(f"/api/orders/{oid}")[1]["order"]["status"],"issued")
+        self.assertEqual(self.action(worker,oid,"queue")[1]["order"]["status"],"queued")
+        status,_=self.action(worker,oid,"accept")
+        self.assertEqual(status,409)
+        self.assertEqual(worker.call(f"/api/orders/{oid}")[1]["order"]["status"],"queued")
+
+        uploaded=self.upload(master,oid,make_photo(background=(31,117,209)),phase="before",name="before-first.png")
+        self.assertEqual(uploaded[0],201,uploaded[1])
+        self.assertFalse(uploaded[1]["photo"]["duplicate"])
+        with app.connect(self.db_path) as db:
+            db.execute("UPDATE photos SET duplicate=1 WHERE id=?",(uploaded[1]["photo"]["id"],))
+        self.assertEqual(self.action(worker,oid,"accept")[0],409)
+        repaired=self.upload(master,oid,make_photo(background=(238,41,79)),phase="before",name="before-repair.png")
+        self.assertEqual(repaired[0],201,repaired[1])
+        self.assertFalse(repaired[1]["photo"]["duplicate"])
+        self.assertEqual(self.action(worker,oid,"accept")[1]["order"]["status"],"accepted")
+        self.assertEqual(self.upload(master,oid,make_photo(background=(15,225,60)),phase="before")[0],403)
+
+    def test_historical_seeded_planned_work_types_match_only_fourth_pattern(self):
+        with app.connect(self.db_path) as db:
+            rows=db.execute("SELECT code,work_type FROM orders WHERE code GLOB 'DEMO-[0-9][0-9][0-9][0-9]' ORDER BY code").fetchall()
+        self.assertEqual(len(rows),app.DEMO_HISTORY_SEED_COUNT)
+        for row in rows:
+            index=int(row["code"].split("-")[1])-1
+            expected="planned" if index%4==3 else "unscheduled"
+            self.assertEqual(row["work_type"],expected,row["code"])
 
     def test_polling_visibility_with_two_real_http_sessions(self):
         master=self.client("master01"); worker=self.client("worker15")
@@ -422,7 +524,7 @@ class LocalAPITest(unittest.TestCase):
         too_many=b"\x89PNG\r\n\x1a\n"+b"x"*4_000_001
         self.assertEqual(self.upload(worker,oid,too_many)[0],413)
         with app.connect(self.db_path) as db:
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=?",(oid,)).fetchone()[0],0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after'",(oid,)).fetchone()[0],0)
 
     def test_session_expiry_and_atomic_duplicate_action_race(self):
         master=self.client("master01");worker=self.client("worker01")
@@ -824,8 +926,12 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(self.action(worker,pid,"complete",completion_text=report,fault_code_id=self.fault_id,labor_hours=1.2,materials=[],materials_not_used=True)[0],200)
         self.assertEqual(self.action(worker,pid,"ai_check")[1]["order"]["status"],"ai_review")
         self.assertEqual(self.action(worker,pid,"close")[0],403)
-        accepted=self.action(master,pid,"close")
+        self.assertEqual(self.action(master,pid,"close")[0],400)
+        accepted=self.action(master,pid,"close",closure_comment="Проверено мастером, замечаний нет.")
         self.assertEqual(accepted[0],200,accepted[1])
+        with app.connect(self.db_path) as db:
+            close_event=db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='close' ORDER BY id DESC LIMIT 1",(pid,)).fetchone()
+            self.assertEqual(json.loads(close_event[0])["closure_comment"],"Проверено мастером, замечаний нет.")
         today=app.utcnow().date().isoformat()
         shift=worker.call(f"/api/reports?date_from={today}&date_to={today}&brigade=A&shift_code=A")
         self.assertEqual(shift[0],200,shift[1])
@@ -881,7 +987,7 @@ class LocalAPITest(unittest.TestCase):
                 if path=="/": self.assertIn("manifest.webmanifest",body)
                 if path=="/sw.js":
                     self.assertIn("cache.addAll",body)
-                    self.assertIn("naryadai-shell-v7",body)
+                    self.assertIn("naryadai-shell-v8",body)
                 if path.endswith("styles.css"): self.assertIn("max-width:760px",body)
                 if path.endswith("/manifest.webmanifest"):
                     manifest=json.loads(body)
@@ -962,97 +1068,350 @@ class LocalAPITest(unittest.TestCase):
             self.assertFalse(worker.call("/api/telegram/status")[1]["paired"])
 
     def test_telegram_outbox_whitelists_events_deduplicates_and_fake_delivers(self):
-        master = self.client("master01")
-        order = self.create_order(master)
-        sent = []
-        with app.connect(self.db_path) as db:
-            db.execute("DELETE FROM telegram_outbox")
-            app.audit(db, None, order["id"], "issued", {"reason":"PRIVATE REASON", "api_key":"TOP-SECRET"})
-            audit_id = db.execute("SELECT MAX(id) FROM audit WHERE order_id=? AND event='issued'", (order["id"],)).fetchone()[0]
-            app.queue_telegram_event(db, audit_id, order["id"], "issued")
-            row = db.execute("SELECT * FROM telegram_outbox").fetchone()
-            payload = json.loads(row["payload_json"])
-            self.assertEqual(row["status"], "queued_local")
-            self.assertEqual(row["recipient_user_id"], self.worker_id)
-            self.assertEqual(payload.keys(), {"text"})
-            self.assertNotIn("PRIVATE REASON", payload["text"])
-            self.assertNotIn("TOP-SECRET", payload["text"])
-            self.assertNotIn("worker01", payload["text"])
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0], 1)
-            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
-                       "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
-                       (self.worker_id, "7812345", "7812345", app.iso()))
-            db.commit()
-        with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
-                "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}):
-            self.assertTrue(app.deliver_telegram_once(self.db_path, sender=lambda token, chat, text: sent.append((token,chat,text))))
-        self.assertEqual(sent[0][0:2], ("fake-token", "7812345"))
-        self.assertIn(order["code"], sent[0][2])
-        with app.connect(self.db_path) as db:
-            row = db.execute("SELECT status,attempts,last_error FROM telegram_outbox").fetchone()
-            self.assertEqual((row["status"],row["attempts"],row["last_error"]),("delivered",1,None))
-            # Idempotent enqueue means a duplicate audit event does not create another send.
-            app.queue_telegram_event(db, audit_id, order["id"], "issued")
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM telegram_outbox").fetchone()[0], 1)
-            app.audit(db, None, order["id"], "start", {})
-            master_id = db.execute("SELECT assigned_master_id FROM orders WHERE id=?", (order["id"],)).fetchone()[0]
-            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
-                       "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
-                       (master_id, "7812346", "7812346", app.iso()))
-            db.commit()
-        def rate_limited(token, chat, text):
-            raise app.TelegramRetry(1)
-        with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
-                "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}):
-            for attempt in range(4):
-                self.assertTrue(app.deliver_telegram_once(self.db_path, sender=rate_limited))
-                with app.connect(self.db_path) as db:
-                    db.execute("UPDATE telegram_outbox SET next_attempt_at=? WHERE status='retrying'", (app.iso(app.utcnow()-timedelta(seconds=2)),))
-                    db.commit()
-        with app.connect(self.db_path) as db:
-            limited = db.execute("SELECT status,attempts,last_error FROM telegram_outbox WHERE recipient_user_id=?", (master_id,)).fetchone()
-            self.assertEqual((limited["status"],limited["attempts"],limited["last_error"]),("failed",4,"retry_limit"))
-            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at) VALUES (?,?,?,?,?)",
-                       (master_id,"uncertain_test",json.dumps({"text":"test"}),"queued_local",app.iso()))
-            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at,send_started_at) VALUES (?,?,?,?,?,?)",
-                       (master_id,"restart_test",json.dumps({"text":"test"}),"sending",app.iso(),app.iso(app.utcnow()-timedelta(minutes=2))))
-            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at) VALUES (?,?,?,?,?)",
-                       (master_id,"stale_test",json.dumps({"text":"test"}),"queued_local",app.iso(app.utcnow()-timedelta(hours=25))))
-            db.commit()
-        with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
-                "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}):
-            self.assertTrue(app.deliver_telegram_once(self.db_path, sender=lambda *_: (_ for _ in ()).throw(TimeoutError("unknown delivery"))))
-            self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *_:self.fail("stale event must not be sent")))
-        with app.connect(self.db_path) as db:
-            statuses={r["event"]:r["status"] for r in db.execute("SELECT event,status FROM telegram_outbox WHERE event IN ('restart_test','stale_test')")}
-            self.assertEqual(statuses,{"restart_test":"uncertain","stale_test":"expired"})
-            uncertain = db.execute("SELECT status,attempts,last_error FROM telegram_outbox WHERE event='uncertain_test'").fetchone()
-            self.assertEqual((uncertain["status"],uncertain["attempts"],uncertain["last_error"]),("uncertain",1,"delivery_uncertain"))
-
-    def test_telegram_delivery_skips_inactive_bound_recipient(self):
-        with app.connect(self.db_path) as db:
-            db.execute("DELETE FROM telegram_outbox WHERE event='inactive_recipient_test'")
-            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
-                       "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
-                       (self.worker_id,"7812399","7812399",app.iso()))
-            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at) VALUES (?,?,?,?,?)",
-                       (self.worker_id,"inactive_recipient_test",json.dumps({"text":"synthetic test"}),"queued_local",app.iso()))
-            db.execute("UPDATE users SET is_active=0 WHERE id=?",(self.worker_id,))
-            db.commit()
+        master=self.client("master01");worker=self.client("worker01");replacement=self.client("worker02")
+        worker_id=self.worker_id
+        master_id=master.call("/api/me")[1]["user"]["id"]
+        replacement_id=replacement.call("/api/me")[1]["user"]["id"]
         sent=[]
         settings={"NARYADAI_TELEGRAM_ENABLED":"1","NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
                   "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox")
+            db.execute("DELETE FROM telegram_bindings WHERE user_id IN (?,?,?)",(worker_id,master_id,replacement_id))
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?)",
+                       (worker_id,"7812345","7812345",app.iso()))
+            db.commit()
+        order=self.create_order(master)
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox WHERE order_id=?",(order["id"],))
+            app.audit(db,None,order["id"],"deadline_escalated",
+                {"minutes_late":12,"reason":"PRIVATE REASON","api_key":"TOP-SECRET"})
+            audit_id=db.execute("SELECT MAX(id) FROM audit WHERE order_id=? AND event='deadline_escalated'",
+                                 (order["id"],)).fetchone()[0]
+            row=db.execute("SELECT * FROM telegram_outbox WHERE order_id=?",(order["id"],)).fetchone()
+            payload=json.loads(row["payload_json"])
+            self.assertEqual((row["status"],row["recipient_user_id"],row["order_id"]),("queued_local",worker_id,order["id"]))
+            self.assertEqual((row["recipient_role"],row["recipient_chat_id"]),("worker","7812345"))
+            self.assertEqual(payload.keys(),{"text"})
+            self.assertNotIn("TOP-SECRET",payload["text"])
+            self.assertIn("PRIVATE REASON",payload["text"])
+            app.queue_telegram_event(db,audit_id,order["id"],"deadline_escalated")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM telegram_outbox WHERE order_id=?",(order["id"],)).fetchone()[0],1)
+            db.commit()
+        with unittest.mock.patch.dict(os.environ,settings):
+            self.assertTrue(app.deliver_telegram_once(self.db_path,sender=lambda token,chat,text:sent.append((token,chat,text))))
+            self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *_:self.fail("duplicate delivery")))
+        self.assertEqual(sent[0][0:2],("fake-token","7812345"))
+        self.assertIn(order["code"],sent[0][2])
+        with app.connect(self.db_path) as db:
+            row=db.execute("SELECT status,attempts,last_error FROM telegram_outbox WHERE order_id=?",(order["id"],)).fetchone()
+            self.assertEqual((row["status"],row["attempts"],row["last_error"]),("delivered",1,None))
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?)",
+                       (master_id,"7812346","7812346",app.iso()))
+            snapshot=db.execute("SELECT * FROM orders WHERE id=?",(order["id"],)).fetchone()
+            app.enqueue_telegram_message(db,master_id,"accept","Synthetic retry message","retry-limit",
+                order=snapshot,recipient_role="master")
+            app.enqueue_telegram_message(db,master_id,"accept","Duplicate retry message","retry-limit",
+                order=snapshot,recipient_role="master")
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM telegram_outbox WHERE dedupe_key='retry-limit'").fetchone()[0],1)
+            db.commit()
+        def rate_limited(token,chat,text):
+            raise app.TelegramRetry(1)
+        with unittest.mock.patch.dict(os.environ,settings):
+            for _ in range(4):
+                self.assertTrue(app.deliver_telegram_once(self.db_path,sender=rate_limited))
+                with app.connect(self.db_path) as db:
+                    db.execute("UPDATE telegram_outbox SET next_attempt_at=? WHERE status='retrying'",
+                               (app.iso(app.utcnow()-timedelta(seconds=2)),))
+                    db.commit()
+        with app.connect(self.db_path) as db:
+            limited=db.execute("SELECT status,attempts,last_error FROM telegram_outbox WHERE dedupe_key='retry-limit'").fetchone()
+            self.assertEqual((limited["status"],limited["attempts"],limited["last_error"]),("failed",4,"retry_limit"))
+            snapshot=db.execute("SELECT * FROM orders WHERE id=?",(order["id"],)).fetchone()
+            app.enqueue_telegram_message(db,master_id,"accept","Synthetic uncertain message","uncertain-once",
+                order=snapshot,recipient_role="master")
+            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at,send_started_at) VALUES (?,?,?,?,?,?)",
+                       (master_id,"restart_test",json.dumps({"text":"legacy test"}),"sending",app.iso(),app.iso(app.utcnow()-timedelta(minutes=2))))
+            db.execute("INSERT INTO telegram_outbox(recipient_user_id,event,payload_json,status,created_at) VALUES (?,?,?,?,?)",
+                       (master_id,"stale_test",json.dumps({"text":"legacy test"}),"queued_local",app.iso(app.utcnow()-timedelta(hours=25))))
+            db.commit()
+        with unittest.mock.patch.dict(os.environ,settings):
+            self.assertTrue(app.deliver_telegram_once(self.db_path,sender=lambda *_:(_ for _ in ()).throw(TimeoutError("unknown delivery"))))
+            self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *_:self.fail("uncertain/expired items must not be retried")))
+        with app.connect(self.db_path) as db:
+            statuses={r["event"]:r["status"] for r in db.execute("SELECT event,status FROM telegram_outbox WHERE event IN ('restart_test','stale_test')")}
+            self.assertEqual(statuses,{"restart_test":"uncertain","stale_test":"expired"})
+            uncertain=db.execute("SELECT status,attempts,last_error FROM telegram_outbox WHERE dedupe_key='uncertain-once'").fetchone()
+            self.assertEqual((uncertain["status"],uncertain["attempts"],uncertain["last_error"]),("uncertain",1,"delivery_uncertain"))
+
+        # A reassignment cannot race between authorization and the mocked send.
+        race_order=self.create_order(master)
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox WHERE order_id=?",(race_order["id"],))
+            snapshot=db.execute("SELECT * FROM orders WHERE id=?",(race_order["id"],)).fetchone()
+            app.enqueue_telegram_message(db,worker_id,"deadline_escalated","Race-scoped message","race-send",
+                order=snapshot,recipient_role="worker")
+            db.commit()
+        entered=threading.Event();release=threading.Event();race_sent=[];delivery_result={};assign_result={}
+        def blocked_sender(token,chat,text):
+            entered.set()
+            if not release.wait(5):
+                raise TimeoutError("race test timed out")
+            race_sent.append((chat,text))
+        def deliver_blocked():
+            with unittest.mock.patch.dict(os.environ,settings):
+                delivery_result["value"]=app.deliver_telegram_once(self.db_path,sender=blocked_sender)
+        delivery_thread=threading.Thread(target=deliver_blocked,daemon=True)
+        delivery_thread.start()
+        if not entered.wait(5):
+            with app.connect(self.db_path) as db:
+                debug={"outbox":dict(db.execute("SELECT * FROM telegram_outbox WHERE dedupe_key='race-send'").fetchone()),
+                       "order":dict(db.execute("SELECT assigned_to,assigned_master_id,status,issued_at FROM orders WHERE id=?",(race_order["id"],)).fetchone()),
+                       "user":dict(db.execute("SELECT role,is_active FROM users WHERE id=?",(worker_id,)).fetchone()),
+                       "binding":dict(db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?",(worker_id,)).fetchone())}
+            self.fail(f"delivery did not reach mocked send; result={delivery_result}; context={debug}")
+        assignment_started=threading.Event()
+        def assign_during_send():
+            assignment_started.set()
+            assign_result["response"]=master.call(f"/api/orders/{race_order['id']}/assign","POST",{"worker_id":int(replacement_id)})
+        assignment_thread=threading.Thread(target=assign_during_send,daemon=True)
+        assignment_thread.start()
+        self.assertTrue(assignment_started.wait(2))
+        release.set()
+        delivery_thread.join(8);assignment_thread.join(8)
+        self.assertFalse(delivery_thread.is_alive())
+        self.assertFalse(assignment_thread.is_alive())
+        self.assertTrue(delivery_result.get("value"))
+        self.assertEqual(assign_result["response"][0],200,assign_result["response"][1])
+        self.assertEqual(len(race_sent),1)
+        self.assertEqual(race_sent[0][0],"7812345")
+        self.assertEqual(worker.call(f"/api/orders/{race_order['id']}")[0],404)
+        with app.connect(self.db_path) as db:
+            status=db.execute("SELECT status FROM telegram_outbox WHERE dedupe_key='race-send'").fetchone()[0]
+            self.assertEqual(status,"delivered")
+        with unittest.mock.patch.dict(os.environ,settings):
+            self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *_:self.fail("race sent twice")))
+
+
+
+        # A retry queued for the former assignee is cancelled by the real API reassignment.
+        stale_order=self.create_order(master)
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox WHERE order_id=?",(stale_order["id"],))
+            snapshot=db.execute("SELECT * FROM orders WHERE id=?",(stale_order["id"],)).fetchone()
+            app.enqueue_telegram_message(db,worker_id,"deadline_escalated","Private delayed notice","stale-reassigned",
+                order=snapshot,recipient_role="worker")
+            db.commit()
+        retry_calls=[]
+        def transient_failure(token,chat,text):
+            retry_calls.append(chat)
+            raise app.TelegramRetry(1)
+        with unittest.mock.patch.dict(os.environ,settings):
+            self.assertTrue(app.deliver_telegram_once(self.db_path,sender=transient_failure))
+        with app.connect(self.db_path) as db:
+            db.execute("UPDATE telegram_outbox SET next_attempt_at=? WHERE dedupe_key='stale-reassigned'",
+                       (app.iso(app.utcnow()-timedelta(seconds=2)),))
+            db.commit()
+        moved=master.call(f"/api/orders/{stale_order['id']}/assign","POST",{"worker_id":int(replacement_id)})
+        self.assertEqual(moved[0],200,moved[1])
+        self.assertEqual(worker.call(f"/api/orders/{stale_order['id']}")[0],404)
+        with unittest.mock.patch.dict(os.environ,settings):
+            self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *_:self.fail("stale reassigned notice must not send")))
+        with app.connect(self.db_path) as db:
+            stale=db.execute("SELECT status,attempts,last_error,payload_json FROM telegram_outbox WHERE dedupe_key='stale-reassigned'").fetchone()
+            self.assertEqual((stale["status"],stale["attempts"],stale["last_error"],stale["payload_json"]),
+                             ("cancelled",1,"order_reassigned","{}"))
+        self.assertEqual(retry_calls,["7812345"])
+
+    def test_telegram_durable_claim_survives_hard_crash_and_rechecks_scope(self):
+        master=self.client("master01");replacement=self.client("worker02")
+        worker_id=self.worker_id
+        replacement_id=replacement.call("/api/me")[1]["user"]["id"]
+        settings={"NARYADAI_TELEGRAM_ENABLED":"1","NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
+                  "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}
+        accepted_marker=Path(self.temp.name)/"telegram-provider-accepted.txt"
+        accepted_marker.unlink(missing_ok=True)
+        with app.connect(self.db_path) as db:
+            previous_binding=db.execute("SELECT chat_id,telegram_user_id,linked_at FROM telegram_bindings WHERE user_id=?",
+                                        (worker_id,)).fetchone()
+        def restore_fixture():
+            with app.connect(self.db_path) as db:
+                db.execute("DELETE FROM telegram_outbox WHERE dedupe_key IN "
+                           "('hard-crash-accepted','claim-reassigned','claim-rebound-chat')")
+                if previous_binding:
+                    db.execute("UPDATE telegram_bindings SET chat_id=?,telegram_user_id=?,linked_at=? WHERE user_id=?",
+                               (*tuple(previous_binding),worker_id))
+                else:
+                    db.execute("DELETE FROM telegram_bindings WHERE user_id=?",(worker_id,))
+                db.commit()
+        self.addCleanup(restore_fixture)
+
+        order=self.create_order(master)
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox")
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
+                       "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
+                       (worker_id,"7812501","7812501",app.iso()))
+            snapshot=db.execute("SELECT * FROM orders WHERE id=?",(order["id"],)).fetchone()
+            app.enqueue_telegram_message(db,worker_id,"deadline_escalated","Crash durability test","hard-crash-accepted",
+                order=snapshot,recipient_role="worker")
+            db.commit()
+
+        child_code=(
+            "import os,sys\n"
+            "from pathlib import Path\n"
+            "import server\n"
+            "def accepted(*_args):\n"
+            "    Path(sys.argv[2]).write_text('accepted',encoding='ascii')\n"
+            "    os._exit(73)\n"
+            "server.deliver_telegram_once(sys.argv[1],sender=accepted)\n"
+            "raise SystemExit(0)\n"
+        )
+        with unittest.mock.patch.dict(os.environ,settings):
+            crash=subprocess.run([sys.executable,"-c",child_code,str(self.db_path),str(accepted_marker)],
+                cwd=str(Path(__file__).resolve().parents[1]),capture_output=True,timeout=15)
+        self.assertEqual(crash.returncode,73,crash.stderr.decode("utf-8",errors="replace"))
+        self.assertEqual(accepted_marker.read_text(encoding="ascii"),"accepted")
+        with app.connect(self.db_path) as db:
+            claimed=db.execute("SELECT status,attempts,send_started_at FROM telegram_outbox WHERE dedupe_key='hard-crash-accepted'").fetchone()
+            self.assertEqual((claimed["status"],claimed["attempts"]),("sending",1))
+            self.assertIsNotNone(claimed["send_started_at"])
+            db.execute("UPDATE telegram_outbox SET send_started_at=? WHERE dedupe_key='hard-crash-accepted'",
+                       (app.iso(app.utcnow()-timedelta(minutes=2)),))
+            db.commit()
+        after_restart=[]
+        with unittest.mock.patch.dict(os.environ,settings):
+            self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *args:after_restart.append(args)))
+        self.assertEqual(after_restart,[])
+        with app.connect(self.db_path) as db:
+            recovered=db.execute("SELECT status,attempts,last_error FROM telegram_outbox WHERE dedupe_key='hard-crash-accepted'").fetchone()
+            self.assertEqual(tuple(recovered),("uncertain",1,"worker_restart_uncertain"))
+
+        # Reassignment between the committed claim and the second transaction cancels it.
+        reassigned=self.create_order(master)
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox")
+            snapshot=db.execute("SELECT * FROM orders WHERE id=?",(reassigned["id"],)).fetchone()
+            app.enqueue_telegram_message(db,worker_id,"deadline_escalated","Reassignment race","claim-reassigned",
+                order=snapshot,recipient_role="worker")
+            db.commit()
+        claimed_id,processed=app._claim_telegram_delivery(self.db_path)
+        self.assertTrue(processed);self.assertIsNotNone(claimed_id)
+        moved=master.call(f"/api/orders/{reassigned['id']}/assign","POST",{"worker_id":int(replacement_id)})
+        self.assertEqual(moved[0],200,moved[1])
+        sent=[]
+        self.assertTrue(app._finish_claimed_telegram_delivery(self.db_path,claimed_id,
+            sender=lambda *args:sent.append(args),token="fake-token"))
+        self.assertEqual(sent,[])
+        with app.connect(self.db_path) as db:
+            state=db.execute("SELECT status,last_error,payload_json FROM telegram_outbox WHERE dedupe_key='claim-reassigned'").fetchone()
+            self.assertEqual(tuple(state),("cancelled","order_reassigned","{}"))
+
+        # A chat rebinding in the same inter-transaction window fails closed too.
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox")
+            app.enqueue_telegram_message(db,worker_id,"pair_linked","Synthetic pairing confirmation","claim-rebound-chat")
+            db.commit()
+        claimed_id,processed=app._claim_telegram_delivery(self.db_path)
+        self.assertTrue(processed);self.assertIsNotNone(claimed_id)
+        with app.connect(self.db_path) as db:
+            db.execute("UPDATE telegram_bindings SET chat_id='7812502',telegram_user_id='7812502' WHERE user_id=?",(worker_id,))
+            db.commit()
+        sent=[]
+        self.assertTrue(app._finish_claimed_telegram_delivery(self.db_path,claimed_id,
+            sender=lambda *args:sent.append(args),token="fake-token"))
+        self.assertEqual(sent,[])
+        with app.connect(self.db_path) as db:
+            state=db.execute("SELECT status,last_error,payload_json FROM telegram_outbox WHERE dedupe_key='claim-rebound-chat'").fetchone()
+            self.assertEqual(tuple(state),("cancelled","stale_authorization_scope","{}"))
+
+    def test_overdue_telegram_template_is_scoped_bounded_and_sanitized(self):
+        master=self.client("master01");worker=self.client("worker01");manager=self.client("manager")
+        order=self.create_order(master)
+        worker_id=worker.call("/api/me")[1]["user"]["id"]
+        manager_id=manager.call("/api/me")[1]["user"]["id"]
+        with app.connect(self.db_path) as db:
+            details=db.execute("SELECT o.assigned_master_id,e.name AS equipment_name,a.name AS area_name FROM orders o JOIN equipment e ON e.id=o.equipment_id JOIN areas a ON a.id=o.area_id WHERE o.id=?",(order["id"],)).fetchone()
+            db.execute("DELETE FROM telegram_outbox")
+            for recipient_id,chat_id in ((worker_id,"7812450"),(details["assigned_master_id"],"7812451")):
+                db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
+                           "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
+                           (recipient_id,chat_id,chat_id,app.iso()))
+            app.audit(db,worker_id,order["id"],"pause",
+                      {"reason":"<b>Check door</b>\nprivate\u0001 note"})
+            app.audit(db,None,order["id"],"deadline_escalated",{"minutes_late":23,"api_key":"never-include"})
+            rows=db.execute("SELECT recipient_user_id,payload_json FROM telegram_outbox WHERE event='deadline_escalated'").fetchall()
+            expected={self.worker_id,details["assigned_master_id"]}
+            self.assertEqual({row["recipient_user_id"] for row in rows},expected)
+            self.assertNotIn(manager_id,{row["recipient_user_id"] for row in rows})
+            self.assertEqual(len(rows),2)
+            for row in rows:
+                message=json.loads(row["payload_json"])["text"]
+                self.assertLessEqual(len(message),280)
+                self.assertIn(order["code"],message)
+                self.assertIn(details["equipment_name"],message)
+                self.assertIn(details["area_name"],message)
+                self.assertIn("Исполнитель",message)
+                self.assertIn("23 мин",message)
+                self.assertIn("Комментарий:",message)
+                self.assertIn("‹b›Check door‹/b› private note",message)
+                self.assertNotIn("<b>",message)
+                self.assertNotIn("never-include",message)
+                self.assertNotIn("\n",message)
+                self.assertLessEqual(len(app.telegram_plain_field("x"*200,52)),52)
+
+    def test_telegram_delivery_skips_inactive_bound_recipient(self):
+        master=self.client("master01")
+        order=self.create_order(master)
+        settings={"NARYADAI_TELEGRAM_ENABLED":"1","NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
+                  "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}
+        sent=[]
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox")
+            db.execute("DELETE FROM telegram_outbox WHERE order_id=?",(order["id"],))
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
+                       "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
+                       (self.worker_id,"7812399","7812399",app.iso()))
+            snapshot=db.execute("SELECT * FROM orders WHERE id=?",(order["id"],)).fetchone()
+            app.enqueue_telegram_message(db,self.worker_id,"inactive_recipient_test","synthetic test","inactive-bound",
+                order=snapshot,recipient_role="worker")
+            db.execute("UPDATE users SET is_active=0 WHERE id=?",(self.worker_id,))
+            db.commit()
         try:
             with unittest.mock.patch.dict(os.environ,settings):
-                self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *args:sent.append(args)))
+                self.assertTrue(app.deliver_telegram_once(self.db_path,sender=lambda *args:sent.append(args)))
             self.assertEqual(sent,[])
             with app.connect(self.db_path) as db:
-                row=db.execute("SELECT status,attempts FROM telegram_outbox WHERE event='inactive_recipient_test'").fetchone()
-                self.assertEqual((row["status"],row["attempts"]),("queued_local",0))
+                row=db.execute("SELECT status,attempts,last_error,payload_json FROM telegram_outbox WHERE dedupe_key='inactive-bound'").fetchone()
+                self.assertEqual((row["status"],row["attempts"],row["last_error"],row["payload_json"]),
+                                 ("cancelled",0,"stale_authorization_scope","{}"))
+                db.execute("UPDATE users SET is_active=1 WHERE id=?",(self.worker_id,))
+                snapshot=db.execute("SELECT * FROM orders WHERE id=?",(order["id"],)).fetchone()
+                app.enqueue_telegram_message(db,self.worker_id,"role_change_test","synthetic test","role-changed",
+                    order=snapshot,recipient_role="worker")
+                db.execute("UPDATE users SET role='master' WHERE id=?",(self.worker_id,))
+                db.commit()
+            with unittest.mock.patch.dict(os.environ,settings):
+                self.assertTrue(app.deliver_telegram_once(self.db_path,sender=lambda *args:sent.append(args)))
+            with app.connect(self.db_path) as db:
+                row=db.execute("SELECT status,last_error,payload_json FROM telegram_outbox WHERE dedupe_key='role-changed'").fetchone()
+                self.assertEqual(tuple(row),("cancelled","stale_authorization_scope","{}"))
+                db.execute("UPDATE users SET role='worker' WHERE id=?",(self.worker_id,))
+                snapshot=db.execute("SELECT * FROM orders WHERE id=?",(order["id"],)).fetchone()
+                app.enqueue_telegram_message(db,self.worker_id,"chat_rebind_test","synthetic test","chat-rebound",
+                    order=snapshot,recipient_role="worker")
+                db.execute("UPDATE telegram_bindings SET chat_id='7812400',telegram_user_id='7812400' WHERE user_id=?",(self.worker_id,))
+                db.commit()
+            with unittest.mock.patch.dict(os.environ,settings):
+                self.assertTrue(app.deliver_telegram_once(self.db_path,sender=lambda *args:sent.append(args)))
+            self.assertEqual(sent,[])
+            with app.connect(self.db_path) as db:
+                row=db.execute("SELECT status,last_error,payload_json FROM telegram_outbox WHERE dedupe_key='chat-rebound'").fetchone()
+                self.assertEqual(tuple(row),("cancelled","stale_authorization_scope","{}"))
         finally:
             with app.connect(self.db_path) as db:
-                db.execute("UPDATE users SET is_active=1 WHERE id=?",(self.worker_id,))
-                db.execute("DELETE FROM telegram_outbox WHERE event='inactive_recipient_test'")
+                db.execute("UPDATE users SET is_active=1,role='worker' WHERE id=?",(self.worker_id,))
+                db.execute("UPDATE telegram_bindings SET chat_id='7812399',telegram_user_id='7812399' WHERE user_id=?",(self.worker_id,))
                 db.commit()
 
     def test_equipment_downtime_permissions_idempotency_and_non_overlapping_report(self):
