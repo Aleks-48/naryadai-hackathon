@@ -425,6 +425,7 @@ def show_worker_actions(order: dict[str, Any], constants: dict[str, Any]) -> Non
                 api("POST", f"/api/orders/{oid}/action", {"action": "pause", "reason": reason}); st.rerun()
         faults = constants.get("fault_codes", [])
         materials = constants.get("materials", [])
+        material_ids = st.multiselect("Использованные материалы", [x["id"] for x in materials], format_func=lambda key: next(f"{x['sku']} · {x['name']} ({x['unit']})" for x in materials if x["id"] == key))
         with st.form(f"complete-{oid}"):
             report = st.text_area("Что сделано и какой результат наблюдался", height=100)
             fault_ids = [item["id"] for item in faults]
@@ -432,10 +433,15 @@ def show_worker_actions(order: dict[str, Any], constants: dict[str, Any]) -> Non
             fault_col, hours_col = st.columns([1.4, .8])
             fault_id = fault_col.selectbox("Код неисправности", fault_ids, format_func=lambda key: fault_labels[key]) if fault_ids else None
             hours = hours_col.number_input("Фактическая работа, ч", min_value=0.1, max_value=72.0, value=1.0)
-            material_ids = st.multiselect("Использованные материалы", [x["id"] for x in materials], format_func=lambda key: next(f"{x['sku']} · {x['name']} ({x['unit']})" for x in materials if x["id"] == key))
+            material_quantities = {}
+            for material_id in material_ids:
+                material = next(item for item in materials if item["id"] == material_id)
+                material_quantities[material_id] = st.number_input(
+                    f"Количество · {material['sku']} ({material['unit']})", min_value=0.001,
+                    max_value=100000.0, value=1.0, step=0.001, format="%.3f", key=f"completion-material-{oid}-{material_id}")
             if st.form_submit_button("Зафиксировать исполнение"):
                 payload = {"action": "complete", "completion_text": report, "fault_code_id": fault_id, "labor_hours": hours,
-                           "materials": [{"material_id": item, "quantity": 1} for item in material_ids], "materials_not_used": not material_ids}
+                           "materials": [{"material_id": item, "quantity": material_quantities[item]} for item in material_ids], "materials_not_used": not material_ids}
                 api("POST", f"/api/orders/{oid}/action", payload); st.rerun()
         add_photo(oid, "after")
     elif status == "paused":
@@ -452,8 +458,9 @@ def show_worker_actions(order: dict[str, Any], constants: dict[str, Any]) -> Non
 
 def show_master_actions(order: dict[str, Any]) -> None:
     oid, status = order["id"], order["status"]
-    if status == "issued":
+    if status in ("issued", "queued"):
         add_photo(oid, "before")
+    if status == "issued":
         with st.form(f"cancel-{oid}"):
             reason = st.text_input("Основание отмены")
             if st.form_submit_button("Отменить наряд"):
@@ -461,9 +468,9 @@ def show_master_actions(order: dict[str, Any]) -> None:
     if status == "ai_review":
         c1, c2 = st.columns(2)
         with c1.form(f"close-{oid}"):
-            reason = st.text_input("Комментарий мастера к приёмке")
+            reason = st.text_input("Комментарий мастера к приёмке", max_chars=1000)
             if st.form_submit_button("Принять и закрыть", type="primary"):
-                api("POST", f"/api/orders/{oid}/action", {"action": "close", "reason": reason}); st.rerun()
+                api("POST", f"/api/orders/{oid}/action", {"action": "close", "closure_comment": reason}); st.rerun()
         with c2.form(f"rework-{oid}"):
             reason = st.text_input("Что исправить")
             if st.form_submit_button("На доработку"):

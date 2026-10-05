@@ -56,6 +56,8 @@ DEMO_EQUIPMENT_TYPES = (
     ("pump", "Насос шламовый"), ("compressor", "Компрессор винтовой"),
     ("fan", "Вентилятор вытяжной"),
 )
+DEMO_HISTORY_SEED_COUNT = 540
+DEMO_HISTORY_WORK_TYPE_MIGRATION = "demo-history-work-type-v1"
 DEMO_EQUIPMENT_SEED_PAIRS = tuple(
     (f"EQ-{index + 1:03d}", f"{label} {index // len(DEMO_EQUIPMENT_TYPES) + 1:02d}", equipment_type)
     for index in range(25)
@@ -202,6 +204,17 @@ def connect(path: Path | str = DB_PATH) -> sqlite3.Connection:
     return conn
 
 
+def migrate_legacy_demo_work_types(db: sqlite3.Connection) -> int:
+    """Fail closed: older synthetic rows have no immutable seed provenance."""
+    db.execute("CREATE TABLE IF NOT EXISTS app_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+    # Earlier rows predate a seed-provenance marker. A code and description
+    # match cannot prove that title, equipment, area, fault, status, assignment,
+    # or work type is still unchanged. Fresh seed rows already get their type
+    # in seed_demo(); never infer a repair from mutable row content.
+    db.execute("INSERT OR IGNORE INTO app_migrations(name,applied_at) VALUES (?,?)",
+               (DEMO_HISTORY_WORK_TYPE_MIGRATION, iso()))
+    return 0
+
 def init_db(path: Path | str = DB_PATH) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     MEDIA.mkdir(parents=True, exist_ok=True)
@@ -300,7 +313,12 @@ def init_db(path: Path | str = DB_PATH) -> None:
             message TEXT NOT NULL, created_at TEXT NOT NULL, read_at TEXT
         );
         CREATE TABLE IF NOT EXISTS telegram_outbox (
-            id INTEGER PRIMARY KEY, event TEXT NOT NULL, payload_json TEXT NOT NULL,
+            id INTEGER PRIMARY KEY,
+            recipient_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            order_id INTEGER REFERENCES orders(id) ON DELETE SET NULL,
+            recipient_role TEXT, recipient_chat_id TEXT,
+            order_status_snapshot TEXT, order_issued_at_snapshot TEXT,
+            event TEXT NOT NULL, payload_json TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'queued_local', created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS telegram_bindings (
@@ -349,14 +367,18 @@ def init_db(path: Path | str = DB_PATH) -> None:
             db.execute("ALTER TABLE photos ADD COLUMN color_signature TEXT")
         telegram_columns = {r[1] for r in db.execute("PRAGMA table_info(telegram_outbox)")}
         for name, definition in (("recipient_user_id", "INTEGER REFERENCES users(id) ON DELETE CASCADE"),
+                                 ("order_id", "INTEGER REFERENCES orders(id) ON DELETE SET NULL"),
+                                 ("recipient_role", "TEXT"), ("recipient_chat_id", "TEXT"),
+                                 ("order_status_snapshot", "TEXT"), ("order_issued_at_snapshot", "TEXT"),
                                  ("attempts", "INTEGER NOT NULL DEFAULT 0"), ("next_attempt_at", "TEXT"),
-                                  ("sent_at", "TEXT"), ("send_started_at", "TEXT"), ("last_error", "TEXT"), ("dedupe_key", "TEXT")):
+                                 ("sent_at", "TEXT"), ("send_started_at", "TEXT"), ("last_error", "TEXT"), ("dedupe_key", "TEXT")):
             if name not in telegram_columns:
                 db.execute(f"ALTER TABLE telegram_outbox ADD COLUMN {name} {definition}")
         db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_dedupe ON telegram_outbox(dedupe_key) WHERE dedupe_key IS NOT NULL")
         db.execute("CREATE INDEX IF NOT EXISTS idx_telegram_delivery ON telegram_outbox(status,next_attempt_at,id)")
         db.execute("UPDATE photos SET duplicate_type='exact' WHERE duplicate=1 AND duplicate_type='none'")
         db.execute("CREATE INDEX IF NOT EXISTS idx_photos_sha256 ON photos(sha256)")
+        migrate_legacy_demo_work_types(db)
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             seed_demo(db)
         seed_synthetic_norm_catalog(db)
@@ -474,12 +496,13 @@ def seed_demo(db: sqlite3.Connection) -> None:
         closed = completed + timedelta(minutes=15) if status == "closed" and completed else None
         due = created + timedelta(minutes=180 if priority == "emergency" else 480)
         text = "Осмотр выполнен; результат и дальнейшие действия зафиксированы в синтетической демонстрационной записи." if completed else None
-        cur = db.execute("""INSERT INTO orders(code,title,description,priority,area_id,equipment_id,assigned_to,assigned_master_id,status,
-                          created_at,issued_at,due_at,accepted_at,started_at,completed_at,closed_at,reject_reason,pause_reason,
-                          labor_hours,fault_code_id,completion_text,ai_mode,ai_result,ai_checked_at,rating,rating_reason,rated_by)
-                          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                         (f"DEMO-{n+1:04d}", title, f"Синтетический повторяемый паттерн {pat+1}. Требуется осмотр и описание результата.",
-                          priority, eq_row["area_id"], eq_id, tech_id, master_id, status, iso(created), iso(issued), iso(due),
+        history_work_type = "planned" if pat == 3 else "unscheduled"
+        cur = db.execute("""INSERT INTO orders(code,title,description,work_type,priority,area_id,equipment_id,assigned_to,assigned_master_id,status,
+                           created_at,issued_at,due_at,accepted_at,started_at,completed_at,closed_at,reject_reason,pause_reason,
+                           labor_hours,fault_code_id,completion_text,ai_mode,ai_result,ai_checked_at,rating,rating_reason,rated_by)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                          (f"DEMO-{n+1:04d}", title, f"Синтетический повторяемый паттерн {pat+1}. Требуется осмотр и описание результата.",
+                           history_work_type, priority, eq_row["area_id"], eq_id, tech_id, master_id, status, iso(created), iso(issued), iso(due),
                           iso(accepted) if accepted else None, iso(started) if started else None, iso(completed) if completed else None,
                           iso(closed) if closed else None, "Синтетическая причина отказа" if status == "rejected" else None,
                           "Синтетическая причина паузы" if status == "paused" else None, round(1 + (n % 8) * 0.25, 2) if completed else None,
@@ -587,32 +610,93 @@ def telegram_delivery_configured() -> bool:
             and bool(os.environ.get("NARYADAI_TELEGRAM_WEBHOOK_SECRET", "").strip()))
 
 
+def cancel_telegram_order_messages(db: sqlite3.Connection, order_id: int, reason: str) -> None:
+    db.execute("""UPDATE telegram_outbox SET status='cancelled',payload_json='{}',
+        last_error=?,next_attempt_at=NULL,send_started_at=NULL
+        WHERE order_id=? AND status IN ('queued_local','retrying','sending')""", (reason,order_id))
+
+
+def cancel_telegram_user_messages(db: sqlite3.Connection, user_id: int, reason: str) -> None:
+    db.execute("""UPDATE telegram_outbox SET status='cancelled',payload_json='{}',
+        last_error=?,next_attempt_at=NULL,send_started_at=NULL
+        WHERE recipient_user_id=? AND status IN ('queued_local','retrying','sending')""", (reason,user_id))
+
+
 def enqueue_telegram_message(db: sqlite3.Connection, recipient_user_id: int, event: str,
-                             message: str, dedupe_key: str) -> None:
+                             message: str, dedupe_key: str, *,
+                             order: sqlite3.Row | None = None,
+                             recipient_role: str | None = None) -> None:
+    user=db.execute("SELECT role,is_active FROM users WHERE id=?",(recipient_user_id,)).fetchone()
+    binding=db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?",(recipient_user_id,)).fetchone()
+    if not user or not user["is_active"] or not binding:
+        return
+    expected_role=recipient_role or user["role"]
+    if expected_role != user["role"]:
+        return
+    if order is not None:
+        scope=(order["id"],order["status"],order["issued_at"])
+    else:
+        scope=(None,None,None)
     db.execute("""INSERT OR IGNORE INTO telegram_outbox
-        (recipient_user_id,event,payload_json,status,created_at,dedupe_key)
-        VALUES (?,?,?,'queued_local',?,?)""",
-        (recipient_user_id, event, json.dumps({"text": message[:280]}, ensure_ascii=False), iso(), dedupe_key))
+        (recipient_user_id,order_id,recipient_role,recipient_chat_id,order_status_snapshot,
+         order_issued_at_snapshot,event,payload_json,status,created_at,dedupe_key)
+        VALUES (?,?,?,?,?,?,?,?,'queued_local',?,?)""",
+        (recipient_user_id,scope[0],expected_role,binding["chat_id"],scope[1],scope[2],event,
+         json.dumps({"text":message[:280]},ensure_ascii=False),iso(),dedupe_key))
+
+def telegram_plain_field(value: object, limit: int) -> str:
+    """Bound a user-visible field for a plain-text Bot API message (no parse_mode)."""
+    text = " ".join(str(value or "").split())
+    text = "".join(char for char in text if char.isprintable())
+    # Keep markup-looking input inert and visually readable; telegram_send_message sends no parse_mode.
+    return text.replace("&", "＆").replace("<", "‹").replace(">", "›")[:limit]
 
 
 def queue_telegram_event(db: sqlite3.Connection, audit_id: int, order_id: int | None, event: str) -> None:
-    """Queue only a small event template for authorized roles, never the audit payload/reason."""
+    """Queue scoped templates; overdue notices may include a bounded plain-text reason, never raw payloads."""
     template = TELEGRAM_EVENT_TEXT.get(event)
     if not template or order_id is None:
         return
-    order = db.execute("SELECT id,code,assigned_to,assigned_master_id,status FROM orders WHERE id=?", (order_id,)).fetchone()
+    order = db.execute("""SELECT o.id,o.code,o.assigned_to,o.assigned_master_id,o.status,o.due_at,o.issued_at,
+        e.name AS equipment_name,a.name AS area_name,w.display_name AS worker_name
+        FROM orders o JOIN equipment e ON e.id=o.equipment_id JOIN areas a ON a.id=o.area_id
+        JOIN users w ON w.id=o.assigned_to WHERE o.id=?""", (order_id,)).fetchone()
     if not order:
         return
     audience, description = template
-    recipients = set()
+    recipients: dict[int, str] = {}
     if audience in ("worker", "both"):
-        recipients.add(order["assigned_to"])
+        recipients[order["assigned_to"]] = "worker"
     if audience in ("master", "both"):
-        recipients.add(order["assigned_master_id"])
+        recipients[order["assigned_master_id"]] = "master"
     status_label = STATUS_LABELS.get(order["status"], "обновлён")
     message = f"Наряд {order['code']}: {description}. Статус: {status_label}."
-    for recipient in recipients:
-        enqueue_telegram_message(db, recipient, event, message, f"audit:{audit_id}:user:{recipient}")
+    if event in {"deadline_reminder", "deadline_escalated", "deadline_repeat"}:
+        event_row = db.execute("SELECT payload_json FROM audit WHERE id=?", (audit_id,)).fetchone()
+        event_payload = json.loads(event_row[0]) if event_row else {}
+        if event == "deadline_reminder":
+            due = parse_time(order["due_at"])
+            minutes = min(99_999_999, max(0, int((due-utcnow()).total_seconds()//60))) if due else 0
+            kind = "До срока"
+        else:
+            try: minutes = min(99_999_999, max(0, int(event_payload.get("minutes_late", 0))))
+            except (TypeError, ValueError): minutes = 0
+            kind = "Просрочка"
+        last_reason = db.execute("""SELECT payload_json FROM audit WHERE order_id=? AND
+            (json_extract(payload_json,'$.closure_comment') IS NOT NULL OR json_extract(payload_json,'$.reason') IS NOT NULL)
+            ORDER BY id DESC LIMIT 1""", (order_id,)).fetchone()
+        reason_data = json.loads(last_reason[0]) if last_reason else {}
+        comment = reason_data.get("closure_comment") or reason_data.get("reason") or "Комментарий не указан"
+        message = (f"{kind} {telegram_plain_field(order['code'],24)} · "
+                   f"{telegram_plain_field(order['equipment_name'],34)} · {telegram_plain_field(order['area_name'],38)} · "
+                   f"Исполнитель {telegram_plain_field(order['worker_name'],32)} · {minutes} мин · "
+                   f"Комментарий: {telegram_plain_field(comment,52)} · {telegram_plain_field(status_label,18)}")
+    for recipient, expected_role in recipients.items():
+        authorized = db.execute("SELECT role,is_active FROM users WHERE id=?", (recipient,)).fetchone()
+        if not authorized or not authorized["is_active"] or authorized["role"] != expected_role:
+            continue
+        enqueue_telegram_message(db, recipient, event, message, f"audit:{audit_id}:user:{recipient}",
+                                 order=order, recipient_role=expected_role)
 
 
 def create_telegram_pairing(db: sqlite3.Connection, user_id: int) -> tuple[str, str]:
@@ -671,46 +755,123 @@ def telegram_send_message(token: str, chat_id: str, text: str) -> None:
         raise TelegramRejected()
 
 
-def deliver_telegram_once(db_path: Path | str, sender=None) -> bool:
-    """Claim and deliver one queue item. Only known 429 rejection is retried."""
-    if not telegram_delivery_configured():
-        return False
-    token = os.environ["NARYADAI_TELEGRAM_BOT_TOKEN"].strip()
+_TELEGRAM_DELIVERY_CONTEXT_SQL = """SELECT q.*,b.chat_id AS current_chat_id,u.role AS current_role,u.is_active AS recipient_active,
+    o.assigned_to AS current_assigned_to,o.assigned_master_id AS current_assigned_master_id,
+    o.status AS current_order_status,o.issued_at AS current_order_issued_at
+    FROM telegram_outbox q
+    LEFT JOIN telegram_bindings b ON b.user_id=q.recipient_user_id
+    LEFT JOIN users u ON u.id=q.recipient_user_id
+    LEFT JOIN orders o ON o.id=q.order_id
+    """
+
+
+def _telegram_delivery_scope_is_current(row: sqlite3.Row) -> bool:
+    valid = bool(row["recipient_role"] in ("worker", "master")
+                 and row["recipient_role"] == row["current_role"]
+                 and row["recipient_active"] == 1
+                 and row["recipient_chat_id"]
+                 and row["recipient_chat_id"] == row["current_chat_id"])
+    if row["order_id"] is None:
+        return valid and row["event"] == "pair_linked"
+    expected_assignee = (row["current_assigned_to"] if row["recipient_role"] == "worker"
+                         else row["current_assigned_master_id"])
+    return bool(valid and row["current_order_status"] is not None
+                and row["recipient_user_id"] == expected_assignee
+                and row["order_status_snapshot"] == row["current_order_status"]
+                and row["order_issued_at_snapshot"] == row["current_order_issued_at"])
+
+
+def _cancel_stale_telegram_delivery(db: sqlite3.Connection, outbox_id: int) -> None:
+    db.execute("""UPDATE telegram_outbox SET status='cancelled',payload_json='{}',
+        last_error='stale_authorization_scope',next_attempt_at=NULL,send_started_at=NULL WHERE id=?""",
+        (outbox_id,))
+
+
+def _claim_telegram_delivery(db_path: Path | str) -> tuple[int | None, bool]:
+    """Durably claim one eligible message before calling any external sender.
+
+    The bool reports whether this call processed an item (including cancelling a
+    stale one), so the delivery loop can drain multiple queue entries.
+    """
     with connect(db_path) as db:
         db.execute("BEGIN IMMEDIATE")
         db.execute("UPDATE telegram_outbox SET status='uncertain',last_error='worker_restart_uncertain',send_started_at=NULL "
-                   "WHERE status='sending' AND send_started_at<?", (iso(utcnow()-timedelta(seconds=60)),))
-        db.execute("UPDATE telegram_outbox SET status='expired',last_error='expired_before_delivery' "
+                   "WHERE status='sending' AND (send_started_at IS NULL OR send_started_at<?)",
+                   (iso(utcnow()-timedelta(seconds=60)),))
+        db.execute("UPDATE telegram_outbox SET status='expired',last_error='expired_before_delivery',payload_json='{}' "
                    "WHERE status IN ('queued_local','retrying') AND created_at<?", (iso(utcnow()-timedelta(hours=24)),))
-        row = db.execute("""SELECT q.*,b.chat_id FROM telegram_outbox q
-            JOIN telegram_bindings b ON b.user_id=q.recipient_user_id
-            JOIN users u ON u.id=q.recipient_user_id AND u.is_active=1
+        row = db.execute(_TELEGRAM_DELIVERY_CONTEXT_SQL + """
             WHERE q.status IN ('queued_local','retrying') AND (q.next_attempt_at IS NULL OR q.next_attempt_at<=?)
             ORDER BY q.id LIMIT 1""", (iso(),)).fetchone()
         if not row:
-            db.commit(); return False
-        db.execute("UPDATE telegram_outbox SET status='sending',attempts=attempts+1,next_attempt_at=NULL,send_started_at=? WHERE id=?", (iso(),row["id"]))
+            db.commit()
+            return None, False
+        if not _telegram_delivery_scope_is_current(row):
+            _cancel_stale_telegram_delivery(db, row["id"])
+            db.commit()
+            return None, True
+        attempts = int(row["attempts"] or 0) + 1
+        claimed = db.execute("UPDATE telegram_outbox SET status='sending',attempts=?,next_attempt_at=NULL,send_started_at=? "
+                             "WHERE id=? AND status IN ('queued_local','retrying')",
+                             (attempts,iso(),row["id"]))
+        if claimed.rowcount != 1:
+            db.commit()
+            return None, True
+        # This commit is deliberately before the provider call. If the process dies
+        # after a provider accepts a message, restart recovery sees a durable claim
+        # and changes it to uncertain instead of blindly delivering it again.
         db.commit()
-    try:
-        (sender or telegram_send_message)(token, row["chat_id"], json.loads(row["payload_json"]).get("text", ""))
-        status, err, next_at = "delivered", None, None
-    except TelegramRetry as exc:
-        with connect(db_path) as db:
-            attempts = db.execute("SELECT attempts FROM telegram_outbox WHERE id=?", (row["id"],)).fetchone()[0]
+        return int(row["id"]), True
+
+
+def _finish_claimed_telegram_delivery(db_path: Path | str, outbox_id: int,
+                                      sender=None, token: str | None = None) -> bool:
+    """Recheck scope and settle a durable claim while holding SQLite's write lock."""
+    delivery_token = token if token is not None else os.environ["NARYADAI_TELEGRAM_BOT_TOKEN"].strip()
+    with connect(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute(_TELEGRAM_DELIVERY_CONTEXT_SQL +
+                         "WHERE q.id=? AND q.status='sending'", (outbox_id,)).fetchone()
+        if not row:
+            db.commit()
+            return True
+        if not _telegram_delivery_scope_is_current(row):
+            _cancel_stale_telegram_delivery(db, outbox_id)
+            db.commit()
+            return True
+        attempts = int(row["attempts"] or 0)
+        # Keep the write lock through the provider call and final status update.
+        # Assignment, unpair, or rebinding either happens before this recheck or
+        # waits until the delivery has a durable final state.
+        try:
+            (sender or telegram_send_message)(delivery_token, row["current_chat_id"],
+                                               json.loads(row["payload_json"]).get("text", ""))
+            status, err, next_at = "delivered", None, None
+        except TelegramRetry as exc:
             if attempts < 4:
                 status, err, next_at = "retrying", "provider_rate_limit", iso(utcnow()+timedelta(seconds=exc.delay_seconds))
             else:
                 status, err, next_at = "failed", "retry_limit", None
-    except TelegramRejected:
-        status, err, next_at = "failed", "provider_rejected", None
-    except Exception:
-        # A transport timeout can happen after Telegram accepted a message. Do not retry blindly.
-        status, err, next_at = "uncertain", "delivery_uncertain", None
-    with connect(db_path) as db:
+        except TelegramRejected:
+            status, err, next_at = "failed", "provider_rejected", None
+        except Exception:
+            # A transport timeout can happen after Telegram accepted a message. Do not retry blindly.
+            status, err, next_at = "uncertain", "delivery_uncertain", None
         db.execute("UPDATE telegram_outbox SET status=?,last_error=?,next_attempt_at=?,sent_at=?,send_started_at=NULL WHERE id=?",
-                   (status, err, next_at, iso() if status == "delivered" else None, row["id"]))
+                   (status,err,next_at,iso() if status == "delivered" else None,outbox_id))
         db.commit()
     return True
+
+
+def deliver_telegram_once(db_path: Path | str, sender=None) -> bool:
+    """Deliver only while the queued role, chat, and order assignment still match."""
+    if not telegram_delivery_configured():
+        return False
+    token = os.environ["NARYADAI_TELEGRAM_BOT_TOKEN"].strip()
+    outbox_id, processed = _claim_telegram_delivery(db_path)
+    if outbox_id is None:
+        return processed
+    return _finish_claimed_telegram_delivery(db_path, outbox_id, sender=sender, token=token)
 
 
 def telegram_delivery_loop(db_path: Path, stopped: threading.Event) -> None:
@@ -719,7 +880,7 @@ def telegram_delivery_loop(db_path: Path, stopped: threading.Event) -> None:
             try:
                 with connect(db_path) as db:
                     db.execute("UPDATE telegram_outbox SET status='uncertain',last_error='worker_restart_uncertain',send_started_at=NULL "
-                               "WHERE status='sending' AND send_started_at<?", (iso(utcnow()-timedelta(seconds=60)),))
+                               "WHERE status='sending' AND (send_started_at IS NULL OR send_started_at<?)", (iso(utcnow()-timedelta(seconds=60)),))
                     db.commit()
             except Exception:
                 pass
@@ -1395,6 +1556,22 @@ class AppHandler(BaseHTTPRequestHandler):
             raise ApiError(400, "Ожидался объект JSON")
         return value
 
+    def discard_request_body(self, limit: int = 32_000) -> bool:
+        """Drain a bounded rejected request body without parsing it, preserving HTTP framing."""
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return False
+        if size < 0 or size > limit:
+            return False
+        remaining = size
+        while remaining:
+            chunk = self.rfile.read(min(remaining, 8_192))
+            if not chunk:
+                return False
+            remaining -= len(chunk)
+        return True
+
     def auth(self) -> sqlite3.Row | None:
         cookie = SimpleCookie()
         try:
@@ -1512,6 +1689,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def telegram_unpair(self, user: sqlite3.Row) -> None:
         with connect(self.server.db_path) as db:
+            cancel_telegram_user_messages(db,user["id"],"recipient_unpaired")
             db.execute("DELETE FROM telegram_bindings WHERE user_id=?", (user["id"],))
             db.execute("DELETE FROM telegram_pairings WHERE user_id=?", (user["id"],))
             audit(db, user["id"], None, "telegram_unpaired", {})
@@ -1520,10 +1698,12 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def telegram_webhook(self) -> None:
         if not telegram_delivery_configured():
+            self.discard_request_body()
             return self.send_json({"error": "not found"}, 404)
         expected = os.environ["NARYADAI_TELEGRAM_WEBHOOK_SECRET"].strip()
         supplied = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if not hmac.compare_digest(supplied, expected):
+            self.discard_request_body()
             return self.send_json({"error": "not found"}, 404)
         try:
             update = self.read_json(32_000)
@@ -1550,6 +1730,9 @@ class AppHandler(BaseHTTPRequestHandler):
             account = db.execute("SELECT role,is_active FROM users WHERE id=?", (pairing["user_id"],)).fetchone() if pairing else None
             if pairing and expires and expires > utcnow() and account and account["is_active"] and account["role"] in ("master", "worker"):
                 try:
+                    previous_binding=db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?",(pairing["user_id"],)).fetchone()
+                    if previous_binding and previous_binding["chat_id"] != chat_id:
+                        cancel_telegram_user_messages(db,pairing["user_id"],"recipient_chat_changed")
                     db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
                                "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
                                (pairing["user_id"], chat_id, chat_id, iso()))
@@ -1998,6 +2181,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 brigade=None; targets={worker["id"]}
             due = iso(utcnow()+timedelta(minutes=180 if row["priority"] == "emergency" else 480))
             db.execute("UPDATE orders SET assigned_to=?,assigned_brigade=?,status='issued',issued_at=?,due_at=?,reject_reason=NULL WHERE id=?",(worker["id"],brigade,iso(),due,order_id))
+            cancel_telegram_order_messages(db,order_id,"order_reassigned")
             audit(db,user["id"],order_id,"reassigned",{"from_status":row["status"],"worker_id":worker["id"],"brigade":brigade})
             notify(db,targets,order_id,f"Наряд {row['code']} назначен вам")
             db.commit()
@@ -2050,6 +2234,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 raise ApiError(403, "Решение доступно только мастеру")
             if role == "manager":
                 raise ApiError(403, "Руководитель имеет доступ только для просмотра")
+            if action == "accept" and row["work_type"] == "unscheduled":
+                before_photo = db.execute("SELECT 1 FROM photos WHERE order_id=? AND phase='before' AND duplicate=0 LIMIT 1", (order_id,)).fetchone()
+                if not before_photo:
+                    raise ApiError(409, "До принятия внепланового наряда мастер должен приложить уникальное фото до работ")
             if action in ("reject", "pause", "request_rework", "cancel") and len(reason) < 4:
                 raise ApiError(400, "Укажите причину (не менее 4 символов)")
             payload: dict = {"from": status, "to": target}
@@ -2136,6 +2324,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 updates.update({"ai_mode": reviewed["mode"], "ai_result": json.dumps(reviewed, ensure_ascii=False), "ai_checked_at": iso()})
                 payload.update({"mode": reviewed["mode"], "verdict": reviewed.get("verdict"), "issues_count": len(reviewed.get("issues", [])), "summary": reviewed.get("summary", "")})
             if action == "close":
+                raw_closure_comment = body.get("closure_comment", "")
+                if not isinstance(raw_closure_comment, str):
+                    raise ApiError(400, "closure_comment must be text")
+                closure_comment = raw_closure_comment.strip()[:1000]
+                if len(closure_comment) < 4:
+                    raise ApiError(400, "Добавьте отдельный комментарий мастера к окончательной приёмке (не менее 4 символов)")
                 issues = []
                 if not row["completion_text"] or len(row["completion_text"]) < 20: issues.append("нет описания работы")
                 if not row["fault_code_id"]: issues.append("не выбран код неисправности")
@@ -2147,15 +2341,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 ai_verdict = json.loads(row["ai_result"] or "{}").get("verdict")
                 if ai_verdict == "rework": issues.append("результат проверки требует доработки; мастер может направить наряд на доработку")
                 if issues: raise ApiError(409, "Нельзя принять наряд: " + "; ".join(issues))
-                if ai_verdict == "comments" and len(reason) < 4: raise ApiError(400, "ИИ указал замечания; укажите причину решения мастера")
+                if ai_verdict == "comments" and len(closure_comment) < 4: raise ApiError(400, "ИИ указал замечания; добавьте обоснование окончательной приёмки")
                 updates["closed_at"] = iso()
-                payload["reason"] = reason or "Окончательная приёмка мастером"
+                payload["closure_comment"] = closure_comment
+                payload["reason"] = closure_comment
             if action == "reissue":
                 updates.update({"issued_at": iso(), "due_at": iso(utcnow()+timedelta(minutes=180 if row["priority"] == "emergency" else 480)), "reject_reason": None, "cancelled_by_master": 0})
                 payload["reason"] = "Повторная выдача мастером"
             sets = ",".join(f"{key}=?" for key in updates)
             payload["to"] = target
             db.execute(f"UPDATE orders SET {sets} WHERE id=?", [*updates.values(), order_id])
+            cancel_telegram_order_messages(db,order_id,"order_state_changed")
             audit(db, user["id"], order_id, action, payload)
             msg = f"Наряд {row['code']}: {STATUS_LABELS[target]}"
             notify(db, {row["assigned_to"], row["assigned_master_id"]}, order_id, msg)
@@ -2172,7 +2368,7 @@ class AppHandler(BaseHTTPRequestHandler):
             phase = str(body.get("phase", "after"))
             if phase not in ("before", "after"): raise ApiError(400,"Фаза фото не распознана")
             can_worker_upload = phase == "after" and user["role"] == "worker" and row["status"] in ("in_progress", "paused") and row["assigned_to"] == user["id"]
-            can_master_upload = phase == "before" and user["role"] == "master" and row["status"] == "issued"
+            can_master_upload = phase == "before" and user["role"] == "master" and row["status"] in ("issued", "queued")
             if not (can_worker_upload or can_master_upload):
                 raise ApiError(403, "Исполнитель добавляет фото в работе; мастер может добавить до пяти фото к выдаваемому наряду")
             if db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase=?", (order_id,phase)).fetchone()[0] >= 5:
