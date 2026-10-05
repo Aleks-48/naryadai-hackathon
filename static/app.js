@@ -2,7 +2,7 @@
   "use strict";
   const $ = (s, root = document) => root.querySelector(s);
   const $$ = (s, root = document) => [...root.querySelectorAll(s)];
-  const S = { me: null, data: null, view: "home", orderId: null, filter: "all", search: "", areaFilter:"", equipmentFilter:"", workerFilter:"", priorityFilter:"", timer: null, installPrompt: null, report: null, session: 0, refreshRequest: 0, drawerVersion: 0, drawerRequest: 0, drawerOrderId: null, drawerStatus: null, viewVersion: 0, reportRequest: 0, telegramRequest: 0, telegramOutsideHandler: null, ratingFrom:"", ratingTo:"", ratingShift:"", reportFrom:"", reportTo:"", reportShift:"", reportBrigade:"", completing: new Set(), uploading: new Set(), creatingOrder: false, downtimeDraft:null, registeringDowntime:false };
+  const S = { me: null, data: null, view: "home", orderId: null, filter: "all", search: "", areaFilter:"", equipmentFilter:"", workerFilter:"", priorityFilter:"", timer: null, installPrompt: null, report: null, session: 0, refreshRequest: 0, drawerVersion: 0, drawerRequest: 0, drawerOrderId: null, drawerStatus: null, viewVersion: 0, reportRequest: 0, telegramRequest: 0, telegramOutsideHandler: null, ratingFrom:"", ratingTo:"", ratingShift:"", reportFrom:"", reportTo:"", reportShift:"", reportBrigade:"", completing: new Set(), uploading: new Set(), drawerWrites:new Set(), creatingOrder: false, downtimeDraft:null, registeringDowntime:false };
   const STATUS_RU = {issued:"Выдан",accepted:"Принят",queued:"В очереди",rejected:"Отклонён",in_progress:"В работе",paused:"Приостановлен",executed:"Исполнено",ai_review:"Проверка ИИ",rework:"Доработка",closed:"Закрыт"};
   const EQUIPMENT_TYPE_RU={crusher:"Дробилка",conveyor:"Конвейер",pump:"Насос",compressor:"Компрессор",fan:"Вентилятор",unknown:"Неизвестно"};
   const EVENT_RU = {issued:"Выдал наряд",accept:"Принял наряд",queue:"Поставил в очередь",reject:"Отклонил наряд",start:"Начал работу",pause:"Приостановил работу",resume:"Продолжил работу",complete:"Зафиксировал исполнение",ai_check:"Проверил отчёт",request_rework:"Вернул на доработку",close:"Принял и закрыл",reissue:"Выдал повторно",reassigned:"Переназначил",cancel:"Отменил наряд",priority_changed:"Изменил приоритет",photo_uploaded:"Загрузил фото",rating_adjusted:"Изменил оценку",rejection_classified:"Классифицировал отказ",acceptance_escalated:"Эскалация принятия",deadline_reminder:"Напоминание о сроке",deadline_escalated:"Эскалация просрочки",deadline_repeat:"Повторное сообщение о просрочке",equipment_downtime_registered:"Зарегистрировал простой оборудования"};
@@ -243,8 +243,16 @@
   function detailButtons(o){
     if(role()==="manager")return '<p class="demo-note">Режим руководителя: только просмотр.</p>';
     if(role()==="worker"){
-      if(o.status==="issued")return `<button class="button button-primary" data-action="accept">Принять в работу</button><button class="button button-outline" data-action="queue">Поставить в очередь</button><button class="button button-danger" data-prompt-action="reject">Отклонить с причиной</button>`;
-      if(o.status==="queued")return `<button class="button button-primary" data-action="accept">Принять из очереди</button>`;
+      if(o.status==="issued"){
+        const hasBefore=(o.photos||[]).some(p=>p.phase==="before"&&!p.duplicate);
+        if(o.work_type==="unscheduled"&&!hasBefore)return `<p class="demo-note">До принятия мастер должен приложить уникальное фото до работ. Наряд можно поставить в очередь, пока мастер загружает фото.</p><button class="button button-primary" data-action="accept" disabled>Принять в работу · ждём фото</button><button class="button button-outline" data-action="queue">Поставить в очередь</button><button class="button button-danger" data-prompt-action="reject">Отклонить с причиной</button>`;
+        return `<button class="button button-primary" data-action="accept">Принять в работу</button><button class="button button-outline" data-action="queue">Поставить в очередь</button><button class="button button-danger" data-prompt-action="reject">Отклонить с причиной</button>`;
+      }
+      if(o.status==="queued"){
+        const hasBefore=(o.photos||[]).some(p=>p.phase==="before"&&!p.duplicate);
+        if(o.work_type==="unscheduled"&&!hasBefore)return `<p class="demo-note">До принятия внепланового наряда мастер должен приложить уникальное фото до работ.</p><button class="button button-primary" data-action="accept" disabled>Принять из очереди · ждём фото</button>`;
+        return `<button class="button button-primary" data-action="accept">Принять из очереди</button>`;
+      }
       if(o.status==="accepted")return `<button class="button button-primary" data-action="start">Начать исполнение</button>`;
       if(o.status==="rework")return `<button class="button button-primary" data-action="start">Начать доработку</button>`;
       if(o.status==="paused")return `<button class="button button-primary" data-action="resume">Продолжить</button>`;
@@ -253,11 +261,22 @@
     }
     if(role()==="master"){
       if(o.status==="ai_review")return `<button class="button button-primary" data-prompt-action="close">Принять и закрыть</button><button class="button button-warning" data-prompt-action="request_rework">Вернуть на доработку</button>`;
-      if(o.status==="rejected"&&!o.cancelled_by_master)return `<button class="button button-primary" data-reassign>Переназначить</button>`;
       if(o.status==="closed")return `<button class="button button-soft" data-toggle-rating>Оценка мастера</button>`;
       if(["issued","accepted","queued"].includes(o.status))return `<button class="button button-outline" data-toggle-priority>Изменить приоритет</button><button class="button button-danger" data-prompt-action="cancel">Отменить наряд</button>`;
     }
     return '';
+  }
+  function drawerWriteKey(action,c=context()){return `${c.session}:${c.orderId}:${action}`;}
+  function releaseDrawerWrite(key,button,selector,c){
+    S.drawerWrites.delete(key);
+    if(button)button.disabled=false;
+    if(sameSession(c)&&S.orderId===c.orderId){const current=$(selector);if(current)current.disabled=false;}
+  }
+  function reassignmentForm(o){
+    if(role()!=="master"||!["issued","rejected"].includes(o.status)||o.cancelled_by_master)return "";
+    const c=context(),busy=S.drawerWrites.has(drawerWriteKey("assign",c));
+    const heading=o.status==="rejected"?"Назначить после отказа исполнителя":"Переназначить до принятия";
+    return `<div class="action-box"><h3>${heading}</h3><div class="field-stack"><label class="field-label">Новый исполнитель или бригада<select class="field-select" id="reassign-target"><option value="">Выберите исполнителя или бригаду</option>${(S.data.free_workers||[]).map(w=>`<option value="worker:${w.id}">${ESC(w.username||"worker")} · ${ESC(w.display_name)} · ${ESC(w.availability_label)} · ${w.active_orders||0} актив.</option>`).join("")}<option value="brigade:A">Вся бригада A</option><option value="brigade:B">Вся бригада B</option><option value="brigade:C">Вся бригада C</option></select></label><button class="button button-outline" data-reassign ${busy?"disabled":""}>Сохранить назначение</button></div></div>`;
   }
   function renderDrawer(detail){
     const o=detail.order; const photos=o.photos||[]; let ai=null; try{ai=o.ai_result?JSON.parse(o.ai_result):null;}catch{ai={mode:o.ai_mode||"rules-only",verdict:"comments",summary:o.ai_result,issues:[]};}
@@ -265,7 +284,7 @@
     const photoScore=ai?.photo_check?.verifiability_score;
     const aiBlock=ai?`<div class="ai-result${ai.verdict!=="accepted"?" caution":""}"><b>Вердикт: ${ESC({accepted:"Принято · рекомендация",comments:"Замечания",rework:"Требует доработки"}[ai.verdict]||"Результат проверки")}</b><p>${ESC(ai.summary||"")} · режим <strong>${ESC(ai.mode||o.ai_mode||"rules-only")}</strong></p>${ai.issues?.length?`<ul>${ai.issues.map(x=>`<li>${ESC(x)}</li>`).join("")}</ul>`:""}<p>${ESC(ai.photo_check?.explanation||"Текст проверен; мастер принимает окончательное решение.")}</p>${photoScore==null?'<p><strong>Оценка проверяемости фото 1–5:</strong> нет оцениваемого фото.</p>':`<p><strong>Оценка проверяемости фото:</strong> ${photoScore}/5. Это не оценка качества ремонта.${ai.master_confirmation_required?" Нужно подтверждение мастера.":""}</p>`}</div>`:'<div class="notice-box">Проверка ещё не выполнена. Без настроенного API показывается только локальный rules-only результат.</div>';
     const statusFlow=Object.entries(STATUS_RU).map(([k,v])=>`<span class="badge status-${k}" style="opacity:${k===o.status?1:.43}">${ESC(v)}</span>`).join(" ");
-    const timeline=(detail.history||[]).slice().reverse().map(h=>`<div class="timeline-item"><b>${ESC(EVENT_RU[h.event]||h.event)}${h.actor_name?` · ${ESC(h.actor_name)}`:""}</b><span>${dateFmt(h.created_at)}${h.payload?.reason?` · ${ESC(h.payload.reason)}`:""}</span></div>`).join("");
+    const timeline=(detail.history||[]).slice().reverse().map(h=>{const comment=h.payload?.closure_comment||h.payload?.reason;return `<div class="timeline-item"><b>${ESC(EVENT_RU[h.event]||h.event)}${h.actor_name?` · ${ESC(h.actor_name)}`:""}</b><span>${dateFmt(h.created_at)}${comment?` · ${ESC(comment)}`:""}</span></div>`}).join("");
     const equipHistory=(detail.equipment_history||[]).slice(0,6).map(h=>`<div class="timeline-item"><b>${ESC(h.code)} · ${ESC(h.title)}</b><span>${dateFmt(h.created_at)} · ${ESC(STATUS_RU[h.status]||h.status)} · ${ESC(h.fault_code||"код не указан")} · ${ESC(h.worker_name||"исполнитель неизвестен")}</span></div>`).join("")||'<p class="demo-note">Истории по этому оборудованию пока нет.</p>';
     const links=detail.repeat_links||[],activeLink=links.find(x=>x.active), repeatCandidates=(detail.equipment_history||[]).filter(h=>o.status==="closed"&&h.status==="closed"&&o.fault_code_id&&h.fault_code_id===o.fault_code_id&&h.completed_at&&Date.parse(o.created_at)>=Date.parse(h.completed_at)&&Date.parse(o.created_at)<=Date.parse(h.completed_at)+7*86400000);
     const repeatPanel=role()==="master"&&o.status==="closed"?`<div class="action-box"><h3>Повторный отказ · явная связь мастера</h3>${activeLink?`<p>Связан с <b>${ESC(activeLink.previous_code)}</b>; прежний исполнитель: ${ESC(activeLink.previous_worker)}; связал ${ESC(activeLink.linked_by)}. Основание: ${ESC(activeLink.reason)}. Фактор рейтинга пересчитан по этой ручной атрибуции.</p><label class="field-label">Основание отмены<textarea id="repeat-revoke-reason" class="field-textarea" placeholder="Почему связь нужно отменить?"></textarea></label><button class="button button-outline" data-revoke-repeat>Отменить связь</button>`:links.length?`<p>Последняя связь отменена ${dateFmt(links[0].revoked_at)} · ${ESC(links[0].revoke_reason||"")}.</p><p>Активной связи нет, повторный фактор не применяется.</p>`:`<p>Автоматической связи и штрафа нет. Если мастер установил повтор в течение 7 дней на том же оборудовании и коде неисправности, выберите прежний наряд и укажите основание. Связь попадёт в аудит; её можно отменить.</p><label class="field-label">Прежний закрытый наряд<select id="repeat-previous" class="field-select"><option value="">Выберите наряд</option>${repeatCandidates.map(h=>`<option value="${h.id}">${ESC(h.code)} · ${ESC(h.worker_name||"исполнитель") } · ${dateFmt(h.completed_at,false)}</option>`).join("")}</select></label><label class="field-label">Основание мастера<textarea id="repeat-reason" class="field-textarea" placeholder="Фактическое основание, без автоматического вывода о вине"></textarea></label><button class="button button-soft" data-create-repeat ${repeatCandidates.length?"":"disabled"}>Связать повтор вручную</button>`}</div>`:"";
@@ -276,7 +295,7 @@
     const unreferencedMaterials=(reference.unreferenced_actual_materials||[]).map(m=>`${ESC(m.sku||"")} · ${ESC(m.name)} · ${m.quantity} ${ESC(m.unit)}`).join("; ");
     const unreferencedNote=unreferencedMaterials?`<p>Фактические материалы без строки в учебном каталоге: ${unreferencedMaterials}. Сравнение unknown; штрафа нет.</p>`:"";
     const referencePanel=reference.status==="unknown"?`<div class="notice-box"><b>Ориентир: unknown</b><p>${ESC(reference.note)}</p>${materialsEvidenceNote}${unreferencedNote}</div>`:`<div class="notice-box"><b>Учебный синтетический ориентир · ${ESC(reference.source_version||"")}</b><p>Тип работы: ${ESC(reference.work_type)} · тип оборудования: ${ESC(reference.equipment_type_label)}. Труд: ${reference.labor.quantity??"unknown"} ${ESC(reference.labor.unit)}; фактически записано ${reference.labor.actual_hours??"—"} ч${reference.labor.difference_hours==null?"":`; разница ${reference.labor.difference_hours} ч`}. Разница справочная и не меняет рейтинг.</p>${referenceMaterials?`<div class="report-table-wrap"><table class="report-table"><thead><tr><th>Материал</th><th>Учебный ориентир</th><th>Факт</th><th>Разница · справочно</th></tr></thead><tbody>${referenceMaterials}</tbody></table></div>`:"<p>Для этого сочетания нет материала в учебном каталоге.</p>"}${materialsEvidenceNote}${unreferencedNote}<small>${ESC(reference.source_name||"")} · ${ESC(reference.note||"")}</small></div>`;
-    const uploadAllowed=(role()==="master"&&o.status==="issued")||(role()==="worker"&&["in_progress","paused"].includes(o.status));
+    const uploadAllowed=(role()==="master"&&["issued","queued"].includes(o.status))||(role()==="worker"&&["in_progress","paused"].includes(o.status));
     const phase=(role()==="master"?"before":"after");
     $("#detail-drawer").innerHTML=`<div class="drawer-head"><div><small>${ESC(o.code)} · ${ESC(o.work_type_label)}</small><b>Карточка наряда</b></div><button class="drawer-close" data-close-drawer aria-label="Закрыть">×</button></div><div class="drawer-body">
       <h1 class="detail-title">${ESC(o.title)}</h1><div class="detail-sub">${ESC(o.description)}</div><div class="detail-badges">${badge(o)}${priority(o)}${o.is_overdue?'<span class="badge status-rework">Просрочен</span>':''}</div>
@@ -289,7 +308,7 @@
       <div class="detail-section"><h3>Проверка отчёта</h3>${aiBlock}</div>
       <div class="detail-section"><h3>История оборудования · ${ESC(o.equipment.code)}</h3><div class="timeline">${equipHistory}</div></div>
       <div class="detail-section"><h3>История действий</h3><div class="timeline">${timeline||'<p class="demo-note">Пока нет событий. Демозаписи помечены отдельно.</p>'}</div></div>
-      ${role()==="master"&&o.status==="issued"?`<div class="action-box"><h3>Переназначить до принятия</h3><div class="field-stack"><label class="field-label">Исполнитель или бригада<select class="field-select" id="reassign-target"><option value="">Выберите исполнителя</option>${(S.data.free_workers||[]).map(w=>`<option value="worker:${w.id}">${ESC(w.username||"worker")} · ${ESC(w.display_name)} · ${ESC(w.availability_label)} · ${w.active_orders||0} актив.</option>`).join("")}<option value="brigade:A">Вся бригада A</option><option value="brigade:B">Вся бригада B</option><option value="brigade:C">Вся бригада C</option></select></label><button class="button button-outline" data-reassign>Сохранить назначение</button></div></div>`:""}
+       ${reassignmentForm(o)}
       ${detailButtons(o)?`<div class="action-box"><h3>Следующий шаг</h3><div class="action-buttons">${detailButtons(o)}</div></div>`:""}
       ${role()==="master"&&o.status==="closed"?ratingForm(o):""}
       ${repeatPanel}
@@ -300,6 +319,10 @@
     bindDrawer(detail);
     const upload=$("[data-upload-phase]");if(upload)upload.disabled=S.uploading.has(`${S.session}:${o.id}:${upload.dataset.uploadPhase}`);
     const completion=$("#save-completion");if(completion)completion.disabled=S.completing.has(`${S.session}:${o.id}`);
+    const drawerContext=context();
+    for(const [selector,action] of [["[data-reassign]","assign"],["[data-create-repeat]","repeat-create"],["[data-revoke-repeat]","repeat-revoke"]]){
+      const button=$(selector);if(button)button.disabled=S.drawerWrites.has(drawerWriteKey(action,drawerContext));
+    }
   }
   function completionForm(o){
     const codes=S.data.constants.fault_codes.map(c=>`<option value="${c.id}" ${o.fault_code_id===c.id?"selected":""}>${ESC(c.code)} · ${ESC(c.label)}</option>`).join("");
@@ -323,6 +346,8 @@
     });
     $("[data-upload-phase]")?.addEventListener("change",uploadPhotos);
     $$("[data-reassign]").forEach(b=>b.addEventListener("click",saveAssignment));
+    $("[data-create-repeat]")?.addEventListener("click",createRepeatLink);
+    $("[data-revoke-repeat]")?.addEventListener("click",revokeRepeatLink);
     $("[data-save-priority]")?.addEventListener("click",savePriority);
     $("[data-save-rating]")?.addEventListener("click",saveRating);
     $("[data-classify-rejection]")?.addEventListener("click",classifyRejection);
@@ -343,8 +368,8 @@
   async function promptAction(action){
     const prompts={reject:"Почему вы отклоняете наряд? Укажите причину.",pause:"Почему работа приостанавливается? Укажите причину.",request_rework:"Какие замечания нужно устранить?",close:"Комментарий мастера к окончательной приёмке. При замечаниях обоснование обязательно.",cancel:"Почему мастер отменяет наряд?"};
     let reason=prompt(prompts[action]||"Причина");if(reason===null)return;
-    if(["reject","pause","request_rework","cancel"].includes(action)&&reason.trim().length<4){toast("Причина должна содержать не менее 4 символов.",true);return;}
-    await runAction(action,{reason:reason.trim()});
+    if(["reject","pause","request_rework","cancel","close"].includes(action)&&reason.trim().length<4){toast(action==="close"?"Комментарий мастера должен содержать не менее 4 символов.":"Причина должна содержать не менее 4 символов.",true);return;}
+    await runAction(action,action==="close"?{closure_comment:reason.trim()}:{reason:reason.trim()});
   }
   function addMaterialRow(){
     const wrap=$("#materials-list"), source=$(".material-row",wrap);const clone=source.cloneNode(true);$(".material-id",clone).value="";$(".material-quantity",clone).value="1";wrap.append(clone);
@@ -373,25 +398,38 @@
       if(sameDrawer(c)){const current=$("#save-completion");if(current)current.disabled=false;}
     }
   }
-  async function saveAssignment(){
+  async function saveAssignment(event){
+    const c=context(),key=drawerWriteKey("assign",c),button=event?.currentTarget;
+    if(!c.orderId||!sameSession(c)||S.drawerWrites.has(key))return;
     const value=$("#reassign-target")?.value;if(!value){toast("Выберите исполнителя или бригаду.",true);return;}
-    const [kind,id]=value.split(":");const body=kind==="brigade"?{brigade:id}:{worker_id:Number(id)};
-    await updateOrder("assign",body,"Назначение обновлено.");
+    const [kind,id]=value.split(":");if(!["worker","brigade"].includes(kind)||!id){toast("Выберите доступного исполнителя или бригаду.",true);return;}
+    const body=kind==="brigade"?{brigade:id}:{worker_id:Number(id)};
+    if(kind==="worker"&&(!Number.isSafeInteger(body.worker_id)||body.worker_id<=0)){toast("Исполнитель не распознан.",true);return;}
+    S.drawerWrites.add(key);if(button)button.disabled=true;
+    try{await updateOrder("assign",body,"Назначение обновлено.");}
+    finally{releaseDrawerWrite(key,button,"[data-reassign]",c);}
   }
   async function savePriority(){await updateOrder("priority",{priority:$("#priority-select").value},"Приоритет обновлён.");}
   async function saveRating(){
     const reason=$("#quality-reason")?.value.trim();if(!reason||reason.length<4){toast("Укажите основание оценки мастера.",true);return;}
     await updateOrder("rating",{rating:Number($("#quality-score").value),reason},"Оценка мастера сохранена в аудите.");
   }
-  async function createRepeatLink(){
-    const c=context(),previous_order_id=Number($("#repeat-previous")?.value),reason=$("#repeat-reason")?.value.trim();
+  async function createRepeatLink(event){
+    const c=context(),key=drawerWriteKey("repeat-create",c),button=event?.currentTarget,previous_order_id=Number($("#repeat-previous")?.value),reason=$("#repeat-reason")?.value.trim();
+    if(!sameDrawer(c)||S.drawerWrites.has(key))return;
     if(!previous_order_id||!reason||reason.length<4){toast("Выберите предыдущий наряд и укажите основание.",true);return;}
+    S.drawerWrites.add(key);if(button)button.disabled=true;
     try{await api(`/api/orders/${c.orderId}/repeat-link`,"POST",{previous_order_id,reason});if(!sameDrawer(c))return;toast("Связь повтора сохранена в аудите; фактор пересчитан по ручной атрибуции.");await refresh(true);if(sameDrawer(c))await refreshDrawer();}catch(e){if(sameDrawer(c))toast(e.message,true);}
+    finally{releaseDrawerWrite(key,button,"[data-create-repeat]",c);}
   }
-  async function revokeRepeatLink(){
-    const c=context(),reason=$("#repeat-revoke-reason")?.value.trim();
+  async function revokeRepeatLink(event){
+    const c=context(),key=drawerWriteKey("repeat-revoke",c),button=event?.currentTarget,reason=$("#repeat-revoke-reason")?.value.trim();
+    if(!sameDrawer(c)||S.drawerWrites.has(key))return;
     if(!reason||reason.length<4){toast("Укажите основание отмены связи.",true);return;}
+    if(!confirm("Отменить ручную связь повтора? Основание попадёт в аудит."))return;
+    S.drawerWrites.add(key);if(button)button.disabled=true;
     try{await api(`/api/orders/${c.orderId}/repeat-link/revoke`,"POST",{reason});if(!sameDrawer(c))return;toast("Связь отменена; рейтинг пересчитан без неё.");await refresh(true);if(sameDrawer(c))await refreshDrawer();}catch(e){if(sameDrawer(c))toast(e.message,true);}
+    finally{releaseDrawerWrite(key,button,"[data-revoke-repeat]",c);}
   }
   async function classifyRejection(){
     const reason=$("#rejection-reason")?.value.trim();if(!reason||reason.length<4){toast("Укажите причину решения мастера.",true);return;}
