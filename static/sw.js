@@ -1,4 +1,4 @@
-const CACHE = "naryadai-shell-v8";
+const CACHE = "naryadai-shell-v13";
 const SHELL = ["/", "/static/styles.css", "/static/app.js", "/static/icon.svg", "/static/icon-192.png", "/static/icon-512.png", "/static/manifest.webmanifest"];
 self.addEventListener("install", event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL))));
 self.addEventListener("activate", event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k.startsWith("naryadai-shell-") && k !== CACHE).map(k => caches.delete(k))))));
