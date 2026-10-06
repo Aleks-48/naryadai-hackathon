@@ -8,7 +8,9 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import html
 import hmac
+import ipaddress
 import http.client
 import io
 import json
@@ -38,7 +40,41 @@ MEDIA = DATA / "media"
 DB_PATH = DATA / "naryadai.sqlite3"
 POLL_SECONDS = 4
 SESSION_SECONDS = 12 * 60 * 60
+MAX_ORDER_CREATE_BYTES = 30_000_000  # Five 4 MB images after base64 encoding plus JSON overhead.
+MAX_ORDER_PHOTOS = 5
 ACTIVE_STATUSES = {"issued", "accepted", "queued", "in_progress", "paused", "executed", "ai_review", "rework"}
+
+ACTIVE_QUEUE_SQL = "'issued','accepted','queued','in_progress','paused','executed','ai_review','rework'"
+
+
+def queue_scope_key(row: sqlite3.Row | dict) -> str:
+    master_id = int(row["assigned_master_id"])
+    if row["status"] == "issued" and row["assigned_brigade"]:
+        return f"master:{master_id}:brigade:{row['assigned_brigade']}"
+    return f"master:{master_id}:worker:{int(row['assigned_to'])}"
+
+
+def queue_scope_sql(alias: str = "o") -> str:
+    return (f"CASE WHEN {alias}.status='issued' AND COALESCE({alias}.assigned_brigade,'')<>'' "
+            f"THEN 'master:'||{alias}.assigned_master_id||':brigade:'||{alias}.assigned_brigade "
+            f"ELSE 'master:'||{alias}.assigned_master_id||':worker:'||{alias}.assigned_to END")
+
+
+def queue_default_key(row: sqlite3.Row | dict) -> tuple:
+    priority = {"emergency": 0, "high": 1, "normal": 2, "planned": 3}.get(row["priority"], 4)
+    return priority, row["due_at"], -int(row["id"])
+
+
+def queue_scope_label(db: sqlite3.Connection, scope: str, row: sqlite3.Row) -> str:
+    parts = scope.split(":", 3)
+    master = db.execute("SELECT display_name FROM users WHERE id=?", (int(parts[1]),)).fetchone()
+    master_name = master[0] if master else "Master"
+    if len(parts) == 4 and parts[2] == "brigade":
+        return f"Brigade {parts[3]} · {master_name}"
+    worker = db.execute("SELECT display_name FROM users WHERE id=?", (row["assigned_to"],)).fetchone()
+    return f"{worker[0] if worker else 'Worker'} · {master_name}"
+
+
 STATUS_LABELS = {
     "issued": "Выдан", "accepted": "Принят", "queued": "Очередь", "rejected": "Отклонён",
     "in_progress": "В работе", "paused": "Приостановлен", "executed": "Исполнено",
@@ -287,7 +323,8 @@ def init_db(path: Path | str = DB_PATH) -> None:
             media_type TEXT NOT NULL, file_path TEXT NOT NULL,
             size_bytes INTEGER NOT NULL, sha256 TEXT NOT NULL, duplicate INTEGER NOT NULL DEFAULT 0,
             duplicate_type TEXT NOT NULL DEFAULT 'none', perceptual_hash TEXT, color_signature TEXT,
-            uploaded_at TEXT NOT NULL, metadata_json TEXT NOT NULL
+            uploaded_at TEXT NOT NULL, metadata_json TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1, cleanup_pending INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS audit (
             id INTEGER PRIMARY KEY, actor_id INTEGER REFERENCES users(id), order_id INTEGER REFERENCES orders(id),
@@ -329,12 +366,103 @@ def init_db(path: Path | str = DB_PATH) -> None:
             code_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             created_at TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS telegram_inbox (
+            update_id INTEGER PRIMARY KEY, received_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS telegram_inbox_budget (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), update_count INTEGER NOT NULL CHECK(update_count>=0)
+        );
+        CREATE TABLE IF NOT EXISTS telegram_ingress_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1), window_started_at TEXT NOT NULL,
+            accepted_count INTEGER NOT NULL CHECK(accepted_count>=0)
+        );
+        CREATE TABLE IF NOT EXISTS telegram_user_state (
+            user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+            orders_page INTEGER NOT NULL DEFAULT 0 CHECK(orders_page>=0), updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS manual_queue_state (
+            scope_key TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0 CHECK(revision>=0),
+            updated_at TEXT, updated_by INTEGER REFERENCES users(id)
+        );
+        CREATE TABLE IF NOT EXISTS manual_queue_items (
+            order_id INTEGER PRIMARY KEY REFERENCES orders(id) ON DELETE CASCADE,
+            scope_key TEXT NOT NULL, position INTEGER NOT NULL CHECK(position>0)
+        );
+        CREATE INDEX IF NOT EXISTS idx_manual_queue_scope_position ON manual_queue_items(scope_key,position);
         CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
         CREATE INDEX IF NOT EXISTS idx_orders_assignee_status ON orders(assigned_to,status);
         CREATE INDEX IF NOT EXISTS idx_orders_created ON orders(created_at);
         CREATE INDEX IF NOT EXISTS idx_audit_order ON audit(order_id,created_at);
         CREATE INDEX IF NOT EXISTS idx_equipment_downtime_period ON equipment_downtime(equipment_id,started_at,ended_at);
+        CREATE TRIGGER IF NOT EXISTS manual_queue_order_insert
+        AFTER INSERT ON orders
+        WHEN NEW.status IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework')
+        BEGIN
+          INSERT OR IGNORE INTO manual_queue_state(scope_key,revision)
+          VALUES (CASE WHEN NEW.status='issued' AND COALESCE(NEW.assigned_brigade,'')<>''
+            THEN 'master:'||NEW.assigned_master_id||':brigade:'||NEW.assigned_brigade
+            ELSE 'master:'||NEW.assigned_master_id||':worker:'||NEW.assigned_to END,0);
+          UPDATE manual_queue_state SET revision=revision+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE scope_key=CASE WHEN NEW.status='issued' AND COALESCE(NEW.assigned_brigade,'')<>''
+            THEN 'master:'||NEW.assigned_master_id||':brigade:'||NEW.assigned_brigade
+            ELSE 'master:'||NEW.assigned_master_id||':worker:'||NEW.assigned_to END;
+        END;
+        CREATE TRIGGER IF NOT EXISTS manual_queue_order_update
+        AFTER UPDATE OF assigned_to,assigned_brigade,assigned_master_id,status ON orders
+        WHEN OLD.assigned_to IS NOT NEW.assigned_to OR OLD.assigned_brigade IS NOT NEW.assigned_brigade
+          OR OLD.assigned_master_id IS NOT NEW.assigned_master_id OR OLD.status IS NOT NEW.status
+        BEGIN
+          INSERT OR IGNORE INTO manual_queue_state(scope_key,revision)
+          SELECT CASE WHEN OLD.status='issued' AND COALESCE(OLD.assigned_brigade,'')<>''
+            THEN 'master:'||OLD.assigned_master_id||':brigade:'||OLD.assigned_brigade
+            ELSE 'master:'||OLD.assigned_master_id||':worker:'||OLD.assigned_to END,0
+          WHERE OLD.status IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework');
+          UPDATE manual_queue_state SET revision=revision+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE scope_key=CASE WHEN OLD.status='issued' AND COALESCE(OLD.assigned_brigade,'')<>''
+            THEN 'master:'||OLD.assigned_master_id||':brigade:'||OLD.assigned_brigade
+            ELSE 'master:'||OLD.assigned_master_id||':worker:'||OLD.assigned_to END
+            AND OLD.status IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework');
+          INSERT OR IGNORE INTO manual_queue_state(scope_key,revision)
+          SELECT CASE WHEN NEW.status='issued' AND COALESCE(NEW.assigned_brigade,'')<>''
+            THEN 'master:'||NEW.assigned_master_id||':brigade:'||NEW.assigned_brigade
+            ELSE 'master:'||NEW.assigned_master_id||':worker:'||NEW.assigned_to END,0
+          WHERE NEW.status IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework')
+            AND (OLD.status NOT IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework') OR
+              (CASE WHEN OLD.status='issued' AND COALESCE(OLD.assigned_brigade,'')<>'' THEN 'master:'||OLD.assigned_master_id||':brigade:'||OLD.assigned_brigade ELSE 'master:'||OLD.assigned_master_id||':worker:'||OLD.assigned_to END)
+              <>(CASE WHEN NEW.status='issued' AND COALESCE(NEW.assigned_brigade,'')<>'' THEN 'master:'||NEW.assigned_master_id||':brigade:'||NEW.assigned_brigade ELSE 'master:'||NEW.assigned_master_id||':worker:'||NEW.assigned_to END));
+          UPDATE manual_queue_state SET revision=revision+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE scope_key=CASE WHEN NEW.status='issued' AND COALESCE(NEW.assigned_brigade,'')<>''
+            THEN 'master:'||NEW.assigned_master_id||':brigade:'||NEW.assigned_brigade
+            ELSE 'master:'||NEW.assigned_master_id||':worker:'||NEW.assigned_to END
+            AND NEW.status IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework')
+            AND (OLD.status NOT IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework') OR
+              (CASE WHEN OLD.status='issued' AND COALESCE(OLD.assigned_brigade,'')<>'' THEN 'master:'||OLD.assigned_master_id||':brigade:'||OLD.assigned_brigade ELSE 'master:'||OLD.assigned_master_id||':worker:'||OLD.assigned_to END)
+              <>(CASE WHEN NEW.status='issued' AND COALESCE(NEW.assigned_brigade,'')<>'' THEN 'master:'||NEW.assigned_master_id||':brigade:'||NEW.assigned_brigade ELSE 'master:'||NEW.assigned_master_id||':worker:'||NEW.assigned_to END));
+          DELETE FROM manual_queue_items WHERE order_id=NEW.id AND (
+            NEW.status NOT IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework') OR
+            (CASE WHEN OLD.status='issued' AND COALESCE(OLD.assigned_brigade,'')<>'' THEN 'master:'||OLD.assigned_master_id||':brigade:'||OLD.assigned_brigade ELSE 'master:'||OLD.assigned_master_id||':worker:'||OLD.assigned_to END)
+            <>(CASE WHEN NEW.status='issued' AND COALESCE(NEW.assigned_brigade,'')<>'' THEN 'master:'||NEW.assigned_master_id||':brigade:'||NEW.assigned_brigade ELSE 'master:'||NEW.assigned_master_id||':worker:'||NEW.assigned_to END));
+        END;
+        CREATE TRIGGER IF NOT EXISTS manual_queue_order_delete
+        AFTER DELETE ON orders
+        WHEN OLD.status IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework')
+        BEGIN
+          INSERT OR IGNORE INTO manual_queue_state(scope_key,revision)
+          VALUES (CASE WHEN OLD.status='issued' AND COALESCE(OLD.assigned_brigade,'')<>''
+            THEN 'master:'||OLD.assigned_master_id||':brigade:'||OLD.assigned_brigade
+            ELSE 'master:'||OLD.assigned_master_id||':worker:'||OLD.assigned_to END,0);
+          UPDATE manual_queue_state SET revision=revision+1,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE scope_key=CASE WHEN OLD.status='issued' AND COALESCE(OLD.assigned_brigade,'')<>''
+            THEN 'master:'||OLD.assigned_master_id||':brigade:'||OLD.assigned_brigade
+            ELSE 'master:'||OLD.assigned_master_id||':worker:'||OLD.assigned_to END;
+        END;
         """)
+        order_columns = {r[1] for r in db.execute("PRAGMA table_info(orders)")}
+        if "worker_completion_comment" not in order_columns:
+            # Nullable by design: legacy rows predate this optional executor comment.
+            db.execute("ALTER TABLE orders ADD COLUMN worker_completion_comment TEXT")
+        db.execute("INSERT OR IGNORE INTO telegram_inbox_budget(singleton,update_count) "
+                   "SELECT 1,COUNT(*) FROM telegram_inbox")
         user_columns = {r[1] for r in db.execute("PRAGMA table_info(users)")}
         for name, definition in (("specialty", "TEXT NOT NULL DEFAULT 'Механика'"),
                                  ("qualification_level", "INTEGER NOT NULL DEFAULT 1"),
@@ -365,6 +493,10 @@ def init_db(path: Path | str = DB_PATH) -> None:
             db.execute("ALTER TABLE photos ADD COLUMN perceptual_hash TEXT")
         if "color_signature" not in photo_columns:
             db.execute("ALTER TABLE photos ADD COLUMN color_signature TEXT")
+        if "active" not in photo_columns:
+            db.execute("ALTER TABLE photos ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        if "cleanup_pending" not in photo_columns:
+            db.execute("ALTER TABLE photos ADD COLUMN cleanup_pending INTEGER NOT NULL DEFAULT 0")
         telegram_columns = {r[1] for r in db.execute("PRAGMA table_info(telegram_outbox)")}
         for name, definition in (("recipient_user_id", "INTEGER REFERENCES users(id) ON DELETE CASCADE"),
                                  ("order_id", "INTEGER REFERENCES orders(id) ON DELETE SET NULL"),
@@ -382,6 +514,7 @@ def init_db(path: Path | str = DB_PATH) -> None:
         if db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
             seed_demo(db)
         seed_synthetic_norm_catalog(db)
+    retire_legacy_duplicate_photos(path)
 
 
 def password_record(password: str, salt: bytes | None = None) -> tuple[str, str]:
@@ -644,6 +777,266 @@ def enqueue_telegram_message(db: sqlite3.Connection, recipient_user_id: int, eve
         (recipient_user_id,scope[0],expected_role,binding["chat_id"],scope[1],scope[2],event,
          json.dumps({"text":message[:280]},ensure_ascii=False),iso(),dedupe_key))
 
+TELEGRAM_MAX_INBOUND_CHARS = 256
+TELEGRAM_ORDERS_PAGE_SIZE = 5
+TELEGRAM_MAX_PAGE_INDEX = 1000
+TELEGRAM_MAX_INBOX_UPDATES = 20_000
+TELEGRAM_MAX_PRIVATE_UPDATES_PER_MINUTE = 120
+TELEGRAM_MAX_PENDING_COMMANDS = 100
+TELEGRAM_BUTTON_COMMANDS = {
+    "статус": "status", "инструкция": "help", "открыть сайт": "site", "меню": "menu",
+    "мои наряды": "orders", "предыдущая страница": "orders_previous",
+    "следующая страница": "orders_next",
+}
+
+
+def telegram_reply_keyboard() -> dict:
+    """Use reply buttons only; no inline callback data is issued by this bot."""
+    return {"keyboard": [
+        [{"text": "Мои наряды"}, {"text": "Статус"}],
+        [{"text": "Предыдущая страница"}, {"text": "Следующая страница"}],
+        [{"text": "Инструкция"}],
+        [{"text": "Открыть сайт"}],
+        [{"text": "Меню"}],
+    ], "resize_keyboard": True, "is_persistent": True}
+
+
+def _telegram_host_has_numeric_last_label(host: str) -> bool:
+    """Reject browser-normalized IPv4 shorthand without resolving any hostname."""
+    label = host.rsplit(".", 1)[-1]
+    if not label.isascii():
+        return False
+    if label.isdecimal():
+        return True
+    if label.startswith("0x"):
+        return not label[2:] or all(char in "0123456789abcdef" for char in label[2:])
+    if label.startswith("0o"):
+        return not label[2:] or all(char in "01234567" for char in label[2:])
+    return False
+
+
+def telegram_public_site_url() -> str | None:
+    """Return an explicit HTTPS origin or the one opted-in demo tunnel host."""
+    raw = os.environ.get("NARYADAI_PUBLIC_SITE_URL", "")
+    demo_tunnel_opt_in = os.environ.get("NARYADAI_ALLOW_DEMO_TUNNEL") == "1"
+    demo_tunnel_host = "legless-bennie-sheepish.ngrok-free.dev"
+    if any(ord(char) < 0x20 or 0x7F <= ord(char) <= 0x9F for char in raw):
+        return None
+    raw = raw.strip()
+    if not raw or len(raw) > 512:
+        return None
+    try:
+        parsed = urlparse(raw)
+        raw_host = parsed.hostname or ""
+        host = raw_host.encode("idna").decode("ascii").lower().rstrip(".")
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        return None
+    if (parsed.scheme.lower() != "https" or not host
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment
+            or port not in (None, 443) or "." not in host):
+        return None
+    if any(host == suffix or host.endswith("." + suffix)
+           for suffix in ("localhost", "local", "localdomain", "internal", "test", "invalid",
+                          "lan", "home", "home.arpa", "corp", "intranet", "private")):
+        return None
+    if _telegram_host_has_numeric_last_label(host):
+        return None
+    if any(marker in host for marker in ("ngrok", "trycloudflare", "loca.lt", "localhost.run")):
+        exact_demo_tunnel = demo_tunnel_opt_in and raw_host.lower() == demo_tunnel_host
+        if not exact_demo_tunnel:
+            return None
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+    labels = host.split(".")
+    if any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in labels):
+        return None
+    return f"https://{host}/"
+
+
+def telegram_parse_command(text: str) -> tuple[str, int | str | None]:
+    normalized = text.strip()
+    if len(normalized) > TELEGRAM_MAX_INBOUND_CHARS:
+        return "too_long", None
+    button_command = TELEGRAM_BUTTON_COMMANDS.get(normalized.casefold())
+    if button_command:
+        return button_command, None
+    match = re.fullmatch(r"/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]{1,32})?(?:\s+([^\s]+))?", normalized)
+    if not match:
+        return "help", None
+    command, argument = match.group(1).lower(), match.group(2)
+    if command in {"start", "menu"}:
+        return "menu", None
+    if command in {"help", "status"}:
+        return command, None
+    if command == "orders":
+        if argument is None:
+            return "orders", 0
+        if re.fullmatch(r"[0-9]{1,6}", argument):
+            page_number = int(argument)
+            if page_number >= 1:
+                return "orders", min(TELEGRAM_MAX_PAGE_INDEX, page_number - 1)
+        return "orders_invalid", None
+    return "help", None
+
+
+def telegram_order_scope_fingerprint(db: sqlite3.Connection, user_id: int, role: str) -> str:
+    if role == "worker":
+        rows = db.execute("SELECT id FROM orders WHERE assigned_to=? ORDER BY id", (user_id,))
+    elif role == "master":
+        rows = db.execute("SELECT id FROM orders WHERE assigned_master_id=? ORDER BY id", (user_id,))
+    elif role == "manager":
+        rows = db.execute("SELECT id FROM orders ORDER BY id")
+    else:
+        return ""
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(str(row[0]).encode("ascii"))
+        digest.update(b",")
+    return digest.hexdigest()
+
+
+def telegram_ingress_allowed(db: sqlite3.Connection, now: datetime | None = None) -> bool:
+    current = now or utcnow()
+    row = db.execute("SELECT window_started_at,accepted_count FROM telegram_ingress_state WHERE singleton=1").fetchone()
+    if not row:
+        db.execute("INSERT INTO telegram_ingress_state(singleton,window_started_at,accepted_count) VALUES (1,?,1)",
+                   (iso(current),))
+        return True
+    started = parse_time(row["window_started_at"])
+    elapsed = (current - started).total_seconds() if started else TELEGRAM_MAX_PRIVATE_UPDATES_PER_MINUTE * 60
+    if elapsed >= 60:
+        db.execute("UPDATE telegram_ingress_state SET window_started_at=?,accepted_count=1 WHERE singleton=1",
+                   (iso(current),))
+        return True
+    if row["accepted_count"] >= TELEGRAM_MAX_PRIVATE_UPDATES_PER_MINUTE:
+        return False
+    db.execute("UPDATE telegram_ingress_state SET accepted_count=accepted_count+1 WHERE singleton=1")
+    return True
+
+
+def telegram_command_queue_has_capacity(db: sqlite3.Connection) -> bool:
+    pending = db.execute("""SELECT COUNT(*) FROM telegram_outbox WHERE event IN ('bot_command','bot_pair_help')
+        AND status IN ('queued_local','retrying','sending')""").fetchone()[0]
+    return pending < TELEGRAM_MAX_PENDING_COMMANDS
+
+
+def enqueue_telegram_bot_command(db: sqlite3.Connection, user_id: int, chat_id: str,
+                                  role: str, command: str, update_id: int,
+                                  page: int | None = None) -> bool:
+    if not telegram_command_queue_has_capacity(db):
+        return False
+    payload = {"command": command,
+               "scope_fingerprint": telegram_order_scope_fingerprint(db, user_id, role)}
+    if command == "orders":
+        payload["page"] = min(TELEGRAM_MAX_PAGE_INDEX, max(0, int(page or 0)))
+    db.execute("""INSERT OR IGNORE INTO telegram_outbox
+        (recipient_user_id,order_id,recipient_role,recipient_chat_id,event,payload_json,status,created_at,dedupe_key)
+        VALUES (?,NULL,?,?,'bot_command',?,'queued_local',?,?)""",
+        (user_id, role, chat_id, json.dumps(payload, separators=(",", ":")),
+         iso(), f"telegram-update:{update_id}"))
+    return True
+
+
+def enqueue_telegram_pair_help(db: sqlite3.Connection, chat_id: str, update_id: int,
+                                  text: str | None = None) -> None:
+    if not telegram_command_queue_has_capacity(db):
+        return
+    text = text or ("Чтобы открыть наряды, сначала привяжите аккаунт: в веб-панели получите одноразовый код, "
+            "затем в личном чате отправьте /start КОД. Без привязки данные нарядов не показываются.")
+    db.execute("""INSERT OR IGNORE INTO telegram_outbox
+        (recipient_user_id,order_id,recipient_role,recipient_chat_id,event,payload_json,status,created_at,dedupe_key)
+        VALUES (NULL,NULL,NULL,?,'bot_pair_help',?,'queued_local',?,?)""",
+        (chat_id, json.dumps({"text": text}, ensure_ascii=False), iso(), f"telegram-update:{update_id}"))
+
+
+def telegram_html_field(value: object, limit: int) -> str:
+    text = " ".join(str(value or "").split())
+    text = "".join(char for char in text if char.isprintable())
+    return html.escape(text[:limit], quote=True)
+
+
+def render_telegram_bot_command(db: sqlite3.Connection, row: sqlite3.Row,
+                                payload: dict) -> tuple[str, dict, str]:
+    command = payload.get("command")
+    keyboard = telegram_reply_keyboard()
+    role = row["recipient_role"]
+    if command == "menu":
+        return ("НарядКонтроль · Выберите команду. Кнопки показывают сведения и не меняют состояние наряда.", keyboard, "HTML")
+    if command == "help":
+        text = ("<b>НарядКонтроль · Инструкция</b>\n"
+                "1. В веб-панели получите одноразовый код привязки Telegram.\n"
+                "2. Откройте личный чат с ботом и отправьте <code>/start КОД</code>. Код действует 10 минут и используется один раз.\n"
+                "3. Исполнитель видит назначенные ему наряды; мастер — назначенные ему как ответственному; руководитель — все наряды только для просмотра.\n"
+                "Откройте «Мои наряды» или отправьте /orders. Кнопки страниц заново проверяют доступ и не меняют наряд.\n"
+                "Без активной привязки данные не выдаются.")
+        return text, keyboard, "HTML"
+    if command == "too_long":
+        return ("Команда слишком длинная. Используйте кнопки меню или короткую команду, например /orders.",
+                 keyboard, "HTML")
+    if command == "orders_invalid":
+        return ("Номер страницы должен быть положительным числом. Используйте /orders или /orders 2.",
+                keyboard, "HTML")
+    if command == "site":
+        site = telegram_public_site_url()
+        if site:
+            return (f'Сайт настроен: <a href="{html.escape(site, quote=True)}">открыть веб-панель</a>.',
+                    keyboard, "HTML")
+        return ("Ссылка на сайт пока не настроена. Администратор должен задать постоянный публичный HTTPS-адрес.",
+                keyboard, "HTML")
+    if command == "status":
+        where, args = telegram_order_scope_sql(role, row["recipient_user_id"])
+        total = db.execute(f"SELECT COUNT(*) FROM orders WHERE {where}", args).fetchone()[0]
+        active = db.execute(f"SELECT COUNT(*) FROM orders WHERE {where} AND status NOT IN ('closed','rejected')", args).fetchone()[0]
+        label = telegram_html_field(ROLE_LABELS.get(role, role), 40)
+        count_label = "Нарядов в системе" if role == "manager" else "Ваших нарядов"
+        return (f"<b>Связь активна.</b> Роль: {label}.\n{count_label}: {total}; активных: {active}.",
+                keyboard, "HTML")
+    if command == "orders":
+        page = max(0, min(TELEGRAM_MAX_PAGE_INDEX, int(payload.get("page", 0) or 0)))
+        where, args = telegram_order_scope_sql(role, row["recipient_user_id"])
+        total = db.execute(f"SELECT COUNT(*) FROM orders WHERE {where}", args).fetchone()[0]
+        pages = max(1, (total + TELEGRAM_ORDERS_PAGE_SIZE - 1) // TELEGRAM_ORDERS_PAGE_SIZE)
+        page = min(page, pages - 1)
+        db.execute("""INSERT INTO telegram_user_state(user_id,orders_page,updated_at) VALUES (?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET orders_page=excluded.orders_page,updated_at=excluded.updated_at""",
+                   (row["recipient_user_id"], page, iso()))
+        rows = db.execute(f"""SELECT o.code,o.title,o.status,o.priority,mqi.position,{queue_scope_sql('o')} AS queue_scope
+            FROM orders o LEFT JOIN manual_queue_items mqi ON mqi.order_id=o.id WHERE {where}
+            ORDER BY CASE WHEN mqi.position IS NOT NULL THEN 0 ELSE 1 END,mqi.scope_key,mqi.position,
+                o.created_at DESC,o.id DESC LIMIT ? OFFSET ?""",
+                          (*args, TELEGRAM_ORDERS_PAGE_SIZE, page * TELEGRAM_ORDERS_PAGE_SIZE)).fetchall()
+        label = "Наряды для просмотра" if role == "manager" else "Мои наряды"
+        output = [f"<b>{label} · {page + 1}/{pages}</b>"]
+        if rows:
+            for item in rows:
+                code = telegram_html_field(item["code"], 32)
+                title = telegram_html_field(item["title"], 72)
+                if item["position"] is not None:
+                    title = f"#{item['position']} · {title}"
+                status = telegram_html_field(STATUS_LABELS.get(item["status"], item["status"]), 28)
+                output.append(f"<b>{code}</b> · {title}\nСтатус: {status}")
+        else:
+            output.append("Наряды не найдены.")
+        output.append("Только просмотр. Статус меняется в веб-панели уполномоченным пользователем.")
+        return "\n\n".join(output), keyboard, "HTML"
+    return ("Команда не распознана. Нажмите «Инструкция» или отправьте /help.", keyboard, "HTML")
+
+
+def telegram_order_scope_sql(role: str, user_id: int) -> tuple[str, tuple]:
+    if role == "worker":
+        return "assigned_to=?", (user_id,)
+    if role == "master":
+        return "assigned_master_id=?", (user_id,)
+    if role == "manager":
+        return "1=1", ()
+    return "0=1", ()
+
+
 def telegram_plain_field(value: object, limit: int) -> str:
     """Bound a user-visible field for a plain-text Bot API message (no parse_mode)."""
     text = " ".join(str(value or "").split())
@@ -727,10 +1120,17 @@ class _NoTelegramRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def telegram_send_message(token: str, chat_id: str, text: str) -> None:
-    """Send one plain-text Bot API message; never log the token or response body."""
+def telegram_send_message(token: str, chat_id: str, text: str, *,
+                          reply_markup: dict | None = None,
+                          parse_mode: str | None = None) -> None:
+    """Send one bounded Bot API message; never log the token or provider response."""
+    form = {"chat_id": chat_id, "text": text[:4096], "disable_web_page_preview": "true"}
+    if reply_markup is not None:
+        form["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False, separators=(",", ":"))
+    if parse_mode == "HTML":
+        form["parse_mode"] = parse_mode
     url = f"https://api.telegram.org/bot{quote(token, safe=':')}/sendMessage"
-    body = urlencode({"chat_id": chat_id, "text": text[:280], "disable_web_page_preview": "true"}).encode()
+    body = urlencode(form).encode()
     request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
     opener = urllib.request.build_opener(_NoTelegramRedirect())
     try:
@@ -765,14 +1165,32 @@ _TELEGRAM_DELIVERY_CONTEXT_SQL = """SELECT q.*,b.chat_id AS current_chat_id,u.ro
     """
 
 
-def _telegram_delivery_scope_is_current(row: sqlite3.Row) -> bool:
-    valid = bool(row["recipient_role"] in ("worker", "master")
+def _telegram_delivery_scope_is_current(row: sqlite3.Row, db: sqlite3.Connection | None = None) -> bool:
+    if row["event"] == "bot_pair_help":
+        return bool(row["recipient_user_id"] is None and row["order_id"] is None
+                    and row["recipient_role"] is None and row["recipient_chat_id"])
+    valid = bool(row["recipient_role"] in ("worker", "master", "manager")
                  and row["recipient_role"] == row["current_role"]
                  and row["recipient_active"] == 1
                  and row["recipient_chat_id"]
                  and row["recipient_chat_id"] == row["current_chat_id"])
     if row["order_id"] is None:
-        return valid and row["event"] == "pair_linked"
+        if not valid or row["event"] not in {"pair_linked", "bot_command"}:
+            return False
+        if row["event"] == "bot_command":
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, json.JSONDecodeError):
+                return False
+            if payload.get("command") == "orders":
+                if db is None:
+                    return False
+                current_fingerprint = telegram_order_scope_fingerprint(
+                    db, row["recipient_user_id"], row["current_role"])
+                return payload.get("scope_fingerprint") == current_fingerprint
+        return True
+    if row["recipient_role"] == "manager":
+        return False
     expected_assignee = (row["current_assigned_to"] if row["recipient_role"] == "worker"
                          else row["current_assigned_master_id"])
     return bool(valid and row["current_order_status"] is not None
@@ -806,7 +1224,7 @@ def _claim_telegram_delivery(db_path: Path | str) -> tuple[int | None, bool]:
         if not row:
             db.commit()
             return None, False
-        if not _telegram_delivery_scope_is_current(row):
+        if not _telegram_delivery_scope_is_current(row, db):
             _cancel_stale_telegram_delivery(db, row["id"])
             db.commit()
             return None, True
@@ -835,7 +1253,7 @@ def _finish_claimed_telegram_delivery(db_path: Path | str, outbox_id: int,
         if not row:
             db.commit()
             return True
-        if not _telegram_delivery_scope_is_current(row):
+        if not _telegram_delivery_scope_is_current(row, db):
             _cancel_stale_telegram_delivery(db, outbox_id)
             db.commit()
             return True
@@ -844,8 +1262,21 @@ def _finish_claimed_telegram_delivery(db_path: Path | str, outbox_id: int,
         # Assignment, unpair, or rebinding either happens before this recheck or
         # waits until the delivery has a durable final state.
         try:
-            (sender or telegram_send_message)(delivery_token, row["current_chat_id"],
-                                               json.loads(row["payload_json"]).get("text", ""))
+            outgoing = json.loads(row["payload_json"])
+            reply_markup = outgoing.get("reply_markup")
+            parse_mode = outgoing.get("parse_mode")
+            text = outgoing.get("text", "")
+            if row["event"] == "bot_command":
+                text, reply_markup, parse_mode = render_telegram_bot_command(db, row, outgoing)
+            elif row["event"] == "pair_linked":
+                reply_markup = telegram_reply_keyboard()
+            chat_id = row["recipient_chat_id"] if row["event"] == "bot_pair_help" else row["current_chat_id"]
+            send_options = {}
+            if reply_markup is not None:
+                send_options["reply_markup"] = reply_markup
+            if parse_mode is not None:
+                send_options["parse_mode"] = parse_mode
+            (sender or telegram_send_message)(delivery_token, chat_id, text, **send_options)
             status, err, next_at = "delivered", None, None
         except TelegramRetry as exc:
             if attempts < 4:
@@ -1189,8 +1620,14 @@ def inspect_image(raw: bytes, declared_mime: str) -> dict:
                     exif_ifd = exif.get_ifd(34665)
                 except (AttributeError, KeyError, TypeError, ValueError):
                     exif_ifd = {}
-                captured_raw = exif_ifd.get(36867) or exif_ifd.get(36868) or exif.get(36867) or exif.get(36868)
-                offset_raw = exif_ifd.get(36881) or exif.get(36881)
+                original_time = exif_ifd.get(36867) or exif.get(36867)
+                digitized_time = exif_ifd.get(36868) or exif.get(36868)
+                if original_time:
+                    captured_raw = original_time
+                    offset_raw = exif_ifd.get(36881) or exif.get(36881)
+                else:
+                    captured_raw = digitized_time
+                    offset_raw = exif_ifd.get(36882) or exif.get(36882)
                 try:
                     image.load()
                     oriented = ImageOps.exif_transpose(image)
@@ -1245,6 +1682,174 @@ def hamming_distance(left: str, right: str) -> int:
         return (int(left, 16) ^ int(right, 16)).bit_count()
     except (TypeError, ValueError):
         return 64
+
+
+def prepare_photo(db: sqlite3.Connection, body: dict, phase: str) -> dict:
+    """Validate image bytes and calculate duplicate metadata without storing a file."""
+    data_url = body.get("data_url", "")
+    if not isinstance(data_url, str):
+        raise ApiError(400, "Фото должно быть передано как строка data URL")
+    match = re.fullmatch(r"data:(image/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)", data_url)
+    if not match:
+        raise ApiError(400, "Поддерживаются JPEG, PNG и WebP")
+    mime, encoded = match.groups()
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error):
+        raise ApiError(400, "Файл повреждён")
+    if not raw or len(raw) > 4_000_000:
+        raise ApiError(413, "Максимальный размер фото — 4 МБ")
+    valid = ((mime == "image/jpeg" and raw.startswith(b"\xff\xd8\xff"))
+             or (mime == "image/png" and raw.startswith(b"\x89PNG\r\n\x1a\n"))
+             or (mime == "image/webp" and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP"))
+    if not valid:
+        raise ApiError(400, "Тип изображения не совпадает с содержимым файла")
+    try:
+        inspected = inspect_image(raw, mime)
+    except ValueError as exc:
+        raise ApiError(400, str(exc))
+    digest = hashlib.sha256(raw).hexdigest()
+    exact_duplicate = bool(db.execute("SELECT id FROM photos WHERE sha256=? LIMIT 1", (digest,)).fetchone())
+    distances = [(hamming_distance(r[0], inspected["perceptual_hash"]), r[1])
+                 for r in db.execute("SELECT perceptual_hash,color_signature FROM photos WHERE perceptual_hash IS NOT NULL")]
+    compatible_distances = []
+    for distance, old_color in distances:
+        if not old_color or not inspected["color_signature"]:
+            continue
+        color_distance = sum(abs(int(a, 16) - int(b, 16)) for a, b in zip(old_color, inspected["color_signature"]))
+        if len(old_color) == len(inspected["color_signature"]) and color_distance <= 3:
+            compatible_distances.append(distance)
+    nearest_distance = min(compatible_distances) if compatible_distances else None
+    similar_duplicate = not exact_duplicate and nearest_distance is not None and nearest_distance <= SIMILAR_HASH_DISTANCE
+    duplicate_type = "exact" if exact_duplicate else "similar" if similar_duplicate else "none"
+    inspected["verifiability_score"] = 1 if exact_duplicate else 2 if similar_duplicate else inspected["verifiability_score"]
+    inspected.update({"exact_duplicate": exact_duplicate, "similar_duplicate": similar_duplicate,
+                      "nearest_hash_distance": nearest_distance,
+                      "similarity_rule": f"dHash 64-bit; Hamming distance <= {SIMILAR_HASH_DISTANCE}"})
+    ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[mime]
+    raw_name = body.get("file_name", "photo")
+    if not isinstance(raw_name, str):
+        raise ApiError(400, "Имя файла должно быть текстом")
+    file_name = re.sub(r"[^A-Za-zА-Яа-яЁё0-9._ -]", "_", raw_name[:100]).strip() or "photo"
+    stored_name = secrets.token_hex(16) + ext
+    media_root = MEDIA.resolve()
+    location = (media_root / stored_name).resolve()
+    if location.parent != media_root:
+        raise ApiError(400, "Недопустимый путь хранения файла")
+    source_size = body.get("source_size_bytes")
+    metadata = {"declared_type": mime, "bytes": len(raw), "sha256": digest,
+                "upload_time_utc": iso(), "freshness_claim": "Не подтверждается: EXIF может отсутствовать или быть изменён; дата загрузки не является датой съёмки.",
+                "client_compressed": body.get("client_compressed") is True,
+                "source_size_bytes_claim": source_size if type(source_size) is int and 0 <= source_size <= 50_000_000 else None,
+                "source_media_type_claim": body.get("source_media_type") if body.get("source_media_type") in ("image/jpeg", "image/png", "image/webp") else None,
+                "client_exif_transfer_succeeded_claim": body.get("exif_transfer_succeeded") is True,
+                **inspected}
+    return {"raw": raw, "mime": mime, "digest": digest, "inspected": inspected,
+            "file_name": file_name, "phase": phase, "duplicate": duplicate_type != "none",
+            "duplicate_type": duplicate_type, "metadata": metadata, "location": location}
+
+
+def detect_batch_photo_duplicates(prepared_photos: list[dict]) -> None:
+    """Include earlier files in one atomic create request in the duplicate check."""
+    seen: list[dict] = []
+    for photo in prepared_photos:
+        duplicate_type = photo["duplicate_type"]
+        exact = duplicate_type == "exact"
+        similar = duplicate_type == "similar"
+        for previous in seen:
+            if photo["digest"] == previous["digest"]:
+                exact = True
+                break
+            left, right = photo["inspected"], previous["inspected"]
+            left_color, right_color = left.get("color_signature"), right.get("color_signature")
+            if (left_color and right_color and len(left_color) == len(right_color)
+                    and sum(abs(int(a, 16) - int(b, 16)) for a, b in zip(left_color, right_color)) <= 3
+                    and hamming_distance(left.get("perceptual_hash"), right.get("perceptual_hash")) <= SIMILAR_HASH_DISTANCE):
+                similar = True
+        resolved = "exact" if exact else "similar" if similar else "none"
+        photo["duplicate_type"] = resolved
+        photo["duplicate"] = resolved != "none"
+        if resolved != "none":
+            score = 1 if resolved == "exact" else 2
+            photo["inspected"]["verifiability_score"] = score
+            photo["metadata"]["verifiability_score"] = score
+        seen.append(photo)
+
+
+def store_photo(db: sqlite3.Connection, user_id: int, order_id: int, prepared: dict) -> tuple[int, Path]:
+    """Persist a prepared image and audit row; the caller owns the enclosing DB commit."""
+    location: Path = prepared["location"]
+    try:
+        location.write_bytes(prepared["raw"])
+        cur = db.execute("""INSERT INTO photos(order_id,file_name,phase,media_type,file_path,size_bytes,sha256,duplicate,duplicate_type,perceptual_hash,color_signature,uploaded_at,metadata_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (order_id, prepared["file_name"], prepared["phase"], prepared["mime"], str(location),
+             len(prepared["raw"]), prepared["digest"], int(prepared["duplicate"]), prepared["duplicate_type"],
+             prepared["inspected"]["perceptual_hash"], prepared["inspected"]["color_signature"],
+             iso(), json.dumps(prepared["metadata"], ensure_ascii=False)))
+        audit(db, user_id, order_id, "photo_uploaded", {"photo_id": cur.lastrowid,
+              "phase": prepared["phase"], "duplicate": prepared["duplicate"],
+              "duplicate_type": prepared["duplicate_type"], "bytes": len(prepared["raw"]),
+              "client_compressed": prepared["metadata"]["client_compressed"],
+              "source_size_bytes_claim": prepared["metadata"]["source_size_bytes_claim"]})
+        return int(cur.lastrowid), location
+    except Exception:
+        location.unlink(missing_ok=True)
+        raise
+
+
+def cleanup_retired_photo_files(db_path: Path | str = DB_PATH, order_id: int | None = None,
+                                limit: int = 5000) -> int:
+    """Delete superseded media after its DB retirement committed; return pending count."""
+    with connect(db_path) as db:
+        if order_id is None:
+            rows = db.execute("SELECT id,file_path FROM photos WHERE active=0 AND cleanup_pending=1 ORDER BY id LIMIT ?",
+                              (limit,)).fetchall()
+        else:
+            rows = db.execute("SELECT id,file_path FROM photos WHERE order_id=? AND active=0 AND cleanup_pending=1 ORDER BY id LIMIT ?",
+                              (order_id, limit)).fetchall()
+    media_root = MEDIA.resolve()
+    for row in rows:
+        candidate = Path(row["file_path"])
+        try:
+            if candidate.parent.resolve() != media_root:
+                continue
+            if candidate.is_file() or candidate.is_symlink():
+                candidate.unlink(missing_ok=True)
+        except OSError:
+            continue
+        with connect(db_path) as db:
+            db.execute("UPDATE photos SET cleanup_pending=0 WHERE id=? AND active=0", (row["id"],))
+            db.commit()
+    with connect(db_path) as db:
+        if order_id is None:
+            return int(db.execute("SELECT COUNT(*) FROM photos WHERE active=0 AND cleanup_pending=1").fetchone()[0])
+        return int(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND active=0 AND cleanup_pending=1",
+                              (order_id,)).fetchone()[0])
+
+
+def retire_legacy_duplicate_photos(db_path: Path | str = DB_PATH) -> None:
+    """Keep legacy duplicate rows and audits, but retire their media from active evidence."""
+    with connect(db_path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        rows = db.execute("SELECT id,order_id,phase,duplicate_type FROM photos WHERE active=1 AND duplicate=1 ORDER BY id").fetchall()
+        for row in rows:
+            db.execute("UPDATE photos SET active=0,cleanup_pending=1 WHERE id=? AND active=1", (row["id"],))
+            audit(db, None, row["order_id"], "photo_legacy_duplicate_retired",
+                  {"photo_id": row["id"], "phase": row["phase"], "duplicate_type": row["duplicate_type"]})
+        db.commit()
+    cleanup_retired_photo_files(db_path)
+
+
+def supersede_after_photos(db: sqlite3.Connection, actor_id: int, order_id: int, reason_code: str) -> int:
+    """Retire the previous completion evidence in the rework transaction."""
+    rows = db.execute("SELECT id,phase FROM photos WHERE order_id=? AND phase='after' AND active=1 ORDER BY id",
+                      (order_id,)).fetchall()
+    for row in rows:
+        db.execute("UPDATE photos SET active=0,cleanup_pending=1 WHERE id=? AND active=1", (row["id"],))
+        audit(db, actor_id, order_id, "photo_superseded",
+              {"photo_id": row["id"], "phase": row["phase"], "reason_code": reason_code})
+    return len(rows)
 
 
 def complete_review(text: str, photo_rows: list[sqlite3.Row], material_count: int, hours: float | None, work_type: str, context: dict | None = None) -> dict:
@@ -1468,7 +2073,7 @@ def order_dict(db: sqlite3.Connection, row: sqlite3.Row, include_history: bool =
     reference = synthetic_order_reference(db,row["work_type"],equipment["equipment_type"],materials,
         actual_materials_known=bool(row["completed_at"]),materials_not_used=bool(row["materials_not_used"]),
         actual_labor_hours=row["labor_hours"],reference_cache=reference_cache)
-    photos = [dict(r) for r in db.execute("SELECT id,file_name,phase,media_type,size_bytes,duplicate,duplicate_type,uploaded_at,metadata_json FROM photos WHERE order_id=? ORDER BY id", (row["id"],))]
+    photos = [dict(r) for r in db.execute("SELECT id,file_name,phase,media_type,size_bytes,duplicate,duplicate_type,uploaded_at,metadata_json FROM photos WHERE order_id=? AND active=1 ORDER BY id", (row["id"],))]
     for photo in photos:
         photo["metadata"] = json.loads(photo.pop("metadata_json"))
         photo["metadata"].pop("sha256", None)
@@ -1625,8 +2230,11 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/api/telegram/webhook":
                 return self.telegram_webhook()
             user = self.require_auth()
-            if user["role"] == "manager" and path != "/api/logout":
+            if user["role"] == "manager" and path not in {
+                    "/api/logout", "/api/telegram/pair", "/api/telegram/unpair"}:
                 raise ApiError(403,"Кабинет руководителя доступен только для просмотра")
+            if path == "/api/work-queues/reorder":
+                return self.reorder_work_queue(user)
             if path == "/api/logout":
                 return self.logout(user)
             if path == "/api/equipment/downtime":
@@ -1676,7 +2284,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         "delivery_counts": counts, "pairing_ttl_minutes": 10})
 
     def telegram_pair(self, user: sqlite3.Row) -> None:
-        if user["role"] not in ("master", "worker"):
+        if user["role"] not in ("master", "worker", "manager"):
             raise ApiError(403, "Для этой роли привязка недоступна")
         if not telegram_delivery_configured():
             raise ApiError(409, "Telegram выключен или его настройки не заданы")
@@ -1709,43 +2317,114 @@ class AppHandler(BaseHTTPRequestHandler):
             update = self.read_json(32_000)
         except ApiError:
             return self.send_json({"ok": True})
+        if not isinstance(update, dict):
+            return self.send_json({"ok": True})
+        update_id = update.get("update_id")
+        if type(update_id) is not int or not 0 <= update_id <= 9_223_372_036_854_775_807:
+            return self.send_json({"ok": True})
+
         message = update.get("message")
-        if not isinstance(message, dict) or not isinstance(message.get("text"), str):
+        chat = message.get("chat") if isinstance(message, dict) else None
+        sender = message.get("from") if isinstance(message, dict) else None
+        text = message.get("text") if isinstance(message, dict) else None
+        if (not isinstance(message, dict) or not isinstance(chat, dict) or not isinstance(sender, dict)
+                or not isinstance(text, str)):
             return self.send_json({"ok": True})
-        chat = message.get("chat") or {}; sender = message.get("from") or {}
-        if not isinstance(chat, dict) or not isinstance(sender, dict):
+        chat_id = chat.get("id")
+        sender_id = sender.get("id")
+        if (chat.get("type") != "private" or type(chat_id) is not int or chat_id <= 0
+                or type(sender_id) is not int or sender.get("is_bot") is True or sender_id != chat_id):
             return self.send_json({"ok": True})
-        if chat.get("type") != "private" or not isinstance(chat.get("id"), int) or chat.get("id") <= 0:
-            return self.send_json({"ok": True})
-        if not isinstance(sender.get("id"), int) or sender.get("is_bot") is True or sender.get("id") != chat.get("id"):
-            return self.send_json({"ok": True})
-        match = re.fullmatch(r"/start(?:@[A-Za-z0-9_]{1,32})?\s+([A-F0-9]{12})", message["text"].strip())
-        if not match:
-            return self.send_json({"ok": True})
-        chat_id = str(chat["id"]); code_hash = hashlib.sha256(match.group(1).encode()).hexdigest()
         with connect(self.server.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
-            pairing = db.execute("SELECT * FROM telegram_pairings WHERE code_hash=? AND consumed_at IS NULL", (code_hash,)).fetchone()
-            expires = parse_time(pairing["expires_at"]) if pairing else None
-            account = db.execute("SELECT role,is_active FROM users WHERE id=?", (pairing["user_id"],)).fetchone() if pairing else None
-            if pairing and expires and expires > utcnow() and account and account["is_active"] and account["role"] in ("master", "worker"):
-                try:
-                    previous_binding=db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?",(pairing["user_id"],)).fetchone()
-                    if previous_binding and previous_binding["chat_id"] != chat_id:
-                        cancel_telegram_user_messages(db,pairing["user_id"],"recipient_chat_changed")
-                    db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
-                               "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
-                               (pairing["user_id"], chat_id, chat_id, iso()))
-                    db.execute("UPDATE telegram_pairings SET consumed_at=? WHERE code_hash=? AND consumed_at IS NULL", (iso(), code_hash))
-                    enqueue_telegram_message(db, pairing["user_id"], "pair_linked",
-                                             "Telegram привязан к НарядAI. Уведомления содержат только код и статус наряда.",
-                                             f"pair:{pairing['user_id']}:{chat_id}")
-                    audit(db, pairing["user_id"], None, "telegram_paired", {})
-                    db.commit()
-                except sqlite3.IntegrityError:
-                    db.rollback()
+            duplicate = db.execute("SELECT 1 FROM telegram_inbox WHERE update_id=?", (update_id,)).fetchone()
+            if duplicate:
+                db.commit()
+                return self.send_json({"ok": True})
+            budget = db.execute("SELECT update_count FROM telegram_inbox_budget WHERE singleton=1").fetchone()
+            if budget and budget["update_count"] >= TELEGRAM_MAX_INBOX_UPDATES:
+                db.commit()
+                return self.send_json({"ok": True})
+            inserted = db.execute("INSERT OR IGNORE INTO telegram_inbox(update_id,received_at) VALUES (?,?)",
+                                  (update_id, iso())).rowcount
+            if inserted != 1:
+                db.commit()
+                return self.send_json({"ok": True})
+            db.execute("UPDATE telegram_inbox_budget SET update_count=update_count+1 WHERE singleton=1")
+            if not telegram_ingress_allowed(db):
+                db.commit()
+                return self.send_json({"ok": True})
+
+            pairing_match = re.fullmatch(r"/start(?:@[A-Za-z0-9_]{1,32})?\s+([A-F0-9]{12})", text.strip())
+            if pairing_match and len(text) <= TELEGRAM_MAX_INBOUND_CHARS:
+                code_hash = hashlib.sha256(pairing_match.group(1).encode()).hexdigest()
+                pairing = db.execute("SELECT * FROM telegram_pairings WHERE code_hash=? AND consumed_at IS NULL",
+                                     (code_hash,)).fetchone()
+                expires = parse_time(pairing["expires_at"]) if pairing else None
+                account = db.execute("SELECT role,is_active FROM users WHERE id=?",
+                                     (pairing["user_id"],)).fetchone() if pairing else None
+                if (pairing and expires and expires > utcnow() and account and account["is_active"]
+                        and account["role"] in ("master", "worker", "manager")):
+                    db.execute("SAVEPOINT telegram_pair")
+                    try:
+                        previous_binding = db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?",
+                                                      (pairing["user_id"],)).fetchone()
+                        if previous_binding and previous_binding["chat_id"] != str(chat_id):
+                            cancel_telegram_user_messages(db, pairing["user_id"], "recipient_chat_changed")
+                        db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?) "
+                                   "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id,telegram_user_id=excluded.telegram_user_id,linked_at=excluded.linked_at",
+                                   (pairing["user_id"], str(chat_id), str(sender_id), iso()))
+                        db.execute("UPDATE telegram_pairings SET consumed_at=? WHERE code_hash=? AND consumed_at IS NULL",
+                                   (iso(), code_hash))
+                        enqueue_telegram_message(db, pairing["user_id"], "pair_linked",
+                            "Привязка НарядКонтроль готова. Нажмите кнопку или отправьте /help.",
+                            f"pair:{pairing['user_id']}:{chat_id}")
+                        audit(db, pairing["user_id"], None, "telegram_paired", {})
+                        db.execute("RELEASE telegram_pair")
+                    except sqlite3.IntegrityError:
+                        db.execute("ROLLBACK TO telegram_pair")
+                        db.execute("RELEASE telegram_pair")
+                db.commit()
+                return self.send_json({"ok": True})
+
+            if len(text) > TELEGRAM_MAX_INBOUND_CHARS:
+                command, argument = "too_long", None
             else:
-                db.rollback()
+                command, argument = telegram_parse_command(text)
+            bound = db.execute("""SELECT u.id,u.role,u.is_active,b.chat_id,b.telegram_user_id
+                FROM telegram_bindings b JOIN users u ON u.id=b.user_id
+                WHERE b.chat_id=? AND b.telegram_user_id=?""",
+                (str(chat_id), str(sender_id))).fetchone()
+            if not bound or not bound["is_active"]:
+                enqueue_telegram_pair_help(db, str(chat_id), update_id)
+                db.commit()
+                return self.send_json({"ok": True})
+            if bound["role"] not in ("worker", "master", "manager"):
+                enqueue_telegram_pair_help(
+                    db, str(chat_id), update_id,
+                    "Эта роль не может получать данные нарядов через Telegram. Используйте веб-панель; сведения о нарядах не отправлены.")
+                db.commit()
+                return self.send_json({"ok": True})
+
+            role = bound["role"]
+            if not telegram_command_queue_has_capacity(db):
+                db.commit()
+                return self.send_json({"ok": True})
+            page = None
+            if command == "orders":
+                page = int(argument or 0)
+            elif command in {"orders_next", "orders_previous"}:
+                state = db.execute("SELECT orders_page FROM telegram_user_state WHERE user_id=?",
+                                   (bound["id"],)).fetchone()
+                current_page = int(state["orders_page"]) if state else 0
+                page = min(TELEGRAM_MAX_PAGE_INDEX, current_page + 1) if command == "orders_next" else max(0, current_page - 1)
+                command = "orders"
+            if command == "orders":
+                db.execute("""INSERT INTO telegram_user_state(user_id,orders_page,updated_at) VALUES (?,?,?)
+                    ON CONFLICT(user_id) DO UPDATE SET orders_page=excluded.orders_page,updated_at=excluded.updated_at""",
+                           (bound["id"], page or 0, iso()))
+            enqueue_telegram_bot_command(db, bound["id"], str(chat_id), role, command, update_id, page)
+            db.commit()
         self.send_json({"ok": True})
 
     def login(self) -> None:
@@ -1780,7 +2459,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def api_get(self, path: str) -> None:
         if path == "/api/health":
-            return self.send_json({"ok": True, "app": "НарядAI", "mode": "local-mvp"})
+            return self.send_json({"ok": True, "app": "НарядКонтроль", "mode": "local-mvp"})
         user = self.require_auth()
         if path == "/api/me":
             return self.send_json({"user": self.user_public(user)})
@@ -1844,9 +2523,44 @@ class AppHandler(BaseHTTPRequestHandler):
             where, args = "WHERE o.assigned_to=? OR (o.status='issued' AND o.assigned_brigade=?)", [user["id"], user["brigade"]]
         elif user["role"] == "master":
             where, args = "WHERE o.assigned_master_id=?", [user["id"]]
-        rows = db.execute(f"SELECT o.* FROM orders o {where} ORDER BY CASE o.priority WHEN 'emergency' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, o.due_at,o.id DESC", args).fetchall()
+        # Keep order rows, saved positions and the revision on one SQLite snapshot.
+        # Without an explicit read transaction, a reorder can commit between the
+        # manual_queue_items and manual_queue_state SELECTs and pair old IDs with
+        # a new revision that would incorrectly authorize a stale click.
+        if not db.in_transaction:
+            db.execute("BEGIN")
+        rows = db.execute(f"SELECT o.* FROM orders o {where}", args).fetchall()
         norm_reference_cache: dict[tuple[str,str],list[dict]] = {}
-        orders = [order_dict(db, r, reference_cache=norm_reference_cache) for r in rows]
+        grouped_rows: dict[str,list[sqlite3.Row]] = {}
+        other_rows: list[sqlite3.Row] = []
+        for row in rows:
+            if row["status"] in ACTIVE_STATUSES:
+                grouped_rows.setdefault(queue_scope_key(row), []).append(row)
+            else:
+                other_rows.append(row)
+        orders_by_id: dict[int,dict] = {}
+        work_queues: list[dict] = []
+        queue_order_ids: list[int] = []
+        for scope in sorted(grouped_rows):
+            group_rows = grouped_rows[scope]
+            saved = {int(item["order_id"]): int(item["position"]) for item in db.execute(
+                "SELECT order_id,position FROM manual_queue_items WHERE scope_key=?", (scope,))}
+            group_rows.sort(key=lambda row: (0, saved[int(row["id"])], *queue_default_key(row))
+                            if int(row["id"]) in saved else (1, *queue_default_key(row)))
+            state = db.execute("SELECT revision FROM manual_queue_state WHERE scope_key=?", (scope,)).fetchone()
+            revision = int(state["revision"]) if state else 0
+            label = queue_scope_label(db, scope, group_rows[0])
+            group_ids = [int(row["id"]) for row in group_rows]
+            work_queues.append({"scope": scope, "label": label, "revision": revision, "order_ids": group_ids})
+            for position, row in enumerate(group_rows, 1):
+                item = order_dict(db, row, reference_cache=norm_reference_cache)
+                item.update({"queue_scope": scope, "queue_scope_label": label,
+                             "queue_position": position, "queue_revision": revision})
+                orders_by_id[int(row["id"])] = item
+                queue_order_ids.append(int(row["id"]))
+        other_rows.sort(key=queue_default_key)
+        orders = [orders_by_id[order_id] for order_id in queue_order_ids]
+        orders.extend(order_dict(db, row, reference_cache=norm_reference_cache) for row in other_rows)
         notifications = [dict(r) for r in db.execute("SELECT n.id,n.message,n.created_at,n.read_at,n.order_id,o.code AS order_code FROM notifications n LEFT JOIN orders o ON o.id=n.order_id WHERE n.user_id=? ORDER BY n.id DESC LIMIT 25", (user["id"],))]
         members = []
         if user["role"] in ("master", "manager"):
@@ -1892,7 +2606,7 @@ class AppHandler(BaseHTTPRequestHandler):
         my_rating = worker_rating(db,user["id"],rating_from,rating_to) if user["role"] == "worker" else None
         return self.send_json({"user": self.user_public(user), "orders": orders, "notifications": notifications,
                                "members": members, "free_workers": free_workers, "area_counts": area_counts, "recurring": recurring,
-                               "my_rating": my_rating, "constants": constants, "server_time": iso(), "synthetic": True})
+                               "my_rating": my_rating, "work_queues": work_queues, "constants": constants, "server_time": iso(), "synthetic": True})
 
     @staticmethod
     def add_presence(db: sqlite3.Connection, person: dict) -> None:
@@ -2104,19 +2818,90 @@ class AppHandler(BaseHTTPRequestHandler):
             return self.send_json({"item": dict(db.execute("SELECT * FROM equipment_downtime WHERE id=?", (downtime_id,)).fetchone()),
                                    "duplicate": False}, 201)
 
+    def reorder_work_queue(self, user: sqlite3.Row) -> None:
+        if user["role"] != "master":
+            raise ApiError(403, "Only the responsible master can change a work queue.")
+        body = self.read_json(500_000)
+        scope = body.get("scope")
+        expected = body.get("expected_revision")
+        order_ids = body.get("order_ids")
+        if not isinstance(scope, str) or not scope or len(scope) > 200:
+            raise ApiError(400, "A valid queue scope is required.")
+        if isinstance(expected, bool) or not isinstance(expected, int) or expected < 0:
+            raise ApiError(400, "expected_revision must be a non-negative integer.")
+        if not isinstance(order_ids, list) or len(order_ids) > 1000:
+            raise ApiError(400, "order_ids must be a list of up to 1000 orders.")
+        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in order_ids):
+            raise ApiError(400, "order_ids must contain positive integer IDs.")
+        if len(order_ids) != len(set(order_ids)):
+            raise ApiError(400, "Duplicate order IDs are not allowed.")
+        with connect(self.server.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(f"SELECT * FROM orders WHERE assigned_master_id=? AND status IN ({ACTIVE_QUEUE_SQL})",
+                              (user["id"],)).fetchall()
+            scope_rows = [row for row in rows if queue_scope_key(row) == scope]
+            if not scope_rows:
+                raise ApiError(404, "Queue is not assigned to this master or no longer active.")
+            state = db.execute("SELECT revision FROM manual_queue_state WHERE scope_key=?", (scope,)).fetchone()
+            current_revision = int(state["revision"]) if state else 0
+            if current_revision != expected:
+                raise ApiError(409, "The queue changed. Refresh it before reordering.")
+            actual_ids = {int(row["id"]) for row in scope_rows}
+            if len(order_ids) != len(scope_rows) or set(order_ids) != actual_ids:
+                raise ApiError(409, "The order list must contain every currently assigned active order in this queue exactly once.")
+            db.execute("INSERT OR IGNORE INTO manual_queue_state(scope_key,revision) VALUES (?,0)", (scope,))
+            changed = db.execute("UPDATE manual_queue_state SET revision=revision+1,updated_at=?,updated_by=? "
+                                 "WHERE scope_key=? AND revision=?", (iso(), user["id"], scope, expected)).rowcount
+            if changed != 1:
+                raise ApiError(409, "The queue changed. Refresh it before reordering.")
+            new_revision = expected + 1
+            db.execute("DELETE FROM manual_queue_items WHERE scope_key=?", (scope,))
+            db.executemany("INSERT INTO manual_queue_items(order_id,scope_key,position) VALUES (?,?,?)",
+                           [(order_id, scope, position) for position, order_id in enumerate(order_ids, 1)])
+            for position, order_id in enumerate(order_ids, 1):
+                audit(db, user["id"], order_id, "work_queue_reordered",
+                      {"scope": scope, "position": position, "revision": new_revision})
+            db.commit()
+        return self.send_json({"ok": True, "scope": scope, "revision": new_revision, "order_ids": order_ids})
+
     def create_order(self, user: sqlite3.Row) -> None:
         if user["role"] != "master": raise ApiError(403, "Новый наряд может выдать мастер")
-        body = self.read_json(30_000)
+        body = self.read_json(MAX_ORDER_CREATE_BYTES)
         title, description = str(body.get("title", "")).strip()[:160], str(body.get("description", "")).strip()[:3000]
         if len(title) < 4 or len(description) < 10: raise ApiError(400, "Добавьте название и описание неисправности")
         work_type = str(body.get("work_type", "unscheduled"))
         priority = str(body.get("priority", "normal"))
         if work_type not in ("planned", "unscheduled"): raise ApiError(400, "Выберите плановый или внеплановый тип")
         if priority not in PRIORITY_LABELS: raise ApiError(400, "Выберите один из четырёх приоритетов")
+        before_body = body.get("before_photo")
+        if "before_photo" in body and not isinstance(before_body, dict):
+            raise ApiError(400, "Фото должно быть передано объектом")
+        if "before_photos" in body and "before_photo" in body:
+            raise ApiError(400, "\u041f\u0435\u0440\u0435\u0434\u0430\u0439\u0442\u0435 \u0444\u043e\u0442\u043e \xab\u0434\u043e\xbb \u043e\u0434\u043d\u0438\u043c \u0441\u043f\u0438\u0441\u043a\u043e\u043c")
+        if "before_photos" in body:
+            before_photos = body["before_photos"]
+            if not isinstance(before_photos, list):
+                raise ApiError(400, "\u0424\u043e\u0442\u043e \xab\u0434\u043e\xbb \u0434\u043e\u043b\u0436\u043d\u044b \u0431\u044b\u0442\u044c \u0441\u043f\u0438\u0441\u043a\u043e\u043c")
+            if len(before_photos) > MAX_ORDER_PHOTOS:
+                raise ApiError(400, "\u0414\u043e\u043f\u0443\u0441\u0442\u0438\u043c\u043e \u043d\u0435 \u0431\u043e\u043b\u0435\u0435 \u043f\u044f\u0442\u0438 \u0444\u043e\u0442\u043e \xab\u0434\u043e\xbb")
+            if any(not isinstance(photo, dict) for photo in before_photos):
+                raise ApiError(400, "\u041a\u0430\u0436\u0434\u043e\u0435 \u0444\u043e\u0442\u043e \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u043e\u0431\u044a\u0435\u043a\u0442\u043e\u043c")
+        elif "before_photo" in body:
+            before_photos = [before_body]
+        else:
+            before_photos = []
         try: area_id, equipment_id = int(body.get("area_id")), int(body.get("equipment_id"))
         except (TypeError, ValueError): raise ApiError(400, "Выберите участок и оборудование")
         with connect(self.server.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
+            prepared_before = [prepare_photo(db, photo, "before") for photo in before_photos]
+            detect_batch_photo_duplicates(prepared_before)
+            if any(photo["duplicate"] for photo in prepared_before):
+                audit(db, user["id"], None, "order_create_duplicate_photos_rejected",
+                      {"phase": "before", "photo_count": len(prepared_before),
+                       "duplicate_count": sum(bool(photo["duplicate"]) for photo in prepared_before)})
+                db.commit()
+                return self.send_json({"error": "В наборе фото «до» есть точный или похожий дубль; наряд не создан, фото не сохранены."}, 409)
             equipment = db.execute("SELECT id FROM equipment WHERE id=? AND area_id=?", (equipment_id, area_id)).fetchone()
             if not equipment: raise ApiError(400, "Оборудование не относится к выбранному участку")
             brigade = str(body.get("brigade", "")).strip() or None
@@ -2147,14 +2932,24 @@ class AppHandler(BaseHTTPRequestHandler):
                 due_value = iso(utcnow()+timedelta(hours=hours))
             now = iso()
             code = f"NA-{utcnow():%y%m%d}-{secrets.token_hex(2).upper()}"
-            cur = db.execute("""INSERT INTO orders(code,title,description,work_type,priority,area_id,equipment_id,assigned_to,assigned_brigade,
-                           assigned_master_id,status,created_at,issued_at,due_at,complexity)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,'issued',?,?,?,?)""", (code,title,description,work_type,priority,area_id,equipment_id,worker["id"],brigade,user["id"],now,now,due_value,
-                             1.5 if priority in ("high","emergency") else 1.0))
-            order_id = cur.lastrowid
-            audit(db,user["id"],order_id,"issued",{"code":code,"work_type":work_type,"priority":priority,"assigned_brigade":brigade})
-            notify(db,targets,order_id,f"Новый наряд {code}: {title}")
-            db.commit()
+            stored_paths: list[Path] = []
+            try:
+                cur = db.execute("""INSERT INTO orders(code,title,description,work_type,priority,area_id,equipment_id,assigned_to,assigned_brigade,
+                               assigned_master_id,status,created_at,issued_at,due_at,complexity)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,'issued',?,?,?,?)""", (code,title,description,work_type,priority,area_id,equipment_id,worker["id"],brigade,user["id"],now,now,due_value,
+                                 1.5 if priority in ("high","emergency") else 1.0))
+                order_id = cur.lastrowid
+                for prepared in prepared_before:
+                    _, stored_path = store_photo(db, user["id"], order_id, prepared)
+                    stored_paths.append(stored_path)
+                audit(db,user["id"],order_id,"issued",{"code":code,"work_type":work_type,"priority":priority,"assigned_brigade":brigade,
+                     "before_photo_id":db.execute("SELECT id FROM photos WHERE order_id=? AND phase='before' ORDER BY id DESC LIMIT 1",(order_id,)).fetchone()[0] if prepared_before else None})
+                notify(db,targets,order_id,f"Новый наряд {code}: {title}")
+                db.commit()
+            except Exception:
+                for stored_path in stored_paths:
+                    stored_path.unlink(missing_ok=True)
+                raise
             return self.send_json({"order": order_dict(db,db.execute("SELECT * FROM orders WHERE id=?",(order_id,)).fetchone())},201)
 
     def reassign(self, user: sqlite3.Row, order_id: int) -> None:
@@ -2234,10 +3029,6 @@ class AppHandler(BaseHTTPRequestHandler):
                 raise ApiError(403, "Решение доступно только мастеру")
             if role == "manager":
                 raise ApiError(403, "Руководитель имеет доступ только для просмотра")
-            if action == "accept" and row["work_type"] == "unscheduled":
-                before_photo = db.execute("SELECT 1 FROM photos WHERE order_id=? AND phase='before' AND duplicate=0 LIMIT 1", (order_id,)).fetchone()
-                if not before_photo:
-                    raise ApiError(409, "До принятия внепланового наряда мастер должен приложить уникальное фото до работ")
             if action in ("reject", "pause", "request_rework", "cancel") and len(reason) < 4:
                 raise ApiError(400, "Укажите причину (не менее 4 символов)")
             payload: dict = {"from": status, "to": target}
@@ -2250,6 +3041,12 @@ class AppHandler(BaseHTTPRequestHandler):
             if action == "pause": updates["pause_reason"] = reason; payload["reason"] = reason
             if action == "start": updates["started_at"] = iso()
             if action == "complete":
+                raw_worker_comment = body.get("worker_completion_comment", "")
+                if not isinstance(raw_worker_comment, str):
+                    raise ApiError(400, "worker_completion_comment must be text")
+                if len(raw_worker_comment) > 1000:
+                    raise ApiError(400, "Комментарий исполнителя должен быть не длиннее 1000 символов")
+                worker_comment = raw_worker_comment.strip()
                 text_value = str(body.get("completion_text", "")).strip()[:8000]
                 hours = body.get("labor_hours")
                 try: hours = float(hours)
@@ -2269,7 +3066,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ApiError(400, "Нельзя одновременно указать расход материалов и подтвердить, что материалы не использовались")
                 if not material_values and not materials_not_used: raise ApiError(400, "Добавьте использованные материалы либо подтвердите, что материалы не использовались")
                 if len(text_value) < 20: raise ApiError(400, "Опишите выполненную работу и результат (не менее 20 символов)")
-                photo_rows = db.execute("SELECT COUNT(*) AS total,SUM(CASE WHEN duplicate=0 THEN 1 ELSE 0 END) AS unique_count FROM photos WHERE order_id=? AND phase='after'", (order_id,)).fetchone()
+                photo_rows = db.execute("SELECT COUNT(*) AS total,COUNT(*) AS unique_count FROM photos WHERE order_id=? AND phase='after' AND active=1", (order_id,)).fetchone()
                 material_ids = set()
                 for item in material_values:
                     try: material_id, quantity = int(item["material_id"]), float(item["quantity"])
@@ -2279,15 +3076,19 @@ class AppHandler(BaseHTTPRequestHandler):
                     if material_id in material_ids:
                         raise ApiError(400, "Материал указан повторно: объедините количество в одной строке")
                     material_ids.add(material_id)
-                updates.update({"completed_at": iso(), "labor_hours": hours, "fault_code_id": fault_id, "completion_text": text_value, "materials_not_used": int(materials_not_used)})
+                updates.update({"completed_at": iso(), "labor_hours": hours, "fault_code_id": fault_id,
+                                "completion_text": text_value, "worker_completion_comment": worker_comment,
+                                "materials_not_used": int(materials_not_used)})
                 db.execute("DELETE FROM order_materials WHERE order_id=?", (order_id,))
                 for item in material_values:
                     db.execute("INSERT INTO order_materials(order_id,material_id,quantity) VALUES (?,?,?)",
                                (order_id, int(item["material_id"]), float(item["quantity"])))
-                payload.update({"labor_hours": hours, "fault_code_id": fault_id, "materials_count": len(material_values), "materials_not_used": materials_not_used, "photos_count": photo_rows["unique_count"] or 0})
+                payload.update({"labor_hours": hours, "fault_code_id": fault_id, "materials_count": len(material_values),
+                                "materials_not_used": materials_not_used, "photos_count": photo_rows["unique_count"] or 0,
+                                "worker_completion_comment": worker_comment})
             if action == "ai_check":
                 text_value = row["completion_text"] or ""
-                photo_set = db.execute("SELECT duplicate,duplicate_type,perceptual_hash,metadata_json,uploaded_at FROM photos WHERE order_id=? AND phase='after'", (order_id,)).fetchall()
+                photo_set = db.execute("SELECT duplicate,duplicate_type,perceptual_hash,metadata_json,uploaded_at FROM photos WHERE order_id=? AND phase='after' AND active=1", (order_id,)).fetchall()
                 material_rows = db.execute("SELECT m.sku,m.name,m.unit,om.quantity FROM order_materials om JOIN materials m ON m.id=om.material_id WHERE om.order_id=?", (order_id,)).fetchall()
                 material_count = len(material_rows)
                 started = parse_time(row["started_at"]); due = parse_time(row["due_at"])
@@ -2336,7 +3137,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not row["labor_hours"] or row["labor_hours"] <= 0: issues.append("не указано время")
                 material_count = db.execute("SELECT COUNT(*) FROM order_materials WHERE order_id=?", (order_id,)).fetchone()[0]
                 if not material_count and not row["materials_not_used"]: issues.append("не подтверждены материалы")
-                photos = db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after' AND duplicate=0", (order_id,)).fetchone()[0]
+                photos = db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after' AND active=1 AND duplicate=0", (order_id,)).fetchone()[0]
                 if row["work_type"] == "unscheduled" and not photos: issues.append("для внепланового наряда нужно фото после выполнения")
                 ai_verdict = json.loads(row["ai_result"] or "{}").get("verdict")
                 if ai_verdict == "rework": issues.append("результат проверки требует доработки; мастер может направить наряд на доработку")
@@ -2348,6 +3149,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if action == "reissue":
                 updates.update({"issued_at": iso(), "due_at": iso(utcnow()+timedelta(minutes=180 if row["priority"] == "emergency" else 480)), "reject_reason": None, "cancelled_by_master": 0})
                 payload["reason"] = "Повторная выдача мастером"
+            if action == "request_rework" or (action == "ai_check" and target == "rework"):
+                reason_code = "master_requested_rework" if action == "request_rework" else "review_required_rework"
+                payload["superseded_after_photos"] = supersede_after_photos(db, user["id"], order_id, reason_code)
             sets = ",".join(f"{key}=?" for key in updates)
             payload["to"] = target
             db.execute(f"UPDATE orders SET {sets} WHERE id=?", [*updates.values(), order_id])
@@ -2356,84 +3160,57 @@ class AppHandler(BaseHTTPRequestHandler):
             msg = f"Наряд {row['code']}: {STATUS_LABELS[target]}"
             notify(db, {row["assigned_to"], row["assigned_master_id"]}, order_id, msg)
             db.commit()
+            cleanup_retired_photo_files(self.server.db_path, order_id=order_id, limit=16)
             fresh = db.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
             return self.send_json({"order": order_dict(db, fresh), "history": self.order_history(db, order_id, user)})
 
     def upload_photo(self, user: sqlite3.Row, order_id: int) -> None:
         body = self.read_json(6_000_000)
+        phase = body.get("phase", "after")
+        if not isinstance(phase, str) or phase not in ("before", "after"):
+            raise ApiError(400, "Фаза фото не распознана")
+        with connect(self.server.db_path) as db:
+            visible = get_visible_order(db, user, order_id)
+            if not visible: raise ApiError(404, "Наряд не найден")
+            can_worker_upload = phase == "after" and user["role"] == "worker" and visible["status"] in ("in_progress", "paused") and visible["assigned_to"] == user["id"]
+            can_master_upload = phase == "before" and user["role"] == "master" and visible["status"] in ("issued", "queued")
+            if not (can_worker_upload or can_master_upload):
+                raise ApiError(403, "Исполнитель добавляет фото в работе; мастер может добавить до пяти фото к выдаваемому наряду")
+        cleanup_retired_photo_files(self.server.db_path, order_id=order_id, limit=5000)
         with connect(self.server.db_path) as db:
             db.execute("BEGIN IMMEDIATE")
             row = get_visible_order(db, user, order_id)
             if not row: raise ApiError(404, "Наряд не найден")
-            phase = str(body.get("phase", "after"))
-            if phase not in ("before", "after"): raise ApiError(400,"Фаза фото не распознана")
             can_worker_upload = phase == "after" and user["role"] == "worker" and row["status"] in ("in_progress", "paused") and row["assigned_to"] == user["id"]
             can_master_upload = phase == "before" and user["role"] == "master" and row["status"] in ("issued", "queued")
             if not (can_worker_upload or can_master_upload):
                 raise ApiError(403, "Исполнитель добавляет фото в работе; мастер может добавить до пяти фото к выдаваемому наряду")
-            if db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase=?", (order_id,phase)).fetchone()[0] >= 5:
-                raise ApiError(400, "Можно приложить не более пяти фотографий каждой фазы: до и после")
-            data_url = str(body.get("data_url", ""))
-            match = re.fullmatch(r"data:(image/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)", data_url)
-            if not match: raise ApiError(400, "Поддерживаются JPEG, PNG и WebP")
-            mime, encoded = match.groups()
-            try: raw = base64.b64decode(encoded, validate=True)
-            except ValueError: raise ApiError(400, "Файл повреждён")
-            if not raw or len(raw) > 4_000_000: raise ApiError(413, "Максимальный размер фото — 4 МБ")
-            valid = (mime == "image/jpeg" and raw.startswith(b"\xff\xd8\xff")) or (mime == "image/png" and raw.startswith(b"\x89PNG\r\n\x1a\n")) or (mime == "image/webp" and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP")
-            if not valid: raise ApiError(400, "Тип изображения не совпадает с содержимым файла")
+            pending = db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND active=0 AND cleanup_pending=1", (order_id,)).fetchone()[0]
+            if pending:
+                raise ApiError(503, "Предыдущие заменённые фото ещё очищаются; повторите загрузку после завершения очистки")
+            prepared = prepare_photo(db, body, phase)
+            if prepared["duplicate"]:
+                audit(db, user["id"], order_id, "photo_duplicate_rejected",
+                      {"phase": phase, "duplicate_type": prepared["duplicate_type"]})
+                db.commit()
+                return self.send_json({"error": "Изображение распознано как точный или похожий дубль; файл не сохранён. Выберите другое фото."}, 409)
+            occupied = db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase=? AND active=1",
+                                  (order_id,phase)).fetchone()[0]
+            if occupied >= MAX_ORDER_PHOTOS:
+                audit(db, user["id"], order_id, "photo_limit_rejected", {"phase": phase, "active_count": occupied})
+                db.commit()
+                return self.send_json({"error": "Можно приложить не более пяти активных фото каждой фазы. Сначала завершите доработку или замену."}, 400)
+            photo_id, location = store_photo(db, user["id"], order_id, prepared)
             try:
-                inspected = inspect_image(raw, mime)
-            except ValueError as exc:
-                raise ApiError(400, str(exc))
-            digest = hashlib.sha256(raw).hexdigest()
-            exact_duplicate = bool(db.execute("SELECT id FROM photos WHERE sha256=? LIMIT 1", (digest,)).fetchone())
-            distances = [(hamming_distance(r[0], inspected["perceptual_hash"]), r[1]) for r in db.execute("SELECT perceptual_hash,color_signature FROM photos WHERE perceptual_hash IS NOT NULL")]
-            compatible_distances = []
-            for distance, old_color in distances:
-                if not old_color or not inspected["color_signature"]:
-                    continue
-                color_distance = sum(abs(int(a, 16) - int(b, 16)) for a, b in zip(old_color, inspected["color_signature"]))
-                if len(old_color) == len(inspected["color_signature"]) and color_distance <= 3:
-                    compatible_distances.append(distance)
-            nearest_distance = min(compatible_distances) if compatible_distances else None
-            similar_duplicate = not exact_duplicate and nearest_distance is not None and nearest_distance <= SIMILAR_HASH_DISTANCE
-            duplicate_type = "exact" if exact_duplicate else "similar" if similar_duplicate else "none"
-            duplicate = duplicate_type != "none"
-            if exact_duplicate:
-                inspected["verifiability_score"] = 1
-            elif similar_duplicate:
-                inspected["verifiability_score"] = 2
-            inspected.update({"exact_duplicate": exact_duplicate, "similar_duplicate": similar_duplicate,
-                              "nearest_hash_distance": nearest_distance,
-                              "similarity_rule": f"dHash 64-bit; Hamming distance <= {SIMILAR_HASH_DISTANCE}"})
-            ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[mime]
-            file_name = re.sub(r"[^A-Za-zА-Яа-яЁё0-9._ -]", "_", str(body.get("file_name", "photo"))[:100]).strip() or "photo"
-            stored_name = secrets.token_hex(16) + ext
-            media_root = MEDIA.resolve()
-            location = (media_root / stored_name).resolve()
-            if location.parent != media_root: raise ApiError(400, "Недопустимый путь хранения файла")
-            location.write_bytes(raw)
-            metadata = {"declared_type": mime, "bytes": len(raw), "sha256": digest,
-                        "upload_time_utc": iso(), "freshness_claim": "Не подтверждается: EXIF может отсутствовать или быть изменён; дата загрузки не является датой съёмки.",
-                        "client_compressed": bool(body.get("client_compressed")),
-                        "source_size_bytes_claim": body.get("source_size_bytes") if isinstance(body.get("source_size_bytes"), int) and 0 <= body.get("source_size_bytes") <= 50_000_000 else None,
-                        "source_media_type_claim": body.get("source_media_type") if body.get("source_media_type") in ("image/jpeg", "image/png", "image/webp") else None,
-                        "client_exif_transfer_succeeded_claim": body.get("exif_transfer_succeeded") is True,
-                        **inspected}
-            try:
-                cur = db.execute("INSERT INTO photos(order_id,file_name,phase,media_type,file_path,size_bytes,sha256,duplicate,duplicate_type,perceptual_hash,color_signature,uploaded_at,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                                 (order_id, file_name, phase, mime, str(location), len(raw), digest, int(duplicate), duplicate_type, inspected["perceptual_hash"], inspected["color_signature"], iso(), json.dumps(metadata, ensure_ascii=False)))
-                audit(db, user["id"], order_id, "photo_uploaded", {"photo_id": cur.lastrowid, "phase": phase, "duplicate": duplicate, "duplicate_type": duplicate_type, "bytes": len(raw), "client_compressed": bool(body.get("client_compressed")), "source_size_bytes_claim": metadata["source_size_bytes_claim"]})
                 db.commit()
             except Exception:
                 location.unlink(missing_ok=True)
                 raise
-            photo = db.execute("SELECT * FROM photos WHERE id=?", (cur.lastrowid,)).fetchone()
-            return self.send_json({"photo": {"id": photo["id"], "file_name": photo["file_name"], "duplicate": bool(duplicate),
-                                               "duplicate_type": duplicate_type, "verifiability_score": inspected["verifiability_score"],
-                                               "capture_datetime": inspected["capture_datetime"], "capture_time_status": inspected["capture_time_status"],
-                                               "size_bytes": len(raw), "uploaded_at": photo["uploaded_at"]}}, 201)
+            photo = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
+            return self.send_json({"photo": {"id": photo["id"], "file_name": photo["file_name"], "duplicate": bool(prepared["duplicate"]),
+                                               "duplicate_type": prepared["duplicate_type"], "verifiability_score": prepared["inspected"]["verifiability_score"],
+                                               "capture_datetime": prepared["inspected"]["capture_datetime"], "capture_time_status": prepared["inspected"]["capture_time_status"],
+                                               "size_bytes": len(prepared["raw"]), "uploaded_at": photo["uploaded_at"]}}, 201)
 
     def set_rating(self, user: sqlite3.Row, order_id: int) -> None:
         if user["role"] != "master": raise ApiError(403, "Оценку может менять только мастер")
@@ -2551,7 +3328,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
 def serve_photo(handler: AppHandler, user: sqlite3.Row, photo_id: int) -> None:
     with connect(handler.server.db_path) as db:
-        row = db.execute("SELECT p.*,o.assigned_to,o.assigned_master_id FROM photos p JOIN orders o ON o.id=p.order_id WHERE p.id=?", (photo_id,)).fetchone()
+        row = db.execute("SELECT p.*,o.assigned_to,o.assigned_master_id FROM photos p JOIN orders o ON o.id=p.order_id WHERE p.id=? AND p.active=1", (photo_id,)).fetchone()
         if not row or not get_visible_order(db, user, row["order_id"]):
             raise ApiError(404, "Фото не найдено")
         media_root = MEDIA.resolve()
@@ -2625,7 +3402,7 @@ def default_server_port() -> int:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Запуск локального MVP НарядAI")
+    parser = argparse.ArgumentParser(description="Запуск локального MVP НарядКонтроль")
     parser.add_argument("--host", default=default_server_host())
     parser.add_argument("--port", type=int, default=default_server_port())
     parser.add_argument("--db", default=str(DB_PATH))
@@ -2639,7 +3416,7 @@ def main() -> None:
     timer.start()
     telegram_worker = threading.Thread(target=telegram_delivery_loop,args=(server.db_path,stopped),daemon=True,name="naryadai-telegram")
     telegram_worker.start()
-    print(f"НарядAI доступен: http://{args.host}:{args.port}")
+    print(f"НарядКонтроль доступен: http://{args.host}:{args.port}")
     print("Демо-пароль для всех аккаунтов: demo123 · демоданные полностью синтетические")
     try: server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt: print("\nСервер остановлен")
