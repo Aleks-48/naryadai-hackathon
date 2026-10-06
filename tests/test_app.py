@@ -26,7 +26,8 @@ import server as app
 from PIL import Image, ImageDraw
 
 
-def make_photo(fmt="PNG", size=(96,96), capture_time=None, offset=None, background=(56,72,88)):
+def make_photo(fmt="PNG", size=(96,96), capture_time=None, offset=None, background=(56,72,88),
+               digitized_time=None, digitized_offset=None):
     image=Image.new("RGB",size,background)
     draw=ImageDraw.Draw(image)
     width,height=size
@@ -36,10 +37,13 @@ def make_photo(fmt="PNG", size=(96,96), capture_time=None, offset=None, backgrou
     if capture_time:
         exif[36867]=capture_time
         if offset: exif[36881]=offset
+    if digitized_time:
+        exif[36868]=digitized_time
+        if digitized_offset: exif[36882]=digitized_offset
     output=io.BytesIO()
     options={"format":fmt}
     if fmt=="JPEG": options["quality"]=88
-    if capture_time: options["exif"]=exif
+    if capture_time or digitized_time: options["exif"]=exif
     image.save(output,**options)
     return output.getvalue()
 
@@ -101,6 +105,14 @@ class Client:
 
 
 class RuntimeConfigurationTest(unittest.TestCase):
+    def test_digitized_capture_uses_its_own_exif_timezone_offset(self):
+        raw=make_photo("JPEG",digitized_time="2026:10:06 11:12:13",digitized_offset="+03:00",
+                       background=(87,166,214))
+        inspected=app.inspect_image(raw,"image/jpeg")
+        self.assertEqual(inspected["capture_datetime"],"2026-10-06T11:12:13+03:00")
+        self.assertEqual(inspected["capture_offset"],"+03:00")
+        self.assertEqual(inspected["capture_time_status"],"capture_time_present")
+
     def test_legacy_demo_work_type_migration_requires_provenance_and_never_rewrites_rows(self):
         with sqlite3.connect(":memory:") as db:
             db.row_factory=sqlite3.Row
@@ -261,23 +273,26 @@ class LocalAPITest(unittest.TestCase):
 
     def create_order(self, master: Client, worker_id: int | None = None, priority: str = "normal",
                      before_photo: bool = True) -> dict:
-        status, response = master.call("/api/orders", "POST", {
+        self.__class__._before_photo_counter = getattr(self.__class__, "_before_photo_counter", 0) + 1
+        serial = self.__class__._before_photo_counter
+        color = ((serial * 73) % 255, (serial * 127) % 255, (serial * 191) % 255)
+        image = make_before_photo(color)
+        payload = {
             "title": "Проверка насосного узла",
             "description": "Проверить вибрацию, закрепить узел и записать результат наблюдения.",
             "work_type": "unscheduled", "priority": priority, "area_id": self.area_id,
             "equipment_id": self.equipment_id, "worker_id": worker_id or self.worker_id,
             "norm_hours": 6,
-        })
+        }
+        if before_photo:
+            payload["before_photo"] = {"phase": "before", "file_name": f"before-{serial}.png",
+                "data_url": "data:image/png;base64," + base64.b64encode(image).decode()}
+        status, response = master.call("/api/orders", "POST", payload)
         self.assertEqual(status, 201, response)
         order = response["order"]
         if before_photo:
-            color = ((order["id"] * 37) % 255, (order["id"] * 79) % 255, (order["id"] * 131) % 255)
-            uploaded = self.upload(master, order["id"], make_before_photo(color), phase="before")
-            self.assertEqual(uploaded[0], 201, uploaded[1])
-            self.assertFalse(uploaded[1]["photo"]["duplicate"], uploaded[1])
-            detail_status,detail=master.call(f"/api/orders/{order['id']}")
-            self.assertEqual(detail_status,200,detail)
-            return detail["order"]
+            self.assertEqual(len([photo for photo in order["photos"] if photo["phase"] == "before"]), 1)
+            self.assertFalse(order["photos"][0]["duplicate"])
         return order
 
     def action(self, client: Client, order_id: int, action: str, **kwargs):
@@ -302,6 +317,152 @@ class LocalAPITest(unittest.TestCase):
         closed=self.action(master,oid,"close",closure_comment="Плановый результат проверен мастером.")
         self.assertEqual(closed[0],200,closed[1])
         return oid
+
+    def test_manual_queue_is_scoped_revisioned_and_independent_of_priority(self):
+        master = self.client("master01")
+        master_race = self.client("master01")
+        worker = self.client("worker01")
+        other_master = self.client("master02")
+        manager = self.client("manager")
+        first = self.create_order(master, priority="normal")
+        second = self.create_order(master, priority="high")
+        other_scope = self.create_order(master, worker_id=self.worker15_id)
+        with app.connect(self.db_path) as db:
+            first_row = db.execute("SELECT * FROM orders WHERE id=?", (first["id"],)).fetchone()
+            scope = app.queue_scope_key(first_row)
+            # This test specifically checks the deterministic fallback for an
+            # unpositioned queue; another test may already have saved this scope.
+            db.execute("DELETE FROM manual_queue_items WHERE scope_key=?", (scope,))
+            db.commit()
+        before = master.call("/api/bootstrap")[1]
+        queue = next(item for item in before["work_queues"] if item["scope"] == scope)
+        original = list(queue["order_ids"])
+        self.assertTrue({first["id"], second["id"]}.issubset(set(original)))
+        order_map = {item["id"]:item for item in before["orders"]}
+        self.assertEqual(original, sorted(original, key=lambda order_id: app.queue_default_key(order_map[order_id])))
+        self.assertNotEqual(next(item for item in before["orders"] if item["id"] == other_scope["id"])["queue_scope"], scope)
+        worker_queues = worker.call("/api/bootstrap")[1]["work_queues"]
+        self.assertEqual(next(item for item in worker_queues if item["scope"] == scope)["order_ids"], original)
+
+        body = {"scope": scope, "expected_revision": queue["revision"], "order_ids": list(reversed(original))}
+        self.assertEqual(worker.call("/api/work-queues/reorder", "POST", body)[0], 403)
+        self.assertEqual(manager.call("/api/work-queues/reorder", "POST", body)[0], 403)
+        self.assertEqual(other_master.call("/api/work-queues/reorder", "POST", body)[0], 404)
+        self.assertEqual(master.call("/api/work-queues/reorder", "POST", {**body, "order_ids": [original[0], original[0]]})[0], 400)
+        self.assertEqual(master.call("/api/work-queues/reorder", "POST", {**body, "order_ids": original[:-1]})[0], 409)
+        crossed = list(original); crossed[-1] = other_scope["id"]
+        self.assertEqual(master.call("/api/work-queues/reorder", "POST", {**body, "order_ids": crossed})[0], 409)
+
+        moved = master.call("/api/work-queues/reorder", "POST", body)
+        self.assertEqual(moved[0], 200, moved[1])
+        self.assertEqual(moved[1]["order_ids"], list(reversed(original)))
+        self.assertEqual(master.call("/api/work-queues/reorder", "POST", body)[0], 409, "stale duplicate click must be rejected")
+        visible = worker.call("/api/bootstrap")[1]
+        worker_queue = next(item for item in visible["work_queues"] if item["scope"] == scope)
+        self.assertEqual(worker_queue["order_ids"], list(reversed(original)))
+        refreshed = master.call("/api/bootstrap")[1]
+        latest = next(item for item in refreshed["work_queues"] if item["scope"] == scope)
+        self.assertEqual(latest["order_ids"], list(reversed(original)))
+        priority_by_id = {item["id"]: item["priority"] for item in refreshed["orders"]}
+        self.assertEqual(priority_by_id[first["id"]], "normal")
+        self.assertEqual(priority_by_id[second["id"]], "high")
+
+        # Two concurrent writes against the same revision: BEGIN IMMEDIATE + revision CAS allow one winner.
+        a, b = list(latest["order_ids"]), list(reversed(latest["order_ids"]))
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(client.call, "/api/work-queues/reorder", "POST",
+                                   {"scope": scope, "expected_revision": latest["revision"], "order_ids": ids})
+                       for client, ids in ((master, a), (master_race, b))]
+            race_results = [future.result(timeout=10)[0] for future in futures]
+        self.assertCountEqual(race_results, [200, 409])
+
+        current = master.call("/api/bootstrap")[1]
+        latest = next(item for item in current["work_queues"] if item["scope"] == scope)
+        reassigned = master.call(f"/api/orders/{first['id']}/assign", "POST", {"worker_id": self.worker15_id})
+        self.assertEqual(reassigned[0], 200, reassigned[1])
+        self.assertEqual(master.call("/api/work-queues/reorder", "POST", {"scope":scope,
+                         "expected_revision":latest["revision"],"order_ids":latest["order_ids"]})[0], 409,
+                         "assignment change invalidates in-flight queue snapshot")
+        detail = master.call(f"/api/orders/{first['id']}")[1]["order"]
+        self.assertEqual(detail["worker"]["id"], self.worker15_id)
+
+    def test_bootstrap_queue_snapshot_blocks_interleaved_reorder_and_stale_click_is_atomic(self):
+        master = self.client("master01")
+        bootstrap_client = self.client("master01")
+        order_a = self.create_order(master, priority="normal")
+        order_b = self.create_order(master, priority="high")
+        before = master.call("/api/bootstrap")[1]
+        target = next(item for item in before["orders"] if item["id"] == order_a["id"])
+        scope = target["queue_scope"]
+        initial_queue = next(item for item in before["work_queues"] if item["scope"] == scope)
+        rendered_ids = list(initial_queue["order_ids"])
+        rendered_revision = initial_queue["revision"]
+        self.assertTrue({order_a["id"], order_b["id"]}.issubset(set(rendered_ids)))
+        new_ids = list(reversed(rendered_ids))
+
+        positions_read = threading.Event()
+        release_snapshot = threading.Event()
+        writer_begin_seen = threading.Event()
+        hook_lock = threading.Lock()
+        blocked_once = {"value": False}
+        original_connect = app.connect
+
+        def instrumented_connect(path=app.DB_PATH):
+            db = original_connect(path)
+            if Path(path) == Path(self.db_path):
+                def trace(statement: str) -> None:
+                    normalized = " ".join(statement.upper().split())
+                    if "SELECT REVISION FROM MANUAL_QUEUE_STATE WHERE SCOPE_KEY=" in normalized:
+                        with hook_lock:
+                            should_block = not blocked_once["value"]
+                            if should_block:
+                                blocked_once["value"] = True
+                        if should_block:
+                            positions_read.set()
+                            if not release_snapshot.wait(10):
+                                raise RuntimeError("Timed out at bootstrap queue snapshot injection")
+                    elif positions_read.is_set() and normalized == "BEGIN IMMEDIATE":
+                        writer_begin_seen.set()
+                db.set_trace_callback(trace)
+            return db
+
+        read_result: dict[str, tuple[int, dict]] = {}
+        write_result: dict[str, tuple[int, dict]] = {}
+        with unittest.mock.patch.object(app, "connect", side_effect=instrumented_connect):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                read_future = pool.submit(lambda: read_result.setdefault("value", bootstrap_client.call("/api/bootstrap")))
+                self.assertTrue(positions_read.wait(5), "bootstrap did not reach the revision read after reading positions")
+                write_future = pool.submit(lambda: write_result.setdefault("value", master.call(
+                    "/api/work-queues/reorder", "POST", {"scope":scope,"expected_revision":rendered_revision,"order_ids":new_ids})))
+                self.assertTrue(writer_begin_seen.wait(5), "concurrent reorder did not reach its write transaction")
+                self.assertFalse(write_future.done(), "write must wait for the in-progress read snapshot")
+                release_snapshot.set()
+                read_future.result(timeout=10)
+                write_future.result(timeout=10)
+
+        snapshot = read_result["value"][1]
+        snapshot_queue = next(item for item in snapshot["work_queues"] if item["scope"] == scope)
+        self.assertEqual(snapshot_queue["order_ids"], rendered_ids)
+        self.assertEqual(snapshot_queue["revision"], rendered_revision)
+        self.assertEqual(write_result["value"][0], 200, write_result["value"][1])
+        current = master.call("/api/bootstrap")[1]
+        current_queue = next(item for item in current["work_queues"] if item["scope"] == scope)
+        self.assertEqual(current_queue["order_ids"], new_ids)
+        self.assertEqual(current_queue["revision"], rendered_revision + 1)
+
+        with app.connect(self.db_path) as db:
+            audited_before = db.execute("SELECT COUNT(*) FROM audit WHERE event='work_queue_reordered' AND order_id IN (" +
+                ",".join("?" for _ in rendered_ids) + ")", rendered_ids).fetchone()[0]
+        stale = master.call("/api/work-queues/reorder", "POST", {"scope":scope,
+            "expected_revision":snapshot_queue["revision"],"order_ids":list(reversed(snapshot_queue["order_ids"]))})
+        self.assertEqual(stale[0], 409, stale[1])
+        with app.connect(self.db_path) as db:
+            audited_after = db.execute("SELECT COUNT(*) FROM audit WHERE event='work_queue_reordered' AND order_id IN (" +
+                ",".join("?" for _ in rendered_ids) + ")", rendered_ids).fetchone()[0]
+        self.assertEqual(audited_after, audited_before, "stale request must not write queue positions or audit rows")
+        final = master.call("/api/bootstrap")[1]
+        final_queue = next(item for item in final["work_queues"] if item["scope"] == scope)
+        self.assertEqual(final_queue["order_ids"], new_ids)
 
     def test_full_workflow_permissions_ai_rework_and_photo_upload(self):
         master = self.client("master01")
@@ -354,8 +515,10 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(uploaded[0],201,uploaded[1])
         self.assertLess(upload_seconds,10)
         duplicate=worker.call(f"/api/orders/{order_id}/photos","POST",photo_payload)
-        self.assertEqual(duplicate[0],201,duplicate[1])
-        self.assertTrue(duplicate[1]["photo"]["duplicate"])
+        self.assertEqual(duplicate[0],409,duplicate[1])
+        with app.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after'",(order_id,)).fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_duplicate_rejected'",(order_id,)).fetchone()[0],1)
         report2=self.action(worker,order_id,"complete",completion_text=report,fault_code_id=self.fault_id,
                             labor_hours=1.5,materials=[],materials_not_used=True)
         self.assertEqual(report2[0],200,report2[1])
@@ -390,29 +553,418 @@ class LocalAPITest(unittest.TestCase):
         self.assertGreaterEqual(upload_seconds,0)
         print(f"\nMeasured local upload request: {upload_seconds:.3f}s (limit 10s)")
 
-    def test_unscheduled_acceptance_waits_for_unique_master_photo(self):
+    def test_unscheduled_acceptance_does_not_require_a_unique_before_photo(self):
         master=self.client("master01");worker=self.client("worker01");manager=self.client("manager")
-        order=self.create_order(master,before_photo=False);oid=order["id"]
+        order=self.create_order(master);oid=order["id"]
+        with app.connect(self.db_path) as db:
+            before_id=db.execute("SELECT id FROM photos WHERE order_id=? AND phase='before'",(oid,)).fetchone()[0]
+            db.execute("UPDATE photos SET duplicate=1 WHERE id=?",(before_id,))
         self.assertEqual(manager.call(f"/api/orders/{oid}/action","POST",{"action":"accept"})[0],403)
         status,response=self.action(worker,oid,"accept")
-        self.assertEqual(status,409,response)
-        self.assertEqual(worker.call(f"/api/orders/{oid}")[1]["order"]["status"],"issued")
-        self.assertEqual(self.action(worker,oid,"queue")[1]["order"]["status"],"queued")
-        status,_=self.action(worker,oid,"accept")
-        self.assertEqual(status,409)
-        self.assertEqual(worker.call(f"/api/orders/{oid}")[1]["order"]["status"],"queued")
-
-        uploaded=self.upload(master,oid,make_photo(background=(31,117,209)),phase="before",name="before-first.png")
-        self.assertEqual(uploaded[0],201,uploaded[1])
-        self.assertFalse(uploaded[1]["photo"]["duplicate"])
-        with app.connect(self.db_path) as db:
-            db.execute("UPDATE photos SET duplicate=1 WHERE id=?",(uploaded[1]["photo"]["id"],))
-        self.assertEqual(self.action(worker,oid,"accept")[0],409)
-        repaired=self.upload(master,oid,make_photo(background=(238,41,79)),phase="before",name="before-repair.png")
-        self.assertEqual(repaired[0],201,repaired[1])
-        self.assertFalse(repaired[1]["photo"]["duplicate"])
-        self.assertEqual(self.action(worker,oid,"accept")[1]["order"]["status"],"accepted")
+        self.assertEqual(status,200,response)
+        self.assertEqual(response["order"]["status"],"accepted")
         self.assertEqual(self.upload(master,oid,make_photo(background=(15,225,60)),phase="before")[0],403)
+
+    def test_invalid_or_failed_unscheduled_issue_leaves_no_order_or_file(self):
+        master=self.client("master01")
+        def counts():
+            with app.connect(self.db_path) as db:
+                return tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                             for table in ("orders","photos","audit","notifications"))
+        def files():
+            return {path.name for path in app.MEDIA.glob("*") if path.is_file()}
+        payload={"title":"Проверка насоса","description":"Проверить крепления и описать наблюдаемый результат.",
+                 "work_type":"unscheduled","priority":"normal","area_id":self.area_id,
+                 "equipment_id":self.equipment_id,"worker_id":self.worker_id,"norm_hours":6}
+        before=counts();existing_files=files()
+        invalid={**payload,"before_photo":{"file_name":"bad.png","data_url":"data:image/png;base64,"+
+            base64.b64encode(b"not an image").decode()}}
+        self.assertEqual(master.call("/api/orders","POST",invalid)[0],400)
+        self.assertEqual(counts(),before)
+        self.assertEqual(files(),existing_files)
+
+        raw=make_before_photo((8,167,211))
+        invalid_batch={**payload,"before_photos":[
+            {"file_name":"batch-valid-first.png","data_url":"data:image/png;base64,"+base64.b64encode(raw).decode()},
+            {"file_name":"batch-invalid-second.png","data_url":"data:image/png;base64,"+base64.b64encode(b"not an image").decode()},
+        ]}
+        self.assertEqual(master.call("/api/orders","POST",invalid_batch)[0],400)
+        self.assertEqual(counts(),before)
+        self.assertEqual(files(),existing_files)
+
+        raw=make_before_photo((11,203,87))
+        valid={**payload,"before_photo":{"file_name":"before-duplicate-check.png",
+            "data_url":"data:image/png;base64,"+base64.b64encode(raw).decode()}}
+        created=master.call("/api/orders","POST",valid)
+        self.assertEqual(created[0],201,created[1])
+        after_create=counts();files_after_create=files()
+        duplicate=master.call("/api/orders","POST",valid)
+        self.assertEqual(duplicate[0],409,duplicate[1])
+        after_duplicate=counts()
+        self.assertEqual(after_duplicate,(after_create[0],after_create[1],after_create[2]+1,after_create[3]))
+        self.assertEqual(files(),files_after_create)
+
+        raw=make_before_photo((190,20,155))
+        valid={**payload,"before_photo":{"file_name":"before-failed-commit.png",
+            "data_url":"data:image/png;base64,"+base64.b64encode(raw).decode()}}
+        with unittest.mock.patch.object(app,"notify",side_effect=RuntimeError("simulated notification failure")):
+            failed=master.call("/api/orders","POST",valid)
+        self.assertEqual(failed[0],500,failed[1])
+        self.assertEqual(counts(),after_duplicate)
+        self.assertEqual(files(),files_after_create)
+
+        audit_failure={**payload,"before_photos":[]}
+        for index,color in enumerate(((27,204,116),(205,41,153))):
+            raw=make_before_photo(color)
+            audit_failure["before_photos"].append({"file_name":f"audit-batch-{index}.png",
+                "data_url":"data:image/png;base64,"+base64.b64encode(raw).decode()})
+        with unittest.mock.patch.object(app,"audit",side_effect=[None,RuntimeError("simulated second photo audit failure")]):
+            failed=master.call("/api/orders","POST",audit_failure)
+        self.assertEqual(failed[0],500,failed[1])
+        self.assertEqual(counts(),after_duplicate)
+        self.assertEqual(files(),files_after_create)
+
+    def test_before_photo_batch_size_and_work_type_matrix(self):
+        master=self.client("master01")
+        def snapshot():
+            with app.connect(self.db_path) as db:
+                return tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                             for table in ("orders","photos","audit","notifications"))
+        def files():
+            return {path.name for path in app.MEDIA.glob("*") if path.is_file()}
+        serial=time.time_ns()
+        for work_type in ("planned","unscheduled"):
+            for count in (0,1,5,6):
+                title=f"Photo batch {work_type} {count} {serial}"
+                body={"title":title,"description":"Inspect synthetic equipment and record the observed result.",
+                      "work_type":work_type,"priority":"planned" if work_type=="planned" else "normal",
+                      "area_id":self.area_id,"equipment_id":self.equipment_id,"worker_id":self.worker_id,"norm_hours":6}
+                if count or work_type=="planned":
+                    photos=[]
+                    for index in range(count):
+                        seed=serial+index+count*17+(1000 if work_type=="planned" else 0)
+                        color=(seed%256,(seed//256)%256,(seed//65536)%256)
+                        raw=make_before_photo(color)
+                        photos.append({"file_name":f"before-{index}.png",
+                            "data_url":"data:image/png;base64,"+base64.b64encode(raw).decode()})
+                    body["before_photos"]=photos
+                before_counts,before_files=snapshot(),files()
+                status,response=master.call("/api/orders","POST",body)
+                if count<=5:
+                    self.assertEqual(status,201,response)
+                    order=response["order"]
+                    self.assertEqual(len([photo for photo in order["photos"] if photo["phase"]=="before"]),count)
+                    with app.connect(self.db_path) as db:
+                        self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_uploaded'",
+                                                    (order["id"],)).fetchone()[0],count)
+                else:
+                    self.assertEqual(status,400,response)
+                    self.assertEqual(snapshot(),before_counts)
+                    self.assertEqual(files(),before_files)
+
+    def test_concurrent_duplicate_attempts_are_rejected_and_rework_replaces_evidence(self):
+        master=self.client("master01")
+        workers=[self.client("worker01") for _ in range(10)]
+        order=self.create_order(master,before_photo=False);oid=order["id"]
+        self.assertEqual(self.action(workers[0],oid,"accept")[0],200)
+        self.assertEqual(self.action(workers[0],oid,"start")[0],200)
+        raw=make_before_photo((61,174,229))
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            results=list(pool.map(lambda worker:self.upload(worker,oid,raw,name="parallel-same.png"),workers))
+        statuses=[status for status,_ in results]
+        self.assertCountEqual(statuses,[201]+[409]*9,results)
+        winner=next(response for status,response in results if status==201)
+        stored_id=winner["photo"]["id"]
+        with app.connect(self.db_path) as db:
+            stored=db.execute("SELECT file_path FROM photos WHERE id=?",(stored_id,)).fetchone()
+            stored_path=Path(stored["file_path"])
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after'",(oid,)).fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after' AND active=1",(oid,)).fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_uploaded'",(oid,)).fetchone()[0],1)
+            rejected=db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='photo_duplicate_rejected'",(oid,)).fetchall()
+            self.assertEqual(len(rejected),9)
+            for row in rejected:
+                self.assertEqual(set(json.loads(row[0])),{"phase","duplicate_type"})
+        self.assertTrue(stored_path.is_file())
+        media_before_failure=set(app.MEDIA.iterdir())
+        with unittest.mock.patch.object(app,"audit",side_effect=RuntimeError("audit unavailable")):
+            failed=self.upload(workers[0],oid,raw,name="not-persisted.png")
+        self.assertEqual(failed[0],500)
+        self.assertEqual(set(app.MEDIA.iterdir()),media_before_failure)
+        with app.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after'",(oid,)).fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_duplicate_rejected'",(oid,)).fetchone()[0],9)
+
+        report="Заменили изношенный узел и описали проверку результата; работа выполнена."
+        completed=self.action(workers[0],oid,"complete",completion_text=report,fault_code_id=self.fault_id,
+                               labor_hours=1.5,materials=[],materials_not_used=True)
+        self.assertEqual(completed[0],200,completed[1])
+        self.assertEqual(self.action(workers[0],oid,"ai_check")[1]["order"]["status"],"ai_review")
+        with unittest.mock.patch.object(app,"audit",side_effect=[None,RuntimeError("action audit unavailable")]):
+            rolled_back=self.action(master,oid,"request_rework",reason="Заменить фото после выполнения")
+        self.assertEqual(rolled_back[0],500)
+        self.assertTrue(stored_path.is_file(),"rollback must keep the previous active media file")
+        with app.connect(self.db_path) as db:
+            state=db.execute("SELECT status FROM orders WHERE id=?",(oid,)).fetchone()[0]
+            photo=db.execute("SELECT active,cleanup_pending FROM photos WHERE id=?",(stored_id,)).fetchone()
+            self.assertEqual(state,"ai_review")
+            self.assertEqual(tuple(photo),(1,0))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_superseded'",(oid,)).fetchone()[0],0)
+
+        returned=self.action(master,oid,"request_rework",reason="Заменить фото после выполнения")
+        self.assertEqual(returned[0],200,returned[1])
+        self.assertEqual(returned[1]["order"]["status"],"rework")
+        self.assertFalse(stored_path.exists())
+        self.assertEqual(self.action(workers[0],oid,"start")[1]["order"]["status"],"in_progress")
+        replacement=self.upload(workers[0],oid,make_before_photo((217,33,108)),name="replacement.png")
+        self.assertEqual(replacement[0],201,replacement[1])
+        with app.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=?",(oid,)).fetchone()[0],2)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND active=1",(oid,)).fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_duplicate_rejected'",(oid,)).fetchone()[0],9)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_superseded'",(oid,)).fetchone()[0],1)
+        completed=self.action(workers[0],oid,"complete",completion_text=report,fault_code_id=self.fault_id,
+                               labor_hours=1.5,materials=[],materials_not_used=True)
+        self.assertEqual(completed[0],200,completed[1])
+        self.assertEqual(self.action(workers[0],oid,"ai_check")[1]["order"]["status"],"ai_review")
+        closed=self.action(master,oid,"close",closure_comment="Мастер проверил заменённое фото и отчёт.")
+        self.assertEqual(closed[0],200,closed[1])
+        self.assertEqual(closed[1]["order"]["status"],"closed")
+
+    def test_legacy_duplicate_rows_are_audited_retired_and_reworkable(self):
+        master=self.client("master01");worker=self.client("worker01")
+        order=self.create_order(master,before_photo=False);oid=order["id"]
+        self.assertEqual(self.action(worker,oid,"accept")[0],200)
+        self.assertEqual(self.action(worker,oid,"start")[0],200)
+        original=make_before_photo((25,170,220))
+        self.assertEqual(self.upload(worker,oid,original,name="legacy-unique.png")[0],201)
+        encoded="data:image/png;base64,"+base64.b64encode(original).decode()
+        duplicate_paths=[]
+        with app.connect(self.db_path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            for index in range(5):
+                prepared=app.prepare_photo(db,{"file_name":f"legacy-duplicate-{index}.png","data_url":encoded},"after")
+                self.assertTrue(prepared["duplicate"])
+                photo_id,path=app.store_photo(db,self.worker_id,oid,prepared)
+                db.execute("UPDATE photos SET duplicate=1,duplicate_type='exact' WHERE id=?",(photo_id,))
+                duplicate_paths.append(path)
+            db.commit()
+        self.assertTrue(all(path.is_file() for path in duplicate_paths))
+        app.init_db(self.db_path)
+        with app.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=?",(oid,)).fetchone()[0],6)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND active=1",(oid,)).fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND active=0 AND cleanup_pending=0",(oid,)).fetchone()[0],5)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_uploaded'",(oid,)).fetchone()[0],6)
+            retired=db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='photo_legacy_duplicate_retired'",(oid,)).fetchall()
+            self.assertEqual(len(retired),5)
+            self.assertTrue(all(set(json.loads(row[0]))=={"photo_id","phase","duplicate_type"} for row in retired))
+        self.assertTrue(all(not path.exists() for path in duplicate_paths))
+        detail=master.call(f"/api/orders/{oid}")[1]["order"]
+        self.assertEqual(len([photo for photo in detail["photos"] if photo["phase"]=="after"]),1)
+        report="Заменили узел и проверили результат после ремонта; работа выполнена."
+        self.assertEqual(self.action(worker,oid,"complete",completion_text=report,fault_code_id=self.fault_id,
+                                     labor_hours=1.5,materials=[],materials_not_used=True)[0],200)
+        self.assertEqual(self.action(worker,oid,"ai_check")[1]["order"]["status"],"ai_review")
+        self.assertEqual(self.action(master,oid,"request_rework",reason="Тест восстановления старых дублей")[0],200)
+        self.assertEqual(self.action(worker,oid,"start")[0],200)
+        replacement=self.upload(worker,oid,make_before_photo((210,35,105)),name="legacy-replacement.png")
+        self.assertEqual(replacement[0],201,replacement[1])
+        self.assertEqual(self.action(worker,oid,"complete",completion_text=report,fault_code_id=self.fault_id,
+                                     labor_hours=1.5,materials=[],materials_not_used=True)[0],200)
+        self.assertEqual(self.action(worker,oid,"ai_check")[1]["order"]["status"],"ai_review")
+        closed=self.action(master,oid,"close",closure_comment="Принято после новой фотографии.")
+        self.assertEqual(closed[0],200,closed[1])
+        with app.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_uploaded'",(oid,)).fetchone()[0],7)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_legacy_duplicate_retired'",(oid,)).fetchone()[0],5)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_superseded'",(oid,)).fetchone()[0],1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='close'",(oid,)).fetchone()[0],1)
+
+    def test_stale_five_photo_slots_are_superseded_before_fresh_rework_upload(self):
+        master=self.client("master01");worker=self.client("worker01")
+        order=self.create_order(master,before_photo=False);oid=order["id"]
+        self.assertEqual(self.action(worker,oid,"accept")[0],200)
+        self.assertEqual(self.action(worker,oid,"start")[0],200)
+        colors=[(250,20,20),(20,250,20),(20,20,250),(240,240,20),(230,20,230),(15,220,235)]
+        stale="2000:01:01 00:00:00"
+        old_paths=[]
+        for index,color in enumerate(colors[:5]):
+            patterned=Image.open(io.BytesIO(make_before_photo(color))).convert("RGB")
+            exif=Image.Exif(); exif[36867]=stale; exif[36881]="+00:00"
+            encoded=io.BytesIO(); patterned.save(encoded,format="JPEG",quality=88,exif=exif)
+            response=self.upload(worker,oid,encoded.getvalue(),
+                                 "image/jpeg",f"stale-{index}.jpg")
+            self.assertEqual(response[0],201,response[1])
+            with app.connect(self.db_path) as db:
+                old_paths.append(Path(db.execute("SELECT file_path FROM photos WHERE id=?",(response[1]["photo"]["id"],)).fetchone()[0]))
+        patterned=Image.open(io.BytesIO(make_before_photo(colors[5]))).convert("RGB")
+        exif=Image.Exif(); exif[36867]=stale; exif[36881]="+00:00"
+        encoded=io.BytesIO(); patterned.save(encoded,format="JPEG",quality=88,exif=exif)
+        extra=self.upload(worker,oid,encoded.getvalue(),"image/jpeg","sixth-stale.jpg")
+        self.assertEqual(extra[0],400,extra[1])
+        with app.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after' AND active=1",(oid,)).fetchone()[0],5)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_limit_rejected'",(oid,)).fetchone()[0],1)
+        report="Заменили узел оборудования и проверили работу; дефект устранён, результат стабилен."
+        self.assertEqual(self.action(worker,oid,"complete",completion_text=report,fault_code_id=self.fault_id,
+                                     labor_hours=1.5,materials=[],materials_not_used=True)[0],200)
+        review=self.action(worker,oid,"ai_check")
+        self.assertEqual(review[1]["order"]["status"],"ai_review")
+        self.assertTrue(review[1]["order"]["ai_result"])
+        self.assertEqual(self.action(master,oid,"request_rework",reason="Нужны актуальные фотографии результата")[0],200)
+        self.assertTrue(all(not path.exists() for path in old_paths))
+        self.assertEqual(self.upload(worker,oid,make_photo("JPEG",capture_time=stale,offset="+00:00",background=(11,90,220)),
+                                     "image/jpeg","before-restart.jpg")[0],403)
+        self.assertEqual(self.upload(master,oid,make_photo(),"image/png","wrong-role.png")[0],403)
+        self.assertEqual(self.action(worker,oid,"start")[1]["order"]["status"],"in_progress")
+        captured=app.utcnow().strftime("%Y:%m:%d %H:%M:%S")
+        fresh=self.upload(worker,oid,make_photo("JPEG",capture_time=captured,offset="+00:00",background=(10,220,90)),
+                          "image/jpeg","fresh-replacement.jpg")
+        self.assertEqual(fresh[0],201,fresh[1])
+        self.assertEqual(self.action(worker,oid,"complete",completion_text=report,fault_code_id=self.fault_id,
+                                     labor_hours=1.5,materials=[],materials_not_used=True)[0],200)
+        reviewed=self.action(worker,oid,"ai_check")
+        self.assertEqual(reviewed[1]["order"]["status"],"ai_review")
+        fresh_check=reviewed[1]["order"]["ai_result"]
+        self.assertNotIn("отличается от исполнения",fresh_check)
+        closed=self.action(master,oid,"close",closure_comment="Мастер принял новый отчёт и фото.")
+        self.assertEqual(closed[0],200,closed[1])
+        self.assertEqual(closed[1]["order"]["status"],"closed")
+        with app.connect(self.db_path) as db:
+            active=db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND active=1",(oid,)).fetchone()[0]
+            self.assertEqual(active,1)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND active=0 AND cleanup_pending=0",(oid,)).fetchone()[0],5)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_superseded'",(oid,)).fetchone()[0],5)
+
+    def test_duplicate_before_creation_is_audited_without_partial_order_or_media(self):
+        master=self.client("master01")
+        serial=time.time_ns(); raw=make_before_photo(((serial*19)%256,(serial*43)%256,(serial*71)%256))
+        photo={"file_name":"same-before.png","data_url":"data:image/png;base64,"+base64.b64encode(raw).decode()}
+        body={"title":f"Duplicate before {serial}","description":"Inspect synthetic equipment and record the observed result.",
+              "work_type":"unscheduled","priority":"normal","area_id":self.area_id,"equipment_id":self.equipment_id,
+              "worker_id":self.worker_id,"norm_hours":6,"before_photos":[photo,dict(photo)]}
+        def snapshot():
+            with app.connect(self.db_path) as db:
+                return tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] for table in ("orders","photos","notifications"))
+        before=snapshot(); media_before=set(app.MEDIA.iterdir())
+        with unittest.mock.patch.object(app,"audit",side_effect=RuntimeError("audit unavailable")):
+            rolled_back=master.call("/api/orders","POST",body)
+        self.assertEqual(rolled_back[0],500)
+        self.assertEqual(snapshot(),before)
+        self.assertEqual(set(app.MEDIA.iterdir()),media_before)
+        rejected=master.call("/api/orders","POST",body)
+        self.assertEqual(rejected[0],409,rejected[1])
+        self.assertEqual(snapshot(),before)
+        self.assertEqual(set(app.MEDIA.iterdir()),media_before)
+        with app.connect(self.db_path) as db:
+            rows=db.execute("SELECT payload_json FROM audit WHERE event='order_create_duplicate_photos_rejected' AND actor_id=? ORDER BY id DESC LIMIT 1",
+                            (db.execute("SELECT id FROM users WHERE username='master01'").fetchone()[0],)).fetchall()
+            self.assertEqual(len(rows),1)
+            self.assertEqual(json.loads(rows[0][0]),{"phase":"before","photo_count":2,"duplicate_count":1})
+
+
+    def test_eight_concurrent_photo_uploads_stop_at_five_unique_with_matching_audit(self):
+        master=self.client("master01")
+        workers=[self.client("worker01") for _ in range(8)]
+        order=self.create_order(master,before_photo=False);oid=order["id"]
+        self.assertEqual(self.action(workers[0],oid,"accept")[0],200)
+        self.assertEqual(self.action(workers[0],oid,"start")[0],200)
+        media_before=set(app.MEDIA.iterdir())
+        colors=[(255,0,0),(0,255,0),(0,0,255),(255,255,0),
+                (255,0,255),(0,255,255),(13,27,41),(242,228,214)]
+        payloads=[make_before_photo(color) for color in colors]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results=list(pool.map(lambda args:self.upload(args[0],oid,args[1],name=f"parallel-{args[2]}.png"),
+                                  [(workers[i],payloads[i],i) for i in range(8)]))
+        statuses=[status for status,_ in results]
+        self.assertCountEqual(statuses,[201]*5+[400]*3,results)
+        with app.connect(self.db_path) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after'",(oid,)).fetchone()[0],5)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM photos WHERE order_id=? AND phase='after' AND duplicate=0",(oid,)).fetchone()[0],5)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_uploaded'",(oid,)).fetchone()[0],5)
+        self.assertEqual(len(set(app.MEDIA.iterdir())-media_before),5)
+
+    def test_before_photos_are_optional_for_both_work_types_and_acceptance(self):
+        master=self.client("master01");worker=self.client("worker01")
+        unscheduled=self.create_order(master,before_photo=False)
+        self.assertFalse(any(photo["phase"]=="before" for photo in unscheduled["photos"]))
+        accepted=self.action(worker,unscheduled["id"],"accept")
+        self.assertEqual(accepted[0],200,accepted[1])
+        self.assertEqual(accepted[1]["order"]["status"],"accepted")
+
+        raw=make_before_photo((20,170,220))
+        planned_payload={"title":"\u041f\u043b\u0430\u043d\u043e\u0432\u044b\u0439 \u043e\u0441\u043c\u043e\u0442\u0440 \u0443\u0437\u043b\u0430",
+            "description":"\u041f\u0440\u043e\u0432\u0435\u0440\u0438\u0442\u044c \u043a\u0440\u0435\u043f\u043b\u0435\u043d\u0438\u044f \u0438 \u0437\u0430\u043f\u0438\u0441\u0430\u0442\u044c \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442 \u043d\u0430\u0431\u043b\u044e\u0434\u0435\u043d\u0438\u044f.",
+            "work_type":"planned","priority":"normal","area_id":self.area_id,
+            "equipment_id":self.equipment_id,"worker_id":self.worker_id,"norm_hours":6,
+            "before_photo":{"file_name":"optional-planned-before.png",
+                "data_url":"data:image/png;base64,"+base64.b64encode(raw).decode()}}
+        status,created=master.call("/api/orders","POST",planned_payload)
+        self.assertEqual(status,201,created)
+        self.assertEqual([photo["phase"] for photo in created["order"]["photos"]],["before"])
+
+    def test_worker_completion_comment_is_optional_strict_and_audited_separately(self):
+        master=self.client("master01");worker=self.client("worker01")
+        response=master.call("/api/orders","POST",{"title":"Плановый осмотр узла",
+            "description":"Плановая проверка креплений и фиксация результата.","work_type":"planned",
+            "priority":"planned","area_id":self.area_id,"equipment_id":self.equipment_id,
+            "worker_id":self.worker_id,"norm_hours":8})
+        self.assertEqual(response[0],201,response[1]);oid=response[1]["order"]["id"]
+        self.assertEqual(self.action(worker,oid,"accept")[0],200)
+        self.assertEqual(self.action(worker,oid,"start")[0],200)
+        report="Выполнена проверка крепления и регулировка; работа стабильна, отклонений не обнаружено."
+        complete={"completion_text":report,"fault_code_id":self.fault_id,"labor_hours":1.25,
+                  "materials":[],"materials_not_used":True}
+        with app.connect(self.db_path) as db:
+            complete_audits=db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='complete'",(oid,)).fetchone()[0]
+            material_rows=db.execute("SELECT COUNT(*) FROM order_materials WHERE order_id=?",(oid,)).fetchone()[0]
+        for bad_value in (12,None,"x"*1001):
+            status,_=self.action(worker,oid,"complete",**{**complete,"worker_completion_comment":bad_value})
+            self.assertEqual(status,400)
+            self.assertEqual(worker.call(f"/api/orders/{oid}")[1]["order"]["status"],"in_progress")
+            with app.connect(self.db_path) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='complete'",(oid,)).fetchone()[0],complete_audits)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM order_materials WHERE order_id=?",(oid,)).fetchone()[0],material_rows)
+
+        completed=self.action(worker,oid,"complete",**complete,worker_completion_comment="")
+        self.assertEqual(completed[0],200,completed[1])
+        self.assertEqual(completed[1]["order"]["worker_completion_comment"],"")
+        self.assertEqual(self.action(worker,oid,"ai_check")[1]["order"]["status"],"ai_review")
+        closed=self.action(master,oid,"close",closure_comment="Проверено мастером; итог принят.")
+        self.assertEqual(closed[0],200,closed[1])
+        with app.connect(self.db_path) as db:
+            completion_payload=json.loads(db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='complete' ORDER BY id DESC LIMIT 1",(oid,)).fetchone()[0])
+            closure_payload=json.loads(db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='close' ORDER BY id DESC LIMIT 1",(oid,)).fetchone()[0])
+            stored=db.execute("SELECT worker_completion_comment FROM orders WHERE id=?",(oid,)).fetchone()[0]
+        self.assertEqual(completion_payload["worker_completion_comment"],"")
+        self.assertEqual(closure_payload["closure_comment"],"Проверено мастером; итог принят.")
+        self.assertNotIn("worker_completion_comment",closure_payload)
+        self.assertEqual(stored,"")
+
+    def test_legacy_order_schema_adds_nullable_worker_comment(self):
+        with tempfile.TemporaryDirectory(prefix="naryadai-legacy-") as directory:
+            root=Path(directory);path=root/"legacy.sqlite3"
+            with unittest.mock.patch.object(app,"MEDIA",root/"media"):
+                app.init_db(path)
+                with app.connect(path) as db:
+                    existing=db.execute("SELECT id FROM orders ORDER BY id LIMIT 1").fetchone()[0]
+                    before=db.execute("SELECT code,title,status FROM orders WHERE id=?",(existing,)).fetchone()
+                    db.execute("ALTER TABLE orders DROP COLUMN worker_completion_comment")
+                    for trigger in db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'manual_queue_order_%'").fetchall():
+                        db.execute(f"DROP TRIGGER {trigger[0]}")
+                    db.execute("DROP TABLE manual_queue_items")
+                    db.execute("DROP TABLE manual_queue_state")
+                app.init_db(path)
+                with app.connect(path) as db:
+                    columns={row[1] for row in db.execute("PRAGMA table_info(orders)")}
+                    value=db.execute("SELECT worker_completion_comment FROM orders WHERE id=?",(existing,)).fetchone()[0]
+                    after=db.execute("SELECT code,title,status FROM orders WHERE id=?",(existing,)).fetchone()
+                    queue_tables={row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertIn("worker_completion_comment",columns)
+            self.assertIsNone(value)
+            self.assertEqual(tuple(before),tuple(after))
+            self.assertTrue({"manual_queue_state","manual_queue_items"}.issubset(queue_tables))
 
     def test_historical_seeded_planned_work_types_match_only_fourth_pattern(self):
         with app.connect(self.db_path) as db:
@@ -482,16 +1034,17 @@ class LocalAPITest(unittest.TestCase):
         first=self.upload(worker,oid,captured,"image/jpeg","../../photo.jpg")
         self.assertEqual(first[0],201,first[1]);self.assertEqual(first[1]["photo"]["verifiability_score"],5)
         self.assertEqual(first[1]["photo"]["capture_datetime"],"2026-10-02T17:40:00+00:00")
+        media_after_first=set(app.MEDIA.iterdir())
         duplicate=self.upload(worker,oid,captured,"image/jpeg","reuse.jpg")
-        self.assertEqual(duplicate[1]["photo"]["duplicate_type"],"exact")
-        self.assertEqual(duplicate[1]["photo"]["verifiability_score"],1)
+        self.assertEqual(duplicate[0],409,duplicate[1])
+        self.assertEqual(set(app.MEDIA.iterdir()),media_after_first)
 
         with Image.open(io.BytesIO(captured)) as original:
             resized=original.resize((83,83),Image.Resampling.LANCZOS)
             output=io.BytesIO();resized.save(output,format="JPEG",quality=62)
         similar=self.upload(worker,oid,output.getvalue(),"image/jpeg","resized.jpg")
-        self.assertEqual(similar[0],201,similar[1]);self.assertEqual(similar[1]["photo"]["duplicate_type"],"similar")
-        self.assertEqual(similar[1]["photo"]["verifiability_score"],2)
+        self.assertEqual(similar[0],409,similar[1])
+        self.assertEqual(set(app.MEDIA.iterdir()),media_after_first)
         distinct=self.upload(worker,oid,make_photo("PNG",background=(15,25,225)),"image/png","different.png")
         self.assertEqual(distinct[0],201,distinct[1]);self.assertEqual(distinct[1]["photo"]["duplicate_type"],"none")
         self.assertEqual(distinct[1]["photo"]["capture_time_status"],"absent")
@@ -987,7 +1540,7 @@ class LocalAPITest(unittest.TestCase):
                 if path=="/": self.assertIn("manifest.webmanifest",body)
                 if path=="/sw.js":
                     self.assertIn("cache.addAll",body)
-                    self.assertIn("naryadai-shell-v8",body)
+                    self.assertIn("naryadai-shell-v13",body)
                 if path.endswith("styles.css"): self.assertIn("max-width:760px",body)
                 if path.endswith("/manifest.webmanifest"):
                     manifest=json.loads(body)
@@ -1027,7 +1580,9 @@ class LocalAPITest(unittest.TestCase):
         manager = self.client("manager")
         with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"test-token",
                 "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"webhook-test-secret"}):
-            self.assertEqual(manager.call("/api/telegram/pair", "POST", {})[0], 403)
+            manager_pairing = manager.call("/api/telegram/pair", "POST", {})
+            self.assertEqual(manager_pairing[0], 200, manager_pairing[1])
+            self.assertEqual(len(manager_pairing[1]["pairing_code"]), 12)
             paired = worker.call("/api/telegram/pair", "POST", {})
             self.assertEqual(paired[0], 200, paired[1])
             code = paired[1]["pairing_code"]
@@ -1041,14 +1596,18 @@ class LocalAPITest(unittest.TestCase):
             with app.connect(self.db_path) as db:
                 original = db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?", (self.worker_id,)).fetchone()
                 original_chat_id = original["chat_id"] if original else None
-            group_update = {**update, "message":{**update["message"], "chat":{"id":-1007812345,"type":"group"}}}
+            group_update = {**update, "update_id":7001,
+                "message":{**update["message"], "chat":{"id":-1007812345,"type":"group"}}}
             self.assertEqual(self.telegram_webhook(group_update)[0], 200)
-            spoofed_update = {**update, "message":{**update["message"], "from":{"id":7812346}}}
+            spoofed_update = {**update, "update_id":7002,
+                "message":{**update["message"], "from":{"id":7812346}}}
             self.assertEqual(self.telegram_webhook(spoofed_update)[0], 200)
             with app.connect(self.db_path) as db:
                 binding = db.execute("SELECT chat_id FROM telegram_bindings WHERE user_id=?", (self.worker_id,)).fetchone()
                 self.assertEqual(binding["chat_id"] if binding else None, original_chat_id)
                 self.assertIsNone(db.execute("SELECT consumed_at FROM telegram_pairings WHERE user_id=?", (self.worker_id,)).fetchone()[0])
+                self.assertIsNone(db.execute("SELECT 1 FROM telegram_inbox WHERE update_id IN (7001,7002)").fetchone())
+            update["update_id"] = 7003
             self.assertEqual(self.telegram_webhook(update)[0], 200)
             # A bad webhook secret is indistinguishable from an unknown path.
             with unittest.mock.patch.dict(os.environ, {"NARYADAI_TELEGRAM_ENABLED":"1", "NARYADAI_TELEGRAM_BOT_TOKEN":"test-token",
@@ -1324,6 +1883,386 @@ class LocalAPITest(unittest.TestCase):
         with app.connect(self.db_path) as db:
             state=db.execute("SELECT status,last_error,payload_json FROM telegram_outbox WHERE dedupe_key='claim-rebound-chat'").fetchone()
             self.assertEqual(tuple(state),("cancelled","stale_authorization_scope","{}"))
+
+    def test_telegram_minimal_menu_is_readonly_scoped_idempotent_and_private(self):
+        temp=tempfile.TemporaryDirectory(prefix="naryadai-telegram-menu-")
+        db_path=Path(temp.name)/"menu.sqlite3"
+        app.init_db(db_path)
+        httpd=app.ThreadingHTTPServer(("127.0.0.1",0),app.AppHandler)
+        httpd.daemon_threads=True
+        httpd.db_path=db_path
+        thread=threading.Thread(target=httpd.serve_forever,kwargs={"poll_interval":0.1},daemon=True)
+        thread.start()
+        base=f"http://127.0.0.1:{httpd.server_address[1]}"
+        def cleanup_test_data():
+            httpd.shutdown();httpd.server_close();thread.join(timeout=3);temp.cleanup()
+        self.addCleanup(cleanup_test_data)
+        settings={"NARYADAI_TELEGRAM_ENABLED":"1","NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token",
+                  "NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret","NARYADAI_PUBLIC_SITE_URL":""}
+        def add_user(db,username,role):
+            salt,digest=app.password_record("local-test-password")
+            return db.execute("""INSERT INTO users(username,display_name,role,brigade,specialty,
+                qualification_level,shift_code,password_salt,password_hash,is_active)
+                VALUES (?,?,?,'QA','mechanic',1,'A',?,?,1)""",
+                (username,username,role,salt,digest)).lastrowid
+        with app.connect(db_path) as db:
+            worker_id=add_user(db,"minimal_worker_qa","worker")
+            other_worker_id=add_user(db,"minimal_other_worker_qa","worker")
+            empty_worker_id=add_user(db,"minimal_empty_worker_qa","worker")
+            master_id=add_user(db,"minimal_master_qa","master")
+            other_master_id=add_user(db,"minimal_other_master_qa","master")
+            area_id=db.execute("SELECT id FROM areas ORDER BY id LIMIT 1").fetchone()[0]
+            equipment_id=db.execute("SELECT id FROM equipment WHERE area_id=? ORDER BY id LIMIT 1",(area_id,)).fetchone()[0]
+            db.commit()
+        master=Client(base);master.login("minimal_master_qa","local-test-password")
+        other_master=Client(base);other_master.login("minimal_other_master_qa","local-test-password")
+        def make_order(client,assigned_worker,title):
+            status,response=client.call("/api/orders","POST",{
+                "title":title,"description":"Synthetic read-only menu test","work_type":"planned",
+                "priority":"normal","area_id":area_id,"equipment_id":equipment_id,
+                "worker_id":assigned_worker,"norm_hours":1})
+            self.assertEqual(status,201,response)
+            return response["order"]
+        assigned_order=make_order(master,worker_id,"Private worker order")
+        foreign_worker_order=make_order(master,other_worker_id,"Other worker private order")
+        foreign_master_order=make_order(other_master,worker_id,"Other master private order")
+        page_orders=[make_order(other_master,worker_id,f"Worker page order {index}") for index in range(4)]
+        order_ids={assigned_order["id"],foreign_worker_order["id"],foreign_master_order["id"],
+                   *(item["id"] for item in page_orders)}
+        worker_visible_codes={item["code"] for item in [assigned_order,foreign_master_order,*page_orders]}
+        with app.connect(db_path) as db:
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?)",
+                       (worker_id,"7812801","7812801",app.iso()))
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?)",
+                       (master_id,"7812802","7812802",app.iso()))
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?)",
+                       (other_master_id,"7812803","7812803",app.iso()))
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?)",
+                       (empty_worker_id,"7812804","7812804",app.iso()))
+            db.execute("DELETE FROM telegram_outbox")
+            before={row["id"]:row["status"] for row in db.execute(
+                "SELECT id,status FROM orders WHERE id IN ("+",".join("?" for _ in order_ids)+")",
+                tuple(order_ids)).fetchall()}
+            db.commit()
+        def update(chat_id,update_id,text,chat_type="private"):
+            return {"update_id":update_id,"message":{"message_id":update_id,
+                "from":{"id":chat_id,"is_bot":False},"chat":{"id":chat_id,"type":chat_type},"text":text}}
+        def post(body,secret="fake-webhook-secret"):
+            request=urllib.request.Request(base+"/api/telegram/webhook",data=json.dumps(body).encode(),
+                headers={"Content-Type":"application/json","X-Telegram-Bot-Api-Secret-Token":secret},method="POST")
+            try:
+                with urllib.request.urlopen(request,timeout=5) as response:return response.status,json.loads(response.read())
+            except urllib.error.HTTPError as error:return error.code,json.loads(error.read())
+        sent=[]
+        def fake_sender(token,chat_id,text,**options):
+            sent.append({"chat_id":chat_id,"text":text,"options":options})
+        with unittest.mock.patch.dict(os.environ,settings):
+            menu=update(7812801,930001,"/start")
+            self.assertEqual(post(menu)[0],200);self.assertEqual(post(menu)[0],200)
+            with app.connect(db_path) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM telegram_outbox WHERE dedupe_key='telegram-update:930001'").fetchone()[0],1)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("Выберите команду",sent[-1]["text"])
+            keyboard=sent[-1]["options"]["reply_markup"]["keyboard"]
+            labels={button["text"] for row in keyboard for button in row}
+            self.assertEqual(labels,{"Мои наряды","Предыдущая страница","Следующая страница",
+                                     "Инструкция","Статус","Открыть сайт","Меню"})
+            self.assertFalse(any("callback_data" in str(button) for row in keyboard for button in row))
+
+            for update_id,command,expected in ((930002,"Инструкция","Инструкция"),
+                                                (930003,"Статус","Ваших нарядов: 6"),
+                                                (930004,"/status","Ваших нарядов: 6"),
+                                                (930014,"Меню","Выберите команду"),
+                                                (930015,"/help","Инструкция")):
+                self.assertEqual(post(update(7812801,update_id,command))[0],200)
+                self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+                self.assertIn(expected,sent[-1]["text"])
+                if command in {"Инструкция","/help"}:
+                    self.assertIn("Мои наряды",sent[-1]["text"])
+                    self.assertIn("/orders",sent[-1]["text"])
+                self.assertNotIn(assigned_order["code"],sent[-1]["text"])
+                self.assertNotIn(foreign_master_order["code"],sent[-1]["text"])
+                self.assertNotIn("Private worker order",sent[-1]["text"])
+                self.assertNotIn("Other worker private order",sent[-1]["text"])
+
+            self.assertEqual(post(update(7812802,930005,"/status"))[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("Ваших нарядов: 2",sent[-1]["text"])
+            self.assertNotIn(foreign_worker_order["code"],sent[-1]["text"])
+            self.assertEqual(post(update(7812803,930006,"Статус"))[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("Ваших нарядов: 5",sent[-1]["text"])
+
+            first_page=update(7812801,930016,"/orders")
+            self.assertEqual(post(first_page)[0],200);self.assertEqual(post(first_page)[0],200)
+            with app.connect(db_path) as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM telegram_outbox WHERE dedupe_key='telegram-update:930016'").fetchone()[0],1)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("Мои наряды · 1/2",sent[-1]["text"])
+            first_page_text=sent[-1]["text"]
+            self.assertNotIn(foreign_worker_order["code"],first_page_text)
+            first_page_codes={code for code in worker_visible_codes if code in first_page_text}
+            self.assertEqual(len(first_page_codes),5)
+            self.assertNotIn("callback_data",str(sent[-1]["options"]["reply_markup"]))
+
+            self.assertEqual(post(update(7812801,930017,"/orders 2"))[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("Мои наряды · 2/2",sent[-1]["text"])
+            self.assertNotIn(foreign_worker_order["code"],sent[-1]["text"])
+            self.assertEqual(len(first_page_codes | {code for code in worker_visible_codes if code in sent[-1]["text"]}),6)
+            self.assertEqual(post(update(7812801,930018,"Предыдущая страница"))[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("Мои наряды · 1/2",sent[-1]["text"])
+
+            self.assertEqual(post(update(7812802,930020,"/orders"))[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("Мои наряды · 1/1",sent[-1]["text"])
+            self.assertIn(assigned_order["code"],sent[-1]["text"])
+            self.assertIn(foreign_worker_order["code"],sent[-1]["text"])
+            self.assertNotIn(foreign_master_order["code"],sent[-1]["text"])
+
+            self.assertEqual(post(update(7812804,930019,"/orders"))[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("Мои наряды · 1/1",sent[-1]["text"])
+            self.assertIn("Наряды не найдены",sent[-1]["text"])
+
+            group=update(7812801,930008,"/status","group")
+            self.assertEqual(post(group)[0],200)
+            with app.connect(db_path) as db:
+                self.assertIsNone(db.execute("SELECT id FROM telegram_outbox WHERE dedupe_key='telegram-update:930008'").fetchone())
+                self.assertIsNone(db.execute("SELECT 1 FROM telegram_inbox WHERE update_id=930008").fetchone())
+
+            unpaired=update(7812805,930009,"/status")
+            self.assertEqual(post(unpaired)[0],200)
+            with app.connect(db_path) as db:
+                queued=db.execute("SELECT recipient_user_id,event,payload_json FROM telegram_outbox WHERE dedupe_key='telegram-update:930009'").fetchone()
+                self.assertIsNone(queued["recipient_user_id"]);self.assertEqual(queued["event"],"bot_pair_help")
+                self.assertNotIn(assigned_order["code"],queued["payload_json"])
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("/start КОД",sent[-1]["text"])
+            self.assertNotIn(assigned_order["code"],sent[-1]["text"])
+
+            long_input=update(7812801,930010,"x"*300)
+            self.assertEqual(post(long_input)[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("слишком длинная",sent[-1]["text"].lower())
+            self.assertNotIn("x"*300,sent[-1]["text"])
+
+            site_missing=update(7812801,930011,"Открыть сайт")
+            self.assertEqual(post(site_missing)[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn("сайт пока не настроена",sent[-1]["text"])
+            with unittest.mock.patch.dict(os.environ,{"NARYADAI_PUBLIC_SITE_URL":"https://mvp.example.kz"}):
+                self.assertEqual(post(update(7812801,930012,"Открыть сайт"))[0],200)
+                self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn('href="https://mvp.example.kz/"',sent[-1]["text"])
+
+            self.assertEqual(post(update(7812801,930021,"/orders"))[0],200)
+            with app.connect(db_path) as db:
+                db.execute("UPDATE orders SET assigned_to=? WHERE id=?",(other_worker_id,page_orders[0]["id"]))
+                db.commit()
+            sent_before=len(sent)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertEqual(len(sent),sent_before)
+            with app.connect(db_path) as db:
+                stale=db.execute("SELECT status,last_error FROM telegram_outbox WHERE dedupe_key='telegram-update:930021'").fetchone()
+                self.assertEqual((stale["status"],stale["last_error"]),("cancelled","stale_authorization_scope"))
+
+            self.assertEqual(post(update(7812801,930022,"/orders"))[0],200)
+            with app.connect(db_path) as db:
+                db.execute("UPDATE users SET role='manager' WHERE id=?",(worker_id,));db.commit()
+            sent_before=len(sent)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertEqual(len(sent),sent_before)
+            with app.connect(db_path) as db:
+                self.assertEqual(db.execute("SELECT status FROM telegram_outbox WHERE dedupe_key='telegram-update:930022'").fetchone()[0],"cancelled")
+                manager_order_count=db.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+            manager_pages=max(1,(manager_order_count+app.TELEGRAM_ORDERS_PAGE_SIZE-1)//app.TELEGRAM_ORDERS_PAGE_SIZE)
+            # An old reply-keyboard tap is just a fresh command: it uses the current manager scope.
+            self.assertEqual(post(update(7812801,930023,"Следующая страница"))[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn(f"Наряды для просмотра · 2/{manager_pages}",sent[-1]["text"])
+            self.assertIn(foreign_worker_order["code"],sent[-1]["text"])
+            self.assertEqual(post(update(7812801,930026,"/status"))[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn(f"Нарядов в системе: {manager_order_count}",sent[-1]["text"])
+            self.assertEqual(post(update(7812801,930027,"/orders 2"))[0],200)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertIn(f"Наряды для просмотра · 2/{manager_pages}",sent[-1]["text"])
+            self.assertIn(foreign_worker_order["code"],sent[-1]["text"])
+
+            self.assertEqual(post(update(7812801,930028,"/orders"))[0],200)
+            with app.connect(db_path) as db:
+                db.execute("UPDATE telegram_bindings SET chat_id='7812899',telegram_user_id='7812899' WHERE user_id=?",
+                           (worker_id,));db.commit()
+            sent_before=len(sent)
+            self.assertTrue(app.deliver_telegram_once(db_path,sender=fake_sender))
+            self.assertEqual(len(sent),sent_before)
+            with app.connect(db_path) as db:
+                chat_stale=db.execute("SELECT status,last_error FROM telegram_outbox WHERE dedupe_key='telegram-update:930028'").fetchone()
+                self.assertEqual((chat_stale["status"],chat_stale["last_error"]),
+                                 ("cancelled","stale_authorization_scope"))
+        with app.connect(db_path) as db:
+            after={row["id"]:row["status"] for row in db.execute(
+                "SELECT id,status FROM orders WHERE id IN ("+",".join("?" for _ in order_ids)+")",
+                tuple(order_ids)).fetchall()}
+        self.assertEqual(after,before)
+
+    def test_telegram_ingress_rate_limit_queue_cap_and_inbox_budget(self):
+        temp=tempfile.TemporaryDirectory(prefix="naryadai-telegram-ingress-")
+        db_path=Path(temp.name)/"ingress.sqlite3"
+        app.init_db(db_path)
+        httpd=app.ThreadingHTTPServer(("127.0.0.1",0),app.AppHandler)
+        httpd.daemon_threads=True;httpd.db_path=db_path
+        thread=threading.Thread(target=httpd.serve_forever,kwargs={"poll_interval":0.1},daemon=True)
+        thread.start();base=f"http://127.0.0.1:{httpd.server_address[1]}"
+        def cleanup_test_data():
+            httpd.shutdown();httpd.server_close();thread.join(timeout=3);temp.cleanup()
+        self.addCleanup(cleanup_test_data)
+        with app.connect(db_path) as db:
+            salt,digest=app.password_record("local-test-password")
+            user_id=db.execute("""INSERT INTO users(username,display_name,role,brigade,specialty,
+                qualification_level,shift_code,password_salt,password_hash,is_active)
+                VALUES ('ingress_worker','Ingress worker','worker','QA','mechanic',1,'A',?,?,1)""",
+                (salt,digest)).lastrowid
+            db.execute("INSERT INTO telegram_bindings(user_id,chat_id,telegram_user_id,linked_at) VALUES (?,?,?,?)",
+                       (user_id,"7812901","7812901",app.iso()))
+            db.commit()
+        def post(update_id):
+            body={"update_id":update_id,"message":{"message_id":update_id,
+                "from":{"id":7812901,"is_bot":False},"chat":{"id":7812901,"type":"private"},"text":"/orders"}}
+            request=urllib.request.Request(base+"/api/telegram/webhook",data=json.dumps(body).encode(),
+                headers={"Content-Type":"application/json","X-Telegram-Bot-Api-Secret-Token":"fake-webhook-secret"},method="POST")
+            with urllib.request.urlopen(request,timeout=5) as response:
+                self.assertEqual(response.status,200)
+                self.assertEqual(json.loads(response.read()),{"ok":True})
+        with unittest.mock.patch.dict(os.environ,{"NARYADAI_TELEGRAM_ENABLED":"1",
+                "NARYADAI_TELEGRAM_BOT_TOKEN":"fake-token","NARYADAI_TELEGRAM_WEBHOOK_SECRET":"fake-webhook-secret"}):
+            flood_count=app.TELEGRAM_MAX_PRIVATE_UPDATES_PER_MINUTE+15
+            for update_id in range(940000,940000+flood_count):
+                post(update_id)
+            with app.connect(db_path) as db:
+                pending=db.execute("SELECT COUNT(*) FROM telegram_outbox WHERE event='bot_command' AND status IN ('queued_local','retrying','sending')").fetchone()[0]
+                accepted=db.execute("SELECT accepted_count FROM telegram_ingress_state WHERE singleton=1").fetchone()[0]
+                inbox=db.execute("SELECT update_count FROM telegram_inbox_budget WHERE singleton=1").fetchone()[0]
+                self.assertEqual(pending,app.TELEGRAM_MAX_PENDING_COMMANDS)
+                self.assertEqual(accepted,app.TELEGRAM_MAX_PRIVATE_UPDATES_PER_MINUTE)
+                self.assertEqual(inbox,flood_count)
+
+                # Exercise the finite hard cap without inserting thousands of fixture rows.
+                db.execute("DELETE FROM telegram_outbox WHERE event='bot_command'")
+                db.execute("UPDATE telegram_inbox_budget SET update_count=? WHERE singleton=1",
+                           (app.TELEGRAM_MAX_INBOX_UPDATES-1,))
+                db.commit()
+            post(950001)
+            post(950002)
+            with app.connect(db_path) as db:
+                self.assertEqual(db.execute("SELECT update_count FROM telegram_inbox_budget WHERE singleton=1").fetchone()[0],
+                                 app.TELEGRAM_MAX_INBOX_UPDATES)
+                self.assertIsNotNone(db.execute("SELECT 1 FROM telegram_inbox WHERE update_id=950001").fetchone())
+                self.assertIsNone(db.execute("SELECT 1 FROM telegram_inbox WHERE update_id=950002").fetchone())
+
+    def test_telegram_menu_parser_site_validation_and_fake_bot_api_serialization(self):
+        aliases = {
+            "/start": ("menu", None), "/help": ("help", None),
+            "/status": ("status", None), "/menu": ("menu", None),
+            "Статус": ("status", None), "Инструкция": ("help", None),
+            "Мои наряды": ("orders", None), "Следующая страница": ("orders_next", None),
+            "Предыдущая страница": ("orders_previous", None),
+            "Открыть сайт": ("site", None), "Меню": ("menu", None),
+            "/orders": ("orders", 0), "/orders 2": ("orders", 1),
+            "/orders 0": ("orders_invalid", None), "/accept": ("help", None),
+        }
+        for incoming, expected in aliases.items():
+            with self.subTest(incoming=incoming):
+                self.assertEqual(app.telegram_parse_command(incoming), expected)
+        self.assertEqual(app.telegram_parse_command("x" * 300), ("too_long", None))
+
+        with unittest.mock.patch.dict(os.environ, {"NARYADAI_PUBLIC_SITE_URL": ""}):
+            self.assertIsNone(app.telegram_public_site_url())
+        invalid_urls = (
+            "http://example.kz", "https://example.kz/work", "https://example.kz/?x=1",
+            "https://mvp.ngrok-free.app", "https://127.0.0.1", "https://127.1",
+            "https://0x7f.1", "https://0177.0.0.1", "https://10.0.0.1",
+            "https://172.16.0.1", "https://192.168.1.10", "https://localhost",
+            "https://worker.local", "https://node.internal", "https://intranet.lan",
+            "https://example.kz:8443", "https://example.kz@evil.test",
+            "https://user:password@example.kz",
+            "https://example.kz\n", "https://example.kz\t", "https://example.kz\x7f",
+        )
+        for url in invalid_urls:
+            with self.subTest(site_url=url), unittest.mock.patch.dict(
+                    os.environ, {"NARYADAI_PUBLIC_SITE_URL": url}):
+                self.assertIsNone(app.telegram_public_site_url())
+        with unittest.mock.patch.object(app.os, "environ", {
+                "NARYADAI_PUBLIC_SITE_URL": "https://exa\x00mple.kz"}):
+            self.assertIsNone(app.telegram_public_site_url())
+        valid_urls = {
+            "https://mvp.example.kz/": "https://mvp.example.kz/",
+            "https://plant.example.com": "https://plant.example.com/",
+            "https://plant.example.com:443/": "https://plant.example.com/",
+        }
+        for url, expected in valid_urls.items():
+            with self.subTest(valid_site_url=url), unittest.mock.patch.dict(
+                    os.environ, {"NARYADAI_PUBLIC_SITE_URL": url}):
+                self.assertEqual(app.telegram_public_site_url(), expected)
+
+        demo_host = "legless-bennie-sheepish.ngrok-free.dev"
+        demo_url = f"https://{demo_host}"
+        with unittest.mock.patch.dict(os.environ, {
+                "NARYADAI_PUBLIC_SITE_URL": demo_url,
+                "NARYADAI_ALLOW_DEMO_TUNNEL": "1"}, clear=True):
+            self.assertEqual(app.telegram_public_site_url(), demo_url + "/")
+        with unittest.mock.patch.dict(os.environ, {
+                "NARYADAI_PUBLIC_SITE_URL": demo_url}, clear=True):
+            self.assertIsNone(app.telegram_public_site_url(), "the exact demo host requires opt-in")
+        for opt_in in ("0", "true", "yes"):
+            with self.subTest(demo_opt_in=opt_in), unittest.mock.patch.dict(os.environ, {
+                    "NARYADAI_PUBLIC_SITE_URL": demo_url,
+                    "NARYADAI_ALLOW_DEMO_TUNNEL": opt_in}, clear=True):
+                self.assertIsNone(app.telegram_public_site_url())
+        demo_rejections = (
+            "https://lookalike-legless-bennie-sheepish.ngrok-free.dev",
+            "https://legless-bennie-sheepish.ngrok-free.dev.attacker.test",
+            "https://legless-bennie-sheepish.ngrok-free.dev.",
+            "https://attacker.test@legless-bennie-sheepish.ngrok-free.dev",
+            "https://@legless-bennie-sheepish.ngrok-free.dev",
+            "https://legless-bennie-sheepish.ngrok-free.dev/redirect?next=https://attacker.test",
+            "http://legless-bennie-sheepish.ngrok-free.dev",
+            "https://legless-bennie-sheepish.ngrok-free.dev:8443",
+            "https://another-demo.ngrok-free.dev",
+            "https://sample.trycloudflare.com",
+            "https://127.1",
+            "https://10.0.0.1",
+            "https://worker.local",
+        )
+        for url in demo_rejections:
+            with self.subTest(opted_in_demo_rejection=url), unittest.mock.patch.dict(os.environ, {
+                    "NARYADAI_PUBLIC_SITE_URL": url,
+                    "NARYADAI_ALLOW_DEMO_TUNNEL": "1"}, clear=True):
+                self.assertIsNone(app.telegram_public_site_url())
+
+        captured = {}
+        class FakeResponse:
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def read(self, limit): return b'{"ok":true}'
+        class FakeOpener:
+            def open(self, request, timeout):
+                captured["request"] = request
+                captured["timeout"] = timeout
+                return FakeResponse()
+        keyboard = app.telegram_reply_keyboard()
+        with unittest.mock.patch.object(app.urllib.request, "build_opener", return_value=FakeOpener()):
+            app.telegram_send_message("fake-token", "123", "x" * 5000,
+                                      reply_markup=keyboard, parse_mode="HTML")
+        request = captured["request"]
+        form = urllib.parse.parse_qs(request.data.decode("ascii"))
+        self.assertEqual(captured["timeout"], 5)
+        self.assertEqual(len(form["text"][0]), 4096)
+        self.assertEqual(form["parse_mode"], ["HTML"])
+        self.assertEqual(json.loads(form["reply_markup"][0]), keyboard)
+        self.assertIn("api.telegram.org/botfake-token/sendMessage", request.full_url)
 
     def test_overdue_telegram_template_is_scoped_bounded_and_sanitized(self):
         master=self.client("master01");worker=self.client("worker01");manager=self.client("manager")

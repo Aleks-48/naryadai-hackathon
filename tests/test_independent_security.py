@@ -64,7 +64,10 @@ class IndependentSecurityQA(unittest.TestCase):
     def test_before_photo_capacity_preserves_after_photo_capacity(self):
         master = self.client('master01'); worker = self.client('worker01'); oid = self.create_order(master)['id']
         for index in range(4):  # create_order fixture already uses one of the five before-photo slots.
-            raw=fixture.make_photo(background=(20+index*30,15,40))
+            # Use visibly distinct synthetic patterns so this capacity test does
+            # not depend on images that the duplicate detector should reject.
+            color=((index*73+11)%255,(index*127+29)%255,(index*191+47)%255)
+            raw=fixture.make_before_photo(color)
             body={'phase':'before','file_name':f'before-{index}.png',
                   'data_url':'data:image/png;base64,'+fixture.base64.b64encode(raw).decode()}
             self.assertEqual(master.call(f'/api/orders/{oid}/photos','POST',body)[0],201)

@@ -1,4 +1,4 @@
-"""Thin optional demo UI over the canonical НарядAI HTTP API. No mock state or business rules live here."""
+"""Thin optional demo UI over the canonical НарядКонтроль HTTP API. No mock state or business rules live here."""
 from __future__ import annotations
 
 import base64
@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent
 EXTERNAL_API_URL = os.environ.get("NARYADAI_API_URL", "").strip().rstrip("/")
 EMBEDDED_MODE = not bool(EXTERNAL_API_URL)
 TIMEOUT = (3, 20)
-st.set_page_config(page_title="НарядAI · демо", page_icon="🛠️", layout="wide")
+st.set_page_config(page_title="НарядКонтроль · демо", page_icon="🛠️", layout="wide")
 
 STREAMLIT_STYLE = """
 <style>
@@ -309,8 +309,26 @@ def api(method: str, path: str, body: dict[str, Any] | None = None) -> dict[str,
     return data
 
 
+def submit_manual_queue_move(context: tuple[str, int, tuple[int, ...], int, str]) -> None:
+    """Submit the immutable queue snapshot bound to this revision's widget."""
+    scope, revision, order_ids, _selected_order_id, _direction = context
+    body = {"scope": scope, "expected_revision": revision, "order_ids": list(order_ids)}
+    try:
+        api("POST", "/api/work-queues/reorder", body)
+        st.session_state["manual-queue-notice"] = (True, "Порядок очереди сохранён.")
+    except RuntimeError as error:
+        message = str(error)
+        if "queue changed" in message.lower() or "refresh it before reordering" in message.lower():
+            message = "Очередь изменил другой сеанс. Данные обновлены; старое действие не применено. Проверьте новый порядок перед повторным нажатием."
+        else:
+            message = f"Порядок не изменён: {message}"
+        st.session_state["manual-queue-notice"] = (False, message)
+    except Exception as error:
+        st.session_state["manual-queue-notice"] = (False, f"Порядок не изменён: {type(error).__name__}. Обновите очередь и проверьте текущее состояние.")
+
+
 def login_panel() -> None:
-    st.title("НарядAI")
+    st.title("НарядКонтроль")
     st.caption("Общий синтетический демо-стенд поверх настоящего API нарядов.")
     if EMBEDDED_MODE:
         st.warning("Общие демо-аккаунты: изменения и синтетические фото видны другим участникам. Перезапуск может удалить все данные. Не загружайте реальные сведения.")
@@ -428,6 +446,7 @@ def show_worker_actions(order: dict[str, Any], constants: dict[str, Any]) -> Non
         material_ids = st.multiselect("Использованные материалы", [x["id"] for x in materials], format_func=lambda key: next(f"{x['sku']} · {x['name']} ({x['unit']})" for x in materials if x["id"] == key))
         with st.form(f"complete-{oid}"):
             report = st.text_area("Что сделано и какой результат наблюдался", height=100)
+            worker_comment = st.text_area("Комментарий исполнителя · необязательно", height=70, max_chars=1000)
             fault_ids = [item["id"] for item in faults]
             fault_labels = {item["id"]: f"{item['code']} · {item['label']}" for item in faults}
             fault_col, hours_col = st.columns([1.4, .8])
@@ -440,7 +459,8 @@ def show_worker_actions(order: dict[str, Any], constants: dict[str, Any]) -> Non
                     f"Количество · {material['sku']} ({material['unit']})", min_value=0.001,
                     max_value=100000.0, value=1.0, step=0.001, format="%.3f", key=f"completion-material-{oid}-{material_id}")
             if st.form_submit_button("Зафиксировать исполнение"):
-                payload = {"action": "complete", "completion_text": report, "fault_code_id": fault_id, "labor_hours": hours,
+                payload = {"action": "complete", "completion_text": report, "worker_completion_comment": worker_comment,
+                           "fault_code_id": fault_id, "labor_hours": hours,
                            "materials": [{"material_id": item, "quantity": material_quantities[item]} for item in material_ids], "materials_not_used": not material_ids}
                 api("POST", f"/api/orders/{oid}/action", payload); st.rerun()
         add_photo(oid, "after")
@@ -508,10 +528,36 @@ def create_order(constants: dict[str, Any], workers: list[dict[str, Any]]) -> No
             work_type = type_col.selectbox("Тип", ["planned", "unscheduled"], format_func=lambda x: {"planned":"Плановая", "unscheduled":"Внеплановая"}[x])
             priority = priority_col.selectbox("Приоритет", ["normal", "high", "emergency", "planned"], format_func=lambda x: {"normal":"Обычный", "high":"Высокий", "emergency":"Аварийный", "planned":"Плановый"}[x])
             hours = hours_col.number_input("До дедлайна, часов", 0.5, 720.0, 8.0, step=0.5)
-            if st.form_submit_button("Выдать через API", type="primary"):
+            st.caption("Фото «до» необязательно для планового и внепланового наряда. Его можно приложить при выдаче; в PWA мастер может добавить фото позже из карточки. Фото не подтверждает свежесть съёмки, исправность или допуск.")
+            before_photos = st.file_uploader("\u0424\u043e\u0442\u043e \xab\u0434\u043e\xbb \u043f\u0435\u0440\u0435\u0434 \u0432\u044b\u0434\u0430\u0447\u0435 (\u043d\u0435\u043e\u0431\u044f\u0437\u0430\u0442\u0435\u043b\u044c\u043d\u043e, \u0434\u043e 5)",
+                type=["jpg", "jpeg", "png", "webp"], key="new-order-before-photos", accept_multiple_files=True)
+            if st.form_submit_button("\u0412\u044b\u0434\u0430\u0442\u044c \u0447\u0435\u0440\u0435\u0437 API", type="primary"):
                 body = {"title": title, "description": description, "area_id": area_id, "equipment_id": equipment_id,
                         "worker_id": user_id, "work_type": work_type, "priority": priority, "norm_hours": hours}
-                api("POST", "/api/orders", body); st.success("Наряд сохранён на сервере."); st.rerun()
+                selected = before_photos or []
+                if len(selected) > 5:
+                    st.error("\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043d\u0435 \u0431\u043e\u043b\u0435\u0435 \u043f\u044f\u0442\u0438 \u0444\u043e\u0442\u043e.")
+                else:
+                    encoded_photos = []
+                    oversized = False
+                    for photo in selected:
+                        raw = photo.getvalue()
+                        if len(raw) > 4_000_000:
+                            oversized = True
+                            break
+                        encoded_photos.append({"file_name": photo.name,
+                            "data_url": f"data:{photo.type};base64," + base64.b64encode(raw).decode("ascii")})
+                    if oversized:
+                        st.error("\u0424\u043e\u0442\u043e \u0431\u043e\u043b\u044c\u0448\u0435 4 \u041c\u0411. \u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0444\u0430\u0439\u043b \u043c\u0435\u043d\u044c\u0448\u0435\u0433\u043e \u0440\u0430\u0437\u043c\u0435\u0440\u0430.")
+                    else:
+                        if encoded_photos:
+                            body["before_photos"] = encoded_photos
+                            success = f"\u041d\u0430\u0440\u044f\u0434 \u0438 {len(encoded_photos)} \u0444\u043e\u0442\u043e \xab\u0434\u043e\xbb \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u044b \u043e\u0434\u043d\u0438\u043c \u0437\u0430\u043f\u0440\u043e\u0441\u043e\u043c."
+                        else:
+                            success = "\u041d\u0430\u0440\u044f\u0434 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d \u043d\u0430 \u0441\u0435\u0440\u0432\u0435\u0440\u0435."
+                        api("POST", "/api/orders", body)
+                        st.success(success)
+                        st.rerun()
         selected_equipment=next((item for item in choices if item["id"]==equipment_id),None)
         if selected_equipment:
             catalog=constants.get("norm_catalog",[])
@@ -703,6 +749,15 @@ def live_orders_panel(user: dict[str, Any], constants: dict[str, Any]) -> None:
     """Refresh orders without rerunning unrelated page widgets or losing form drafts."""
     bootstrap = api("GET", "/api/bootstrap")
     orders = bootstrap.get("orders", [])
+    work_queues = bootstrap.get("work_queues", [])
+    queue_notice = st.session_state.pop("manual-queue-notice", None)
+    if queue_notice:
+        (st.success if queue_notice[0] else st.warning)(queue_notice[1])
+    queue_by_scope = {queue["scope"]: queue for queue in work_queues}
+    queue_by_order: dict[int, tuple[int, str]] = {}
+    for queue in work_queues:
+        for position, order_id in enumerate(queue.get("order_ids", []), 1):
+            queue_by_order[int(order_id)] = (position, queue.get("label", ""))
     status_counts: dict[str, int] = {}
     for item in orders:
         status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
@@ -721,6 +776,13 @@ def live_orders_panel(user: dict[str, Any], constants: dict[str, Any]) -> None:
         columns[3].metric("Закрыты мастером", status_counts.get("closed", 0))
         columns[3].caption(f"Отклонено: {status_counts.get('rejected',0)}")
     st.subheader("Список нарядов")
+    if work_queues:
+        st.caption("Ручной порядок очереди независим от приоритета и срока; меняет его только ответственный мастер.")
+        st.dataframe([{"Позиция":position,"Очередь":label,"Наряд":next((o["code"] for o in orders if o["id"]==order_id),str(order_id)),
+                       "Приоритет":next((o["priority_label"] for o in orders if o["id"]==order_id),"")}
+                      for queue in work_queues for position,order_id in enumerate(queue.get("order_ids",[]),1)
+                      for _,label in [queue_by_order.get(order_id,(position,queue.get("label","")))]],
+                     width="stretch",hide_index=True)
     with st.container(key="order-queue"):
         st.dataframe([{"\u041d\u0430\u0440\u044f\u0434":o["code"],"\u0421\u0442\u0430\u0442\u0443\u0441":o["status_label"],"\u0420\u0430\u0431\u043e\u0442\u0430":o["title"],"\u041e\u0431\u043e\u0440\u0443\u0434\u043e\u0432\u0430\u043d\u0438\u0435":o["equipment"]["name"],"\u0418\u0441\u043f\u043e\u043b\u043d\u0438\u0442\u0435\u043b\u044c":o["worker"]["display_name"],"\u0421\u0440\u043eк UTC":o["due_at"]} for o in orders[:100]], width="stretch", height=330, hide_index=True)
     if not orders:
@@ -728,6 +790,27 @@ def live_orders_panel(user: dict[str, Any], constants: dict[str, Any]) -> None:
     selected = st.selectbox("\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043d\u0430\u0440\u044f\u0434", [o["id"] for o in orders], format_func=lambda key: next(order_label(o) for o in orders if o["id"] == key), key="live-selected-order")
     detail = api("GET", f"/api/orders/{selected}")
     order = detail["order"]
+    selected_scope = next((scope for scope, group in queue_by_scope.items() if selected in group.get("order_ids", [])), None)
+    if selected_scope:
+        queue = queue_by_scope[selected_scope]
+        queue_position = next((position for position, order_id in enumerate(queue.get("order_ids", []), 1) if order_id == selected), None)
+        st.caption(f"Позиция в очереди: {queue_position} · приоритет: {order['priority_label']} · порядок не меняет приоритет")
+        if user["role"] == "master":
+            ids = list(queue.get("order_ids", [])); index = ids.index(selected) if selected in ids else -1
+            up, down = st.columns(2)
+            for direction, column, offset in (("up", up, -1), ("down", down, 1)):
+                revision = int(queue["revision"])
+                widget_key = f"queue-{direction}-{queue['scope']}-{selected}-r{revision}"
+                candidate = list(ids)
+                target = index + offset
+                enabled = index >= 0 and 0 <= target < len(candidate)
+                if enabled:
+                    candidate[index], candidate[target] = candidate[target], candidate[index]
+                rendered_context = (str(queue["scope"]), revision, tuple(int(value) for value in candidate),
+                                    int(selected), direction)
+                label = f"{chr(8593)} Выше" if direction == "up" else f"{chr(8595)} Ниже"
+                column.button(label, key=widget_key, on_click=submit_manual_queue_move,
+                    args=(rendered_context,), disabled=not enabled)
     with st.container(key="order-detail"):
         st.subheader(f"{order['code']} · {order['status_label']} · {order['title']}")
         c1,c2,c3 = st.columns(3)
@@ -739,6 +822,9 @@ def live_orders_panel(user: dict[str, Any], constants: dict[str, Any]) -> None:
         if order.get("completion_text"):
             st.markdown("**Отчёт исполнителя**")
             st.write(order["completion_text"])
+            if order.get("worker_completion_comment"):
+                st.markdown("**Комментарий исполнителя**")
+                st.write(order["worker_completion_comment"])
         if order.get("ai_result"):
             with st.expander("Результат автоматической проверки", expanded=False):
                 try:
@@ -772,7 +858,7 @@ def main() -> None:
     user = st.session_state.user
     st.session_state.naryadai_api_url = API_URL
     with st.sidebar:
-        st.title("НарядAI")
+        st.title("НарядКонтроль")
         st.write(user["display_name"])
         st.caption(user["role_label"])
         st.caption(f"Профиль: {user.get('specialty') or '-'} · разряд {user.get('qualification_level') or '-'} · смена {user.get('shift_code') or '-'} · синтетика")
@@ -809,7 +895,7 @@ def main() -> None:
             create_order(constants, bootstrap.get("free_workers", []))
         live_orders_panel(user, constants)
     except (RuntimeError, requests.RequestException) as error:
-        st.error(f"Ошибка API НарядAI: {error}")
+        st.error(f"Ошибка API НарядКонтроль: {error}")
 
 if __name__ == "__main__":
     main()
