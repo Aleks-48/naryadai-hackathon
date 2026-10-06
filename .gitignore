@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+data/
+.venv/
+.env
+deliverables/
+
+.env.*
+!.env.example
+# Never commit local Streamlit credentials
+.streamlit/secrets.toml

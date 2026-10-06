@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+*.pyc
+data
+deliverables
+tests
+docs
+.env
+.env.*
+!.env.example
+
+.streamlit/secrets.toml
