@@ -27,8 +27,8 @@ function harness() {
   ['#app','#login-screen','#detail-drawer','#drawer-backdrop','#view-root','#toast-region','#offline-banner','#telegram-button'].forEach(get);
   const localStorageWrites=[],logs=[];
   const globals={document,console:{log:(...x)=>logs.push(x),warn:(...x)=>logs.push(x),error:(...x)=>logs.push(x)},localStorage:{setItem:(...x)=>localStorageWrites.push(x),removeItem:(...x)=>localStorageWrites.push(x),getItem:()=>null},navigator:{onLine:true},location:{protocol:'http:',hostname:'example.invalid'},window:{addEventListener(){}},URLSearchParams,setTimeout:()=>0,clearInterval(){},setInterval:()=>1,performance:{now:()=>0},fetch:()=>Promise.reject(new Error('Unexpected real fetch')),FileReader:class{},prompt:()=>null,confirm:()=>true};
-  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','detailButtons','reassignmentForm','bindDrawer','loadReport','loadAudit','render','runAction','showTelegram','exifPayload','insertJpegExif'];
-  const expose=`globalThis.app={S,${names.join(',')},override(overrides){${['api','refresh','renderDrawer','render','syncChrome','compressImage','renderReportResult'].map(n=>`if(overrides.${n})${n}=overrides.${n};`).join('')}}};`;
+  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','detailButtons','reassignmentForm','bindDrawer','loadReport','loadAudit','render','runAction','showTelegram','moveWorkQueue','exifPayload','insertJpegExif'];
+  const expose=`globalThis.app={S,${names.join(',')},override(overrides){${['api','refresh','refreshDrawer','openOrder','renderDrawer','render','syncChrome','compressImage','renderReportResult'].map(n=>`if(overrides.${n})${n}=overrides.${n};`).join('')}}};`;
   const source=fs.readFileSync(sourcePath,'utf8').replace(/\n  bindGlobal\(\);[\s\S]*?\n\}\)\(\);\s*$/,`\n  ${expose}\n})();`);
   vm.runInNewContext(source,globals,{filename:sourcePath});
   const {app}=globals;
@@ -40,11 +40,12 @@ function harness() {
 }
 function completionInputs(h) {
   h.get('#completion-text').value='Заменили уплотнение и проверили результат';
+  h.get('#worker-completion-comment').value='Дополнительная заметка исполнителя';
   h.get('#fault-code').value='2';h.get('#labor-hours').value='1.5';h.get('#materials-not-used').checked=true;h.get('#save-completion');
 }
 function issueInputs(h) {
   h.app.S.me.role='master';
-  for(const [id,value] of Object.entries({'issue-assignee':'worker:2','issue-title':'Новый наряд','issue-description':'Подробное описание работы','issue-type':'planned','issue-priority':'normal','issue-area':'1','issue-equipment':'3','issue-hours':'8','issue-template':'pump','issue-submit':''}))h.get('#'+id).value=value;
+  for(const [id,value] of Object.entries({'issue-assignee':'worker:2','issue-title':'Новый наряд','issue-description':'Подробное описание работы','issue-type':'planned','issue-priority':'normal','issue-area':'1','issue-equipment':'3','issue-hours':'8','issue-template':'pump','issue-before-photos':'','issue-submit':''}))h.get('#'+id).value=value;
 }
 
 test('EXIF transfer survives browser JPEG recompression and can be inspected again',()=>{
@@ -66,6 +67,7 @@ test('completion and mandatory check stay on initiating order after navigation',
   h.app.override({api:async(p,m,b)=>{calls.push([p,b]);if(b?.action==='complete')await pending.promise;return {order:{status:'ai_review'}}},refresh:async()=>{},renderDrawer(){}});
   const save=h.app.saveCompletion();h.app.S.orderId=202;pending.resolve();await save;
   assert.deepEqual(calls.map(c=>c[0]),['/api/orders/101/action','/api/orders/101/action']);
+  assert.equal(calls[0][1].worker_completion_comment,'Дополнительная заметка исполнителя');
 });
 
 test('completion is single-flight and failed validation keeps the draft',async()=>{
@@ -124,15 +126,56 @@ test('template finds equipment options and its matching area',()=>{
   h.app.bindIssueForm();h.get('#issue-template').events.change({target:{value:'pump'}});assert.equal(h.get('#issue-equipment').value,'3');assert.equal(h.get('#issue-area').value,'2');
 });
 
-test('unscheduled work can be queued but cannot be accepted without a unique before photo',()=>{
+test('issued work does not require a pre-work photo in the creation form',async()=>{
+  const h=harness();issueInputs(h);h.get('#issue-type').value='unscheduled';const calls=[];
+  h.app.override({api:async(p,m,b)=>{calls.push([p,m,b]);return {order:{id:9,code:'DEMO-9'}}},openOrder:async()=>{},refresh:async()=>{}});
+  await h.app.createOrder();assert.equal(calls.length,1);assert.equal(calls[0][0],'/api/orders');
+  assert.equal(Object.hasOwn(calls[0][2],'before_photo'),false);
+  assert.equal(Object.hasOwn(calls[0][2],'before_photos'),false);
+});
+
+test('issue creation sends zero, one, or five optional photos and rejects six before compression',async()=>{
+  for(const count of [0,1,5,6]){
+    const h=harness();issueInputs(h);const input=h.get('#issue-before-photos');
+    input.files=Array.from({length:count},(_,i)=>({name:`before-${i}.jpg`}));
+    const calls=[];let compressed=0;
+    h.app.override({compressImage:async file=>{compressed++;return {file_name:file.name,data_url:'data:image/jpeg;base64,AA=='}},
+      api:async(p,m,b)=>{calls.push([p,m,b]);return {order:{id:9,code:'DEMO-9'}}},openOrder:async()=>{},refresh:async()=>{}});
+    await h.app.createOrder();
+    if(count<=5){
+      assert.equal(calls.length,1);assert.equal(calls[0][0],'/api/orders');
+      assert.equal(calls[0][2].before_photos?.length||0,count);assert.equal(compressed,count);
+    }else{assert.equal(calls.length,0);assert.equal(compressed,0);}
+  }
+});
+
+test('photo chooser supports camera or gallery without forcing capture',()=>{
+  const source=fs.readFileSync(sourcePath,'utf8');
+  assert.match(source,/id="issue-before-photos" type="file"[^>]*multiple/);
+  assert.doesNotMatch(source,/capture="environment"/);
+  assert.ok(source.includes('data-upload-phase=\"${phase}\" multiple'));
+  assert.ok(source.includes('current-shift-focus'));
+  assert.ok(source.includes('\u041e\u0447\u0435\u0440\u0435\u0434\u044c \u0438 \u043f\u0440\u0438\u0451\u043c\u043a\u0430'));
+});
+
+test('duplicate photo rows do not use the remaining unique-photo quota',async()=>{
+  const h=harness(),calls=[];
+  h.groups.set('.photo-item',Array.from({length:5},(_,i)=>({dataset:{phase:'after',duplicate:i===0?'0':'1'}})));
+  h.app.override({compressImage:async file=>({file_name:file.name,data_url:'data:image/jpeg;base64,AA=='}),
+    api:async(p,m,b)=>{calls.push([p,m,b]);return {photo:{id:99}}},refreshDrawer:async()=>{}});
+  const input=element();input.dataset.uploadPhase='after';input.files=[{name:'replacement.jpg'}];
+  await h.app.uploadPhotos({currentTarget:input});
+  assert.equal(calls.length,1);assert.equal(calls[0][0],'/api/orders/101/photos');
+});
+
+test('unscheduled orders can be accepted without a unique pre-work photo',()=>{
   const h=harness(),order={status:'issued',work_type:'unscheduled',photos:[]};
-  const issued=h.app.detailButtons(order);
-  assert.match(issued,/data-action="accept" disabled/);
-  assert.match(issued,/data-action="queue"(?! disabled)/);
-  h.app.S.me.role='worker';
+  assert.match(h.app.detailButtons(order),/data-action="accept"/);
+  assert.doesNotMatch(h.app.detailButtons(order),/data-action="accept" disabled/);
   const queued=h.app.detailButtons({...order,status:'queued'});
-  assert.match(queued,/data-action="accept" disabled/);
-  assert.doesNotMatch(h.app.detailButtons({...order,photos:[{phase:'before',duplicate:false}]}),/data-action="accept" disabled/);
+  assert.match(queued,/data-action="accept"/);assert.doesNotMatch(queued,/data-action="accept" disabled/);
+  h.app.S.me.role='worker';
+  assert.doesNotMatch(h.app.detailButtons({...order,work_type:'planned'}),/data-action="accept" disabled/);
 });
 
 test('rejected master detail offers a worker or brigade selector for reassignment',()=>{
@@ -261,4 +304,22 @@ test('Telegram logout discards late status and never renders a stale pairing cod
   assert.equal(h.localStorageWrites.length,0);
   assert.equal(JSON.stringify(h.logs).includes('PRIVATE-ONCE-CODE'),false);
   assert.equal(h.document.body.children.some(child=>child.innerHTML.includes('PRIVATE-ONCE-CODE')),false);
+});
+
+test('manual queue reorder is single-flight and logout discards stale refresh',async()=>{
+  const h=harness(),pending=deferred(),calls=[];let refreshes=0;
+  h.app.S.session=17;h.app.S.me={id:2,role:'master',csrf:'test'};
+  h.app.S.data={work_queues:[{scope:'master:2:worker:4',revision:8,order_ids:[501,502]}],
+    orders:[{id:501,priority:'normal'},{id:502,priority:'emergency'}]};
+  h.app.override({api:async(path,method,body)=>{calls.push({path,method,body});await pending.promise;return {revision:9}},
+    refresh:async()=>{refreshes++}});
+  const first=h.app.moveWorkQueue('master:2:worker:4',502,'up');
+  const duplicate=h.app.moveWorkQueue('master:2:worker:4',502,'up');
+  assert.equal(calls.length,1);
+  assert.deepEqual(calls[0].body.order_ids,[502,501]);
+  assert.equal(calls[0].body.expected_revision,8);
+  assert.equal(h.app.S.data.orders[0].priority,'normal');
+  h.app.logoutLocal();pending.resolve();await Promise.all([first,duplicate]);
+  assert.equal(refreshes,0);
+  assert.equal(calls.length,1);
 });
