@@ -27,7 +27,7 @@ function harness() {
   ['#app','#login-screen','#detail-drawer','#drawer-backdrop','#view-root','#toast-region','#offline-banner','#telegram-button'].forEach(get);
   const localStorageWrites=[],logs=[];
   const globals={document,console:{log:(...x)=>logs.push(x),warn:(...x)=>logs.push(x),error:(...x)=>logs.push(x)},localStorage:{setItem:(...x)=>localStorageWrites.push(x),removeItem:(...x)=>localStorageWrites.push(x),getItem:()=>null},navigator:{onLine:true},location:{protocol:'http:',hostname:'example.invalid'},window:{addEventListener(){}},URLSearchParams,setTimeout:()=>0,clearInterval(){},setInterval:()=>1,performance:{now:()=>0},fetch:()=>Promise.reject(new Error('Unexpected real fetch')),FileReader:class{},prompt:()=>null,confirm:()=>true};
-  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','detailButtons','reassignmentForm','bindDrawer','loadReport','loadAudit','render','runAction','showTelegram','moveWorkQueue','exifPayload','insertJpegExif'];
+  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','detailButtons','closureForm','closeOrder','reviewEvidenceHTML','reassignmentForm','bindDrawer','renderReports','renderReportResult','bindReportControls','submitEquipmentDowntime','loadReport','loadAudit','render','runAction','showTelegram','moveWorkQueue','exifPayload','insertJpegExif'];
   const expose=`globalThis.app={S,${names.join(',')},override(overrides){${['api','refresh','openOrder','renderDrawer','render','syncChrome','compressImage','renderReportResult'].map(n=>`if(overrides.${n})${n}=overrides.${n};`).join('')}}};`;
   const source=fs.readFileSync(sourcePath,'utf8').replace(/\n  bindGlobal\(\);[\s\S]*?\n\}\)\(\);\s*$/,`\n  ${expose}\n})();`);
   vm.runInNewContext(source,globals,{filename:sourcePath});
@@ -48,6 +48,101 @@ function issueInputs(h) {
   for(const [id,value] of Object.entries({'issue-assignee':'worker:2','issue-title':'Новый наряд','issue-description':'Подробное описание работы','issue-type':'planned','issue-priority':'normal','issue-area':'1','issue-equipment':'3','issue-hours':'8','issue-template':'pump','issue-submit':''}))h.get('#'+id).value=value;
 }
 
+
+test('issuance sends a separate optional comment and preserves the draft on failure',async()=>{
+  const h=harness();issueInputs(h);h.get('#issue-comment').value='Детали для исполнителя\n<script>не HTML</script>';
+  const calls=[];h.app.override({api:async(p,m,b)=>{calls.push(b);throw Error('Ошибка сохранения')}});
+  await h.app.createOrder();
+  assert.equal(calls[0].issuance_comment,h.get('#issue-comment').value);
+  assert.equal(calls[0].description,'Подробное описание работы');
+  assert.equal(h.get('#issue-submit').disabled,false);
+  h.nodes.delete('#issue-comment');await h.app.createOrder();assert.equal(calls[1].issuance_comment,'');
+});
+
+test('issuance form shows workload and Russian references; detail escapes both comments',()=>{
+  const h=harness();issueInputs(h);h.get('#issue-norm-preview');h.get('#issue-equipment').value='3';
+  h.app.S.data.constants.equipment=[{id:3,code:'EQ-003',name:'Насос',equipment_type:'pump'}];
+  h.app.S.data.free_workers=[{id:2,display_name:'Иван',availability_label:'Выполняет наряд',current_order:{code:'NA-123'},queue_count:4}];
+  h.app.openNewOrder();
+  const form=h.get('#detail-drawer').innerHTML;
+  assert.match(form,/Комментарий при выдаче · необязательно/);assert.match(form,/id="issue-comment"[^>]*maxlength="1000"/);
+  assert.match(form,/текущий NA-123/);assert.match(form,/в очереди 4/);
+  const preview=h.get('#issue-norm-preview').innerHTML;
+  assert.match(preview,/Плановая/);assert.match(preview,/Насос/);assert.match(preview,/Ориентир: неизвестен/);
+  assert.doesNotMatch(preview,/unknown|planned|pump/);
+  h.app.S.me.role='worker';
+  h.app.renderDrawer({order:{id:101,status:'closed',issuance_comment:'<issue>',worker_completion_comment:'<complete>',
+    completion_text:'Отчёт выполнен',equipment:{code:'EQ-003'},worker:{},master:{},photos:[]},history:[{event:'issued',payload:{issuance_comment:'<audit>'}}]});
+  const detail=h.get('#detail-drawer').innerHTML;
+  for(const tag of ['issue','complete','audit']){assert.ok(detail.includes(`&lt;${tag}&gt;`));assert.ok(!detail.includes(`<${tag}>`));}
+});
+
+test('closure requires an explicit human score and keeps draft after a rejected write',async()=>{
+  const h=harness();h.app.S.me.role='master';h.get('#closure-rating').value='';h.get('#closure-comment').value='Проверено мастером';const button=h.get('[data-close-order]');
+  const html=h.app.closureForm();assert.match(html,/<option value="">Выберите явно<\/option>/);assert.doesNotMatch(html,/selected/);
+  let writes=0;h.app.override({api:async()=>{writes++;throw Error('validation rejected')},refresh:async()=>{}});
+  await h.app.closeOrder({currentTarget:button});assert.equal(writes,0);
+  h.get('#closure-rating').value='4';
+  await h.app.closeOrder({currentTarget:button});assert.equal(writes,1);
+  assert.equal(h.get('#closure-comment').value,'Проверено мастером');assert.equal(button.disabled,false);
+});
+
+test('closure is single-flight and remains attached to its initiating order',async()=>{
+  const h=harness(),pending=deferred();h.app.S.me.role='master';
+  h.get('#closure-rating').value='3';h.get('#closure-comment').value='Обоснованная оценка';const button=h.get('[data-close-order]'),calls=[];
+  h.app.override({api:async(url,method,body)=>{calls.push({url,body});return pending.promise},refresh:async()=>{}});
+  const task=h.app.closeOrder({currentTarget:button});
+  await h.app.closeOrder({currentTarget:button});assert.equal(calls.length,1);
+  assert.equal(calls[0].url,'/api/orders/101/action');assert.equal(calls[0].body.rating,3);
+  assert.equal(calls[0].body.closure_comment,'Обоснованная оценка');
+  h.app.S.orderId=202;pending.resolve({order:{id:101,status:'closed'}});await task;
+  assert.equal(calls.length,1);assert.equal(h.app.S.drawerWrites.size,0);
+});
+
+test('worker sees separate AI and master scores with escaped explanations and unknown references',()=>{
+  const h=harness();
+  const html=h.app.reviewEvidenceHTML({report_score:5,score_reason:'<model>',norm_reference:{status:'unknown'}},{rating:3,rating_reason:'<master>'});
+  assert.match(html,/5\/5/);assert.match(html,/3\/5/);
+  assert.match(html,/&lt;model&gt;/);assert.match(html,/&lt;master&gt;/);
+  assert.match(html,/Нет применимого ориентира/);
+  const offline=h.app.reviewEvidenceHTML({report_score:null,score_reason:'Только правила'},{rating:null});
+  assert.match(offline,/Не выставлена/);assert.match(offline,/Нет оценки мастера/);
+});
+
+test('report filters survive rendering and every selected dimension reaches the API',async()=>{
+  const h=harness();h.app.S.me.role='master';h.app.S.view='reports';
+  Object.assign(h.app.S,{reportArea:'2',reportEquipment:'3',reportWorker:'4'});
+  h.app.S.data.constants={areas:[{id:2,name:'Участок <два>'}],equipment:[{id:3,code:'EQ-3',name:'Насос'}],users:[{id:4,role:'worker',display_name:'Исполнитель'}]};
+  const html=h.app.renderReports();
+  assert.match(html,/id="report-area"/);assert.match(html,/value="2" selected/);assert.match(html,/Участок &lt;два&gt;/);
+  for(const [name,value] of Object.entries({'from':'2001-01-01','to':'2001-01-02','brigade':'A','shift':'C','area':'2','equipment':'3','worker':'4'}))h.get('#report-'+name).value=value;
+  h.get('#report-result');const urls=[];h.app.override({api:async url=>{urls.push(url);return {summary:{}}},renderReportResult(){}});
+  await h.app.loadReport({type:'click'});
+  const query=new URL(urls[0],'http://local.test').searchParams;
+  assert.equal(query.get('area_id'),'2');assert.equal(query.get('equipment_id'),'3');assert.equal(query.get('worker_id'),'4');
+  assert.equal(query.get('shift_code'),'C');assert.equal(query.has('include_ai_summary'),false);
+  await h.app.loadReport(true);assert.match(urls[1],/include_ai_summary=1/);
+});
+
+test('downtime submits explicit order linkage and retries with the same idempotency key',async()=>{
+  const h=harness();h.app.S.me.role='master';h.app.S.view='reports';
+  for(const [name,value] of Object.entries({'equipment':'3','order':'101','start':'2001-01-01T10:00','end':'2001-01-01T11:00','reason':'Проверка связи'}))h.get('#downtime-'+name).value=value;
+  h.get('#downtime-submit');h.get('#report-result');const payloads=[];
+  h.app.override({api:async(url,method,body)=>{if(method==='POST'){payloads.push({...body});if(payloads.length===1)throw Error('connection lost');return {duplicate:true};}return {summary:{}};},renderReportResult(){}});
+  await h.app.submitEquipmentDowntime({preventDefault(){}});
+  await h.app.submitEquipmentDowntime({preventDefault(){}});
+  assert.equal(payloads[0].order_id,101);assert.equal(payloads[0].equipment_id,3);
+  assert.equal(payloads[0].idempotency_key,payloads[1].idempotency_key);assert.equal(h.app.S.downtimeDraft,null);
+});
+
+test('report output separates event totals from current workload and escapes notes',()=>{
+  const h=harness();h.app.S.view='reports';h.get('#report-result');
+  h.app.S.report={summary:{date_from:'2001-01-01',date_to:'2001-01-01',shift_code:'A',period_note:'<period>',workload_note:'<load>'},
+    worker_totals:[{worker_id:1,worker:'<worker>',brigade:'B',shift_code:'B',completed:0,closed:1,labor_hours:0,current_active:3,current_in_progress:1,current_queued:2}],items:[]};
+  h.app.renderReportResult();const html=h.get('#report-result').innerHTML;
+  assert.match(html,/Активно сейчас/);assert.match(html,/В работе сейчас/);assert.match(html,/Очередь сейчас/);
+  assert.match(html,/&lt;worker&gt;/);assert.match(html,/&lt;period&gt;/);assert.match(html,/&lt;load&gt;/);
+});
 test('EXIF transfer survives browser JPEG recompression and can be inspected again',()=>{
   const h=harness();
   const exif=Uint8Array.from([69,120,105,102,0,0,73,73,42,0,8,0]);
@@ -138,35 +233,36 @@ test('new-order photo picker tracks manual and template type changes, repeats, a
   };
   setupForm();h.app.openNewOrder();
   const type=h.get('#issue-type'),wrap=h.get('#issue-before-photo-wrap'),input=h.get('#issue-before-photo'),template=h.get('#issue-template');
-  assert.equal(type.value,'unscheduled');assert.equal(wrap.classList.contains('hidden'),false);assert.equal(input.required,true);
-  type.value='planned';type.events.change();assert.equal(wrap.classList.contains('hidden'),true);assert.equal(input.required,false);
-  template.events.change({target:{value:'pump'}});assert.equal(type.value,'unscheduled');assert.equal(wrap.classList.contains('hidden'),false);assert.equal(input.required,true);
-  template.events.change({target:{value:'pm'}});assert.equal(type.value,'planned');assert.equal(wrap.classList.contains('hidden'),true);assert.equal(input.required,false);
-  template.events.change({target:{value:'pump'}});assert.equal(type.value,'unscheduled');assert.equal(wrap.classList.contains('hidden'),false);assert.equal(input.required,true);
-  let writes=0;h.app.override({api:async()=>{writes++;return {order:{id:9}}}});await h.app.createOrder();assert.equal(writes,0);
+  assert.equal(type.value,'unscheduled');assert.equal(wrap.classList.contains('hidden'),false);assert.equal(input.required,false);
+  type.value='planned';type.events.change();assert.equal(wrap.classList.contains('hidden'),false);assert.equal(input.required,false);
+  template.events.change({target:{value:'pump'}});assert.equal(type.value,'unscheduled');assert.equal(wrap.classList.contains('hidden'),false);assert.equal(input.required,false);
+  template.events.change({target:{value:'pm'}});assert.equal(type.value,'planned');assert.equal(wrap.classList.contains('hidden'),false);assert.equal(input.required,false);
+  template.events.change({target:{value:'pump'}});assert.equal(type.value,'unscheduled');assert.equal(wrap.classList.contains('hidden'),false);assert.equal(input.required,false);
+  let writes=0;h.app.override({api:async()=>{writes++;return {order:{id:9}}},openOrder:async()=>{},refresh:async()=>{}});await h.app.createOrder();assert.equal(writes,1);
   type.value='planned';type.events.change();h.app.closeDrawer();
   setupForm();h.app.openNewOrder();
-  assert.equal(h.get('#issue-type').value,'unscheduled');assert.equal(h.get('#issue-before-photo-wrap').classList.contains('hidden'),false);assert.equal(h.get('#issue-before-photo').required,true);
+  assert.equal(h.get('#issue-type').value,'unscheduled');assert.equal(h.get('#issue-before-photo-wrap').classList.contains('hidden'),false);assert.equal(h.get('#issue-before-photo').required,false);
 });
 
-test('new unscheduled orders require and send a compressed before photo in the create request',async()=>{
+test('new orders send an optional compressed before photo and can be issued without one',async()=>{
   const h=harness();issueInputs(h);h.get('#issue-type').value='unscheduled';h.get('#issue-before-photo').files=[{name:'before.png'}];
   const calls=[];h.app.override({compressImage:async file=>({file_name:file.name,data_url:'data:image/jpeg;base64,valid'}),
     api:async(p,m,b)=>{calls.push([p,m,b]);return {order:{id:9}}},openOrder:async()=>{},refresh:async()=>{}});
   await h.app.createOrder();assert.equal(calls.length,1);assert.equal(calls[0][0],'/api/orders');
   assert.equal(calls[0][2].before_photo.data_url,'data:image/jpeg;base64,valid');
   const h2=harness();issueInputs(h2);h2.get('#issue-type').value='unscheduled';let writes=0;
-  h2.app.override({api:async()=>{writes++}});await h2.app.createOrder();assert.equal(writes,0);
+  h2.app.override({api:async(p,m,b)=>{writes++;assert.equal(b.before_photo,undefined);return {order:{id:10}}},openOrder:async()=>{},refresh:async()=>{}});await h2.app.createOrder();assert.equal(writes,1);
+  h.get('#issue-type').value='planned';await h.app.createOrder();assert.equal(calls.length,2);assert.equal(calls[1][2].before_photo.file_name,'before.png');
 });
 
-test('unscheduled work can be queued but cannot be accepted without a unique before photo',()=>{
+test('optional before photo does not block direct or queued acceptance',()=>{
   const h=harness(),order={status:'issued',work_type:'unscheduled',photos:[]};
   const issued=h.app.detailButtons(order);
-  assert.match(issued,/data-action="accept" disabled/);
+  assert.match(issued,/data-action="accept"(?! disabled)/);
   assert.match(issued,/data-action="queue"(?! disabled)/);
   h.app.S.me.role='worker';
   const queued=h.app.detailButtons({...order,status:'queued'});
-  assert.match(queued,/data-action="accept" disabled/);
+  assert.match(queued,/data-action="accept"(?! disabled)/);
   assert.doesNotMatch(h.app.detailButtons({...order,photos:[{phase:'before',duplicate:false}]}),/data-action="accept" disabled/);
 });
 

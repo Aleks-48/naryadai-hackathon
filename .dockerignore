@@ -1,5 +1,7 @@
 .git
 .venv
+.test-temp
+tmp
 __pycache__
 *.pyc
 data

@@ -129,7 +129,7 @@ class StreamlitApiAppTest(unittest.TestCase):
         self.assertIn("Рейтинг / 100", worker_metrics)
         worker_frames = [item.value for item in worker.dataframe if hasattr(item.value, "columns")]
         self.assertTrue(any({"Фактор", "Значение / 100", "Базовый вес, %"}.issubset(frame.columns) for frame in worker_frames))
-        self.assertTrue(any({"Отказы — события", "Обоснованы мастером", "Необоснованы мастером", "Pending · ждут решения мастера"}.issubset(frame.columns) for frame in worker_frames))
+        self.assertTrue(any({"Отказы — события", "Обоснованы мастером", "Необоснованы мастером", "Ждут решения мастера"}.issubset(frame.columns) for frame in worker_frames))
         dashboard_metrics = {item.label for item in manager.metric}
         self.assertTrue({"Ожидают", "Приняты / в работе", "Проверка / доработка", "Закрыты мастером"}.issubset(dashboard_metrics))
 
@@ -148,7 +148,7 @@ class StreamlitApiAppTest(unittest.TestCase):
         team_frames = [item.value for item in manager.dataframe if hasattr(item.value, "columns")]
         self.assertTrue(any("Общий рейтинг / 100" in frame.columns for frame in team_frames))
         self.assertTrue(any("Качество закрытых нарядов" in frame.columns for frame in team_frames))
-        self.assertTrue(any("Pending · ждут решения мастера" in frame.columns for frame in team_frames))
+        self.assertTrue(any("Ждут решения мастера" in frame.columns for frame in team_frames))
 
         section.set_value(section.options[-1]).run()
         self.assertFalse(manager.exception, self.exceptions(manager))
@@ -181,6 +181,42 @@ class StreamlitApiAppTest(unittest.TestCase):
         data=self.api_json(master,"/api/equipment/downtime?"+params)
         self.assertGreaterEqual(data["minutes"],60)
         self.assertTrue(any(item["reason"]=="Synthetic maintenance stop" for item in data["intervals"]))
+
+    def test_report_link_and_rating_filters_through_streamlit(self) -> None:
+        master = self.new_app("master01","master")
+        bootstrap = self.api_json(master,"/api/bootstrap")
+        order = bootstrap["orders"][0]
+        asset = next(row for row in bootstrap["constants"]["equipment"] if row["id"] == order["equipment_id"])
+        section = next(item for item in master.radio if item.label == LABELS["section"])
+        section.set_value(section.options[-1]).run()
+        linked = next(item for item in master.selectbox if item.label == "Наряд (необязательно)")
+        linked.set_value(next(option for option in linked.options if option.startswith(order["code"]+" ·")))
+        equipment = next(item for item in master.selectbox if item.label == "Оборудование")
+        equipment.set_value(next(option for option in equipment.options if option.startswith(asset["code"]+" ·")))
+        reason = "Linked AppTest " + str(time.time_ns())
+        next(item for item in master.text_input if item.label == "Причина регистрации").set_value(reason)
+        self.click(master,"register_downtime")
+        detail = self.api_json(master,f"/api/orders/{order['id']}")
+        self.assertTrue(any(row["reason"] == reason for row in detail["order"]["equipment_downtime"]["intervals"]))
+        labels = {item.label for item in master.selectbox}
+        self.assertTrue({"Участок отчёта","Оборудование отчёта","Исполнитель отчёта"}.issubset(labels))
+        report_equipment = next(item for item in master.selectbox if item.label == "Оборудование отчёта")
+        report_equipment.set_value(next(option for option in report_equipment.options if option.startswith(asset["code"]+" ·")))
+        self.click(master,"make_report")
+        self.assertFalse(master.exception,self.exceptions(master))
+        self.assertTrue(any("срез на сейчас" in item.value for item in master.caption))
+
+        worker = self.new_app("worker01","worker")
+        dates = {item.label:item for item in worker.date_input}
+        # Stay inside the widget's supported calendar range (default: +/- ten years).
+        sample_day = datetime.now(timezone.utc).date().replace(month=1,day=1)
+        dates["Рейтинг с"].set_value(sample_day)
+        dates["Рейтинг по"].set_value(sample_day)
+        next(item for item in worker.selectbox if item.label == "Смена событий рейтинга").set_value("C")
+        worker.run()
+        self.assertFalse(worker.exception,self.exceptions(worker))
+        self.assertTrue(any(sample_day.isoformat() in item.value and "смена событий C" in item.value for item in worker.caption),
+                        [item.value for item in worker.caption])
 
     def test_area_change_refreshes_equipment_before_form_submission(self) -> None:
         master = self.new_app("master01", "master")
@@ -220,18 +256,22 @@ class StreamlitApiAppTest(unittest.TestCase):
         description = "Inspect the synthetic pump and record the condition before work."
         next(item for item in master.text_input if item.label == LABELS["title"]).set_value(first_title)
         next(item for item in master.text_area if item.label == LABELS["description"]).set_value(description)
+        next(item for item in master.text_area if item.label == "Комментарий при выдаче · необязательно").set_value("Заметка мастера\n<не HTML>")
         next(item for item in master.selectbox if item.label == LABELS["assignee"]).set_value(worker["id"])
         work_type = next(item for item in master.selectbox if item.label == LABELS["work_type"])
         self.assertEqual(work_type.value, "planned")
         self.assertEqual(len(master.file_uploader), 1, "photo picker must already be present before selecting work type")
 
-        # Pick type, attach the required photo, and submit in one AppTest run.
+        # Pick type, attach an optional photo, and submit in one AppTest run.
         work_type.set_value("unscheduled")
         master.file_uploader[0].upload("unique-a.jpg", photo_a, "image/jpeg")
         self.click(master, "create")
         self.assertFalse(master.exception, self.exceptions(master))
         first = next(order for order in self.api_json(master, "/api/bootstrap")["orders"] if order["title"] == first_title)
         first_order = self.api_json(master, f"/api/orders/{first['id']}")["order"]
+        self.assertEqual(first_order["issuance_comment"], "Заметка мастера\n<не HTML>")
+        self.select_order(master, first['id'])
+        self.assertTrue(any(item.value == "Заметка мастера\n<не HTML>" for item in master.text))
         self.assertTrue(any(item["phase"] == "before" for item in first_order.get("photos", [])))
 
         missing_title = "Missing-photo validation " + str(time.time_ns())
@@ -240,10 +280,9 @@ class StreamlitApiAppTest(unittest.TestCase):
         master.file_uploader[0].set_value(None)
         # No intermediate .run(): the first submit must validate this form as-is.
         self.click(master, "create")
-        self.assertTrue(master.error, "missing unscheduled photo must be rejected")
-        self.assertEqual(next(item for item in master.text_input if item.label == LABELS["title"]).value, missing_title)
-        self.assertEqual(next(item for item in master.text_area if item.label == LABELS["description"]).value, description)
-        self.assertFalse(any(order["title"] == missing_title for order in self.api_json(master, "/api/bootstrap")["orders"]))
+        self.assertFalse(master.error, [item.value for item in master.error])
+        missing = next(order for order in self.api_json(master, "/api/bootstrap")["orders"] if order["title"] == missing_title)
+        self.assertEqual(self.api_json(master, f"/api/orders/{missing['id']}")["order"]["photos"], [])
 
         retry_title = "Repeated type switch " + str(time.time_ns())
         next(item for item in master.text_input if item.label == LABELS["title"]).set_value(retry_title)
@@ -257,7 +296,7 @@ class StreamlitApiAppTest(unittest.TestCase):
         retry_order = self.api_json(master, f"/api/orders/{retry['id']}")["order"]
         self.assertTrue(any(item["phase"] == "before" for item in retry_order.get("photos", [])))
 
-        planned_title = "Planned photo ignored " + str(time.time_ns())
+        planned_title = "Planned photo retained " + str(time.time_ns())
         next(item for item in master.text_input if item.label == LABELS["title"]).set_value(planned_title)
         next(item for item in master.selectbox if item.label == LABELS["work_type"]).set_value("planned")
         master.file_uploader[0].upload("unique-planned.jpg", unique_photo(time.time_ns() + 2), "image/jpeg")
@@ -265,7 +304,20 @@ class StreamlitApiAppTest(unittest.TestCase):
         planned = next(order for order in self.api_json(master, "/api/bootstrap")["orders"] if order["title"] == planned_title)
         planned_order = self.api_json(master, f"/api/orders/{planned['id']}")["order"]
         self.assertEqual(planned_order["work_type"], "planned")
-        self.assertFalse(any(item["phase"] == "before" for item in planned_order.get("photos", [])))
+        self.assertTrue(any(item["phase"] == "before" for item in planned_order.get("photos", [])))
+
+        brigade_title = "Brigade issuance " + str(time.time_ns())
+        next(item for item in master.text_input if item.label == LABELS["title"]).set_value(brigade_title)
+        assignee = next(item for item in master.selectbox if item.label == LABELS["assignee"])
+        self.assertTrue(any("в очереди" in option for option in assignee.options))
+        assignee.set_value("brigade:A")
+        next(item for item in master.text_area if item.label == "Комментарий при выдаче · необязательно").set_value("")
+        master.file_uploader[0].set_value(None)
+        self.click(master, "create")
+        self.assertFalse(master.exception, self.exceptions(master))
+        brigade_order = next(order for order in self.api_json(master, "/api/bootstrap")["orders"] if order["title"] == brigade_title)
+        self.assertEqual(brigade_order["assigned_brigade"], "A")
+        self.assertEqual(brigade_order["issuance_comment"], "")
 
     def test_master_moves_manual_queue_and_worker_reads_same_position(self) -> None:
         master = self.new_app("master01", "master")
@@ -477,8 +529,10 @@ class StreamlitApiAppTest(unittest.TestCase):
         self.select_order(master, order_id)
         close_note = next(item for item in master.text_input if item.label == LABELS["close_note"])
         close_note.set_value("Reviewed the report and accepted the measured result.")
+        next(item for item in master.selectbox if item.label == "Оценка при закрытии 1–5").set_value(4)
         self.click(master, "close")
         self.assert_status(master, order_id, "closed")
+        self.assertEqual(self.api_json(master,f"/api/orders/{order_id}")["order"]["rating"],4)
         self.select_order(master, order_id)
 
         rating = next(item for item in master.selectbox if item.label == LABELS["rating"])

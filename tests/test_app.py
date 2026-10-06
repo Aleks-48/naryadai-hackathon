@@ -302,7 +302,7 @@ class LocalAPITest(unittest.TestCase):
             labor_hours=1.0,materials=[],materials_not_used=True)[0],200)
         checked=self.action(worker,oid,"ai_check")
         self.assertEqual(checked[1]["order"]["status"],"ai_review",checked[1])
-        closed=self.action(master,oid,"close",closure_comment="Плановый результат проверен мастером.")
+        closed=self.action(master,oid,"close",rating=4,closure_comment="Плановый результат проверен мастером.")
         self.assertEqual(closed[0],200,closed[1])
         return oid
 
@@ -491,7 +491,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(first_review["mode"],"rules-only: configuration_missing")
         self.assertEqual(first_review["verdict"],"rework")
         self.assertTrue(any("фото" in issue.lower() for issue in first_review["issues"]))
-        self.assertEqual(self.action(master,order_id,"close",closure_comment="Принято мастером")[0],409)
+        self.assertEqual(self.action(master,order_id,"close",rating=4,closure_comment="Принято мастером")[0],409)
 
         # Rework cycle; binary content, digest duplicate detection and upload latency.
         self.assertEqual(self.action(worker,order_id,"start")[1]["order"]["status"],"in_progress")
@@ -518,13 +518,13 @@ class LocalAPITest(unittest.TestCase):
         with app.connect(self.db_path) as db:
             close_audit_before=db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='close'",(order_id,)).fetchone()[0]
         for invalid_comment in (None,True,7,[],{},"    "):
-            bad_close=self.action(master,order_id,"close",closure_comment=invalid_comment)
+            bad_close=self.action(master,order_id,"close",rating=4,closure_comment=invalid_comment)
             self.assertEqual(bad_close[0],400,repr(invalid_comment))
             with app.connect(self.db_path) as db:
                 state=db.execute("SELECT status,closed_at FROM orders WHERE id=?",(order_id,)).fetchone()
                 self.assertEqual(tuple(state),("ai_review",None))
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='close'",(order_id,)).fetchone()[0],close_audit_before)
-        closed=self.action(master,order_id,"close",closure_comment="Фото проверено мастером; дата EXIF неизвестна.")
+        closed=self.action(master,order_id,"close",rating=4,closure_comment="Фото проверено мастером; дата EXIF неизвестна.")
         self.assertEqual(closed[0],200,closed[1])
         self.assertEqual(closed[1]["order"]["status"],"closed")
 
@@ -539,7 +539,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertGreaterEqual(upload_seconds,0)
         print(f"\nMeasured local upload request: {upload_seconds:.3f}s (limit 10s)")
 
-    def test_unscheduled_acceptance_waits_for_unique_master_photo(self):
+    def test_before_photo_is_optional_for_issue_and_acceptance(self):
         master=self.client("master01");worker=self.client("worker01");manager=self.client("manager")
         with app.connect(self.db_path) as db:
             before_counts=tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -548,30 +548,37 @@ class LocalAPITest(unittest.TestCase):
             "title":"Проверка насосного узла","description":"Проверить вибрацию, закрепить узел и записать результат наблюдения.",
             "work_type":"unscheduled","priority":"normal","area_id":self.area_id,"equipment_id":self.equipment_id,
             "worker_id":self.worker_id,"norm_hours":6})
-        self.assertEqual(rejected[0],400,rejected[1])
+        self.assertEqual(rejected[0],201,rejected[1])
+        self.assertEqual(rejected[1]["order"]["photos"],[])
+        self.assertEqual(self.action(worker,rejected[1]["order"]["id"],"accept")[0],200)
         with app.connect(self.db_path) as db:
             after_counts=tuple(db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                                for table in ("orders","photos","audit","notifications"))
-        self.assertEqual(after_counts,before_counts)
+        self.assertEqual(after_counts[0],before_counts[0]+1)
+        self.assertEqual(after_counts[1],before_counts[1])
 
         order=self.create_order(master);oid=order["id"]
         self.assertEqual(manager.call(f"/api/orders/{oid}/action","POST",{"action":"accept"})[0],403)
         with app.connect(self.db_path) as db:
             before_id=db.execute("SELECT id FROM photos WHERE order_id=? AND phase='before'",(oid,)).fetchone()[0]
             db.execute("UPDATE photos SET duplicate=1 WHERE id=?",(before_id,))
-        status,response=self.action(worker,oid,"accept")
-        self.assertEqual(status,409,response)
-        self.assertEqual(worker.call(f"/api/orders/{oid}")[1]["order"]["status"],"issued")
         self.assertEqual(self.action(worker,oid,"queue")[1]["order"]["status"],"queued")
-        status,_=self.action(worker,oid,"accept")
-        self.assertEqual(status,409)
-        self.assertEqual(worker.call(f"/api/orders/{oid}")[1]["order"]["status"],"queued")
-
-        repaired=self.upload(master,oid,make_photo(background=(238,41,79)),phase="before",name="before-repair.png")
-        self.assertEqual(repaired[0],201,repaired[1])
-        self.assertFalse(repaired[1]["photo"]["duplicate"])
         self.assertEqual(self.action(worker,oid,"accept")[1]["order"]["status"],"accepted")
         self.assertEqual(self.upload(master,oid,make_photo(background=(15,225,60)),phase="before")[0],403)
+
+    def test_planned_issue_accepts_optional_photo_and_rejects_malformed_photo(self):
+        master=self.client("master01")
+        body={"title":"Плановый осмотр", "description":"Проверить оборудование и зафиксировать результат.",
+              "work_type":"planned", "priority":"planned", "area_id":self.area_id,
+              "equipment_id":self.equipment_id,"worker_id":self.worker_id,"norm_hours":6}
+        for malformed in (None,False,[],"image",{}):
+            self.assertEqual(master.call("/api/orders","POST",{**body,"before_photo":malformed})[0],400)
+        raw=make_before_photo((32,163,217))
+        body["before_photo"]={"file_name":"planned-before.png",
+            "data_url":"data:image/png;base64,"+base64.b64encode(raw).decode()}
+        status,result=master.call("/api/orders","POST",body)
+        self.assertEqual(status,201,result)
+        self.assertEqual(result["order"]["photos"][0]["phase"],"before")
 
     def test_invalid_or_failed_unscheduled_issue_leaves_no_order_or_file(self):
         master=self.client("master01")
@@ -638,7 +645,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(completed[0],200,completed[1])
         self.assertEqual(completed[1]["order"]["worker_completion_comment"],"")
         self.assertEqual(self.action(worker,oid,"ai_check")[1]["order"]["status"],"ai_review")
-        closed=self.action(master,oid,"close",closure_comment="Проверено мастером; итог принят.")
+        closed=self.action(master,oid,"close",rating=4,closure_comment="Проверено мастером; итог принят.")
         self.assertEqual(closed[0],200,closed[1])
         with app.connect(self.db_path) as db:
             completion_payload=json.loads(db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='complete' ORDER BY id DESC LIMIT 1",(oid,)).fetchone()[0])
@@ -899,7 +906,7 @@ class LocalAPITest(unittest.TestCase):
 
     def test_llm_review_sends_bounded_anonymized_context_as_untrusted_data(self):
         model_report={"verdict":"accepted","summary":"Synthetic match","issues":[],
-                      "confidence":0.9,"needs_master_attention":False}
+                      "confidence":0.9,"report_score":4,"score_reason":"Отчёт содержит действия и результат.","needs_master_attention":False}
         class Response:
             def __enter__(self): return self
             def __exit__(self,*args): return False
@@ -931,7 +938,7 @@ class LocalAPITest(unittest.TestCase):
         bounded=payload["order_context"]
         self.assertEqual(set(bounded),{"original_problem","equipment","reported_fault","work_type","materials",
             "materials_not_used","reported_labor_hours","hours_until_deadline_from_start","unique_after_photos",
-            "truncated","truncated_fields"})
+            "truncated","truncated_fields","norm_reference"})
         self.assertLessEqual(len(bounded["original_problem"]),1200)
         self.assertLessEqual(len(bounded["equipment"]),160)
         self.assertLessEqual(len(bounded["reported_fault"]),120)
@@ -958,7 +965,7 @@ class LocalAPITest(unittest.TestCase):
         seen=[]
         for verdict in ("rework","comments"):
             model={"mode":"llm:fake","summary":"Mismatch or missing facts","issues":["Reported task does not match."],
-                   "verdict":verdict,"confidence":0.96,"needs_master_attention":False}
+                   "verdict":verdict,"confidence":0.96,"report_score":4,"score_reason":"Отчёт содержит действия и результат.","needs_master_attention":False}
             with unittest.mock.patch.object(app,"llm_review",side_effect=lambda text,ctx:(seen.append((text,ctx)) or model)):
                 result=app.complete_review("Completed unrelated railing paint task.",[],1,2.0,"planned",context)
             self.assertEqual(result["verdict"],verdict)
@@ -969,7 +976,7 @@ class LocalAPITest(unittest.TestCase):
 
     def test_optimistic_model_cannot_accept_missing_order_context(self):
         accepted={"mode":"llm:fake","summary":"Looks complete","issues":[],"verdict":"accepted",
-                  "confidence":0.99,"needs_master_attention":False}
+                  "confidence":0.99,"report_score":4,"score_reason":"Отчёт содержит действия и результат.","needs_master_attention":False}
         with unittest.mock.patch.object(app,"llm_review",return_value=accepted):
             result=app.complete_review("Completed the repair and checked the result.",[],1,1.0,"planned",{})
         self.assertEqual(result["verdict"],"comments")
@@ -979,7 +986,7 @@ class LocalAPITest(unittest.TestCase):
 
     def test_truncated_order_context_cannot_be_accepted_without_master_review(self):
         accepted={"mode":"llm:fake","summary":"Looks complete","issues":[],"verdict":"accepted",
-                  "confidence":0.99,"needs_master_attention":False}
+                  "confidence":0.99,"report_score":4,"score_reason":"Отчёт содержит действия и результат.","needs_master_attention":False}
         context={"problem":"Pump P-07 leak; " + "details "*400,"equipment":"Pump P-07",
                  "materials":[{"sku":f"SKU-{i}","name":"seal","unit":"piece","quantity":1} for i in range(25)]}
         with unittest.mock.patch.object(app,"llm_review",return_value=accepted):
@@ -1017,7 +1024,7 @@ class LocalAPITest(unittest.TestCase):
                 self.seen.append((context,report,verdict))
                 parsed={"verdict":verdict,"summary":"Synthetic semantic fixture response.",
                         "issues":[issue] if issue else [],"confidence":0.94,
-                        "needs_master_attention":verdict!="accepted"}
+                        "report_score":4 if verdict=="accepted" else 1,"score_reason":"Учебное объяснение оценки.","needs_master_attention":verdict!="accepted"}
                 payload={"choices":[{"message":{"content":json.dumps(parsed)}}]}
                 return Response(payload)
         opener=FakeSemanticOpener()
@@ -1040,7 +1047,7 @@ class LocalAPITest(unittest.TestCase):
 
     def test_gemini_json_schema_adapter_is_opt_in_and_validates_response(self):
         report = {"verdict":"accepted","summary":"Текст описывает работу и результат.","issues":[],
-                  "confidence":0.92,"needs_master_attention":False}
+                  "confidence":0.92,"report_score":4,"score_reason":"Отчёт содержит действия и результат.","needs_master_attention":False}
         class Response:
             def __init__(self, payload): self.payload=payload
             def __enter__(self): return self
@@ -1064,7 +1071,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(request_body["response_format"]["type"],"json_schema")
         self.assertTrue(request_body["response_format"]["json_schema"]["strict"])
         self.assertEqual(set(request_body["response_format"]["json_schema"]["schema"]["required"]),
-                         {"verdict","summary","issues","confidence","needs_master_attention"})
+                         {"verdict","summary","issues","confidence","report_score","score_reason","needs_master_attention"})
         with unittest.mock.patch.dict(os.environ,{**settings,"NARYADAI_LLM_ENABLED":""}):
             disabled=app.llm_review("Нормальный пример текста достаточной длины.")
         self.assertEqual(disabled["mode"],"rules-only: disabled")
@@ -1098,7 +1105,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(truncated["note"],"IncompleteRead")
 
         report={"verdict":"accepted","summary":"Synthetic response","issues":[],"confidence":10**400,
-                "needs_master_attention":False}
+                "report_score":4,"score_reason":"Отчёт содержит действия и результат.","needs_master_attention":False}
         payload={"choices":[{"message":{"content":json.dumps(report)}}]}
         class Response:
             def __enter__(self): return self
@@ -1186,18 +1193,22 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(self.action(worker,pid,"ai_check")[1]["order"]["status"],"ai_review")
         self.assertEqual(self.action(worker,pid,"close")[0],403)
         self.assertEqual(self.action(master,pid,"close")[0],400)
-        accepted=self.action(master,pid,"close",closure_comment="Проверено мастером, замечаний нет.")
+        accepted=self.action(master,pid,"close",rating=4,closure_comment="Проверено мастером, замечаний нет.")
         self.assertEqual(accepted[0],200,accepted[1])
         with app.connect(self.db_path) as db:
             close_event=db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='close' ORDER BY id DESC LIMIT 1",(pid,)).fetchone()
             self.assertEqual(json.loads(close_event[0])["closure_comment"],"Проверено мастером, замечаний нет.")
         today=app.utcnow().date().isoformat()
+        with app.connect(self.db_path) as db:
+            db.execute("UPDATE orders SET completed_at=?,closed_at=? WHERE id=?",
+                       (today+"T07:30:00Z",today+"T07:35:00Z",pid))
+            db.commit()
         shift=worker.call(f"/api/reports?date_from={today}&date_to={today}&brigade=A&shift_code=A")
         self.assertEqual(shift[0],200,shift[1])
         self.assertGreaterEqual(shift[1]["summary"]["completed"],1)
         self.assertEqual(shift[1]["summary"]["date_from"],today)
         self.assertEqual(shift[1]["summary"]["shift_code"],"A")
-        self.assertIn("не является подтверждённым простоем",shift[1]["summary"]["pause_minutes_note"])
+        self.assertIn("не подтверждённый простой",shift[1]["summary"]["pause_minutes_note"])
         self.assertEqual(worker.call("/api/reports?date_from=2026-09-02&date_to=2026-09-01")[0],400)
         self.assertEqual(worker.call("/api/reports?date_from=bad&date_to=2026-09-01")[0],400)
         profile=worker.call("/api/bootstrap?rating_from=2026-09-01&rating_to=2026-10-02")[1]
@@ -1246,7 +1257,7 @@ class LocalAPITest(unittest.TestCase):
                 if path=="/": self.assertIn("manifest.webmanifest",body)
                 if path=="/sw.js":
                     self.assertIn("cache.addAll",body)
-                    self.assertIn("naryadai-shell-v12",body)
+                    self.assertIn("naryadai-shell-v16",body)
                 if path.endswith("styles.css"): self.assertIn("max-width:760px",body)
                 if path.endswith("/manifest.webmanifest"):
                     manifest=json.loads(body)
@@ -2179,7 +2190,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(status,201,unknown)
         self.assertEqual(unknown["order"]["norm_reference"]["status"],"unknown")
         self.assertIsNone(unknown["order"]["norm_reference"]["labor"]["quantity"])
-        self.assertIn("unknown",unknown["order"]["norm_reference"]["note"])
+        self.assertIn("неизвестен",unknown["order"]["norm_reference"]["note"])
 
     def test_legacy_seeded_completion_without_material_evidence_stays_unknown(self):
         master=self.client("master02")

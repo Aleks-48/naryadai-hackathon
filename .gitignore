@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 data/
 .venv/
+.test-temp/
+tmp/
 .env
 deliverables/
 

@@ -42,6 +42,15 @@ def main() -> None:
                 last_error = str(error)
                 time.sleep(0.2)
         output = ""
+        # Stop the child before reading its pipe: read(size) on a live idle
+        # server can block forever and defeat the advertised 20-second bound.
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
         if process.stdout:
             try:
                 output = process.stdout.read(10_000)

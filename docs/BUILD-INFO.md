@@ -1,5 +1,7 @@
 # Build verification · 5 October 2026
 
+Historical snapshot only. Current source reconciliation and verification: [6 October acceptance](acceptance-2026-10-06.md). Optional before-photo behavior now follows the original case §5.1; old mandatory-photo statements below describe the preserved baseline commit, not the current implementation.
+
 This local source snapshot carries the Telegram order list and the follow-up criteria package. The earlier Telegram minimal v1 Library item and separate P0v3 artifact remain separate and were not overwritten.
 
 ## Follow-up criteria package
