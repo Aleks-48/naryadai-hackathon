@@ -1,0 +1,32 @@
+EnbekPlus native master creation v2, prepared 2026-10-07 UTC
+PASS 445 complete RU/KK/EN entries, placeholders and direct UI keys
+PASS Content-Length fix and protected-media source guards retained
+PASS light palette 1d2d36/ffffff: 14.18:1
+PASS light palette 50636d/ffffff: 6.27:1
+PASS light palette ffffff/245d52: 7.60:1
+PASS light palette 74231f/fceae8: 9.02:1
+PASS light palette 4d3d1e/f5ecd5: 8.91:1
+PASS dark palette e1ecf0/15232b: 13.36:1
+PASS dark palette adc0ca/15232b: 8.54:1
+PASS dark palette 07382d/8ad3bd: 7.52:1
+PASS dark palette ffc9c3/492d2d: 8.48:1
+PASS dark palette ebd8aa/3e331d: 8.81:1
+NOT RUN: Dart/Flutter analyzer, formatter, widget tests, Android build or device flows
+PASS four original reference-backend creation/photo unit tests (temporary synthetic DB)
+PASS custom real HTTP reference-backend contract: master-only, all priorities, worker/brigade, UTC deadline, invalid inputs, create then five before uploads, sixth rejected
+PASS independent source review: role/validation, refresh/navigation, no repeated create after ambiguous outcome, partial uploads, Back/disposal
+PASS full + incremental patches reproduce all eight delivered Dart production files
+PASS PNG test fixture validates
+NOT RUN: Dart/Flutter format/analyze/widget tests, Android build, live server or device creation
+Previous UI v1 archive remains unchanged. Current source is a drop-in update, not a complete Android/iOS scaffold or backend.
+Original input SHA-256:
+0076da8dbdc4faa9be21bbb68162cfa3455f1d53eb30b8ebb515f1b13f970bd0  main(1).dart
+6cae98cf58fd3810d00d414e56637203b2636bdfd1bd8f2ebe3245653d5ea829  api.dart
+abd5686b2729f7c8728c30a108fb43136edd51f99048df9d7e0f887a27b563db  pubspec(1).yaml
+5abfa340260fe8722de7355e46ea8a4d5d05d8d6082bbf70fb838e5764da49ad  app.js
+
+2026-10-07 17:25 UTC lint-only hotfix: removed redundant dart:typed_data import; added const to filter icon, timer icon, TextScaler.linear. Addresses exactly four info diagnostics reported by the user. No behavior changes. Flutter analyzer/tests/build not rerun in cloud.
+
+2026-10-07 17:49 UTC test harness hotfix: preserved/strengthened rapid photo-open guard assertions, replaced single-frame navigation advances with bounded start/advance/completion pumps. No production source changes. Addresses observed visible photo test failure; full suite had user-reported +97/-8 and remaining failures are not yet diagnosed because uploaded log was incomplete. No local SDK rerun.
+
+2026-10-07 17:54 UTC completed-log update (supersedes the incomplete-log note): all eight failures identified. One native XFile filename fixture, five lazy-list test visibility failures, two photo navigation-frame tests. Four test files corrected, all original assertions retained; narrow checkbox hit/toggle assertions strengthened. Production Dart source unchanged. Actual rerun is still required; no claim of passing tests or APK build.
