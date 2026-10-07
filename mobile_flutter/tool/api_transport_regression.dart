@@ -59,6 +59,8 @@ Future<void> main() async {
           check(request.headers.value('X-CSRF-Token') == csrf, 'Missing CSRF header');
         }
         switch (path) {
+          case '/api/orders':
+            check(body['title'] == 'Проверка узла' && body['worker_id'] == 3 && body['norm_hours'] == 8, 'Create payload changed');
           case '/api/bootstrap':
             check(request.method == 'GET', 'Bootstrap method changed');
           case '/api/orders/7/action':
@@ -91,6 +93,7 @@ Future<void> main() async {
     await api.action(7, 'pause', payload: {'reason': 'Проверка 🔧'});
     await api.rateOrder(7, rating: 4, reason: 'Повторная проверка');
     await api.uploadPhoto(orderId: 7, fileName: 'ремонт.png', mimeType: 'image/png', bytes: List<int>.generate(8192, (i) => i % 256));
+    await api.createOrder({'title': 'Проверка узла', 'description': 'Проверить узел оборудования', 'work_type': 'planned', 'priority': 'normal', 'area_id': 1, 'equipment_id': 2, 'worker_id': 3, 'norm_hours': 8});
     await api.logout();
     await api.logout();
     await api.login('  мастер🔧  ', ' пароль🔐 ');
@@ -110,8 +113,8 @@ Future<void> main() async {
       check(error.message.contains('некорректный ответ'), 'Gateway error misclassified');
     }
     check(failures.isEmpty, failures.join('; '));
-    check(calls == 9, 'Unexpected request count');
-    stdout.writeln('PASS 9 loopback requests: framing, UTF-8, credentials, cookie/CSRF, writes, logout, 401, gateway');
+    check(calls == 10, 'Unexpected request count');
+    stdout.writeln('PASS 10 loopback requests including master creation: framing, UTF-8, credentials, cookie/CSRF, writes, logout, 401, gateway');
   } finally {
     api.close();
     await server.close(force: true);
