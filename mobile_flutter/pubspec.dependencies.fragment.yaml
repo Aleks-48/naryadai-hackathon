@@ -1,0 +1,9 @@
+# REFERENCE ONLY. Merge into your existing dependencies; do not replace pubspec.yaml.
+# Prefer the dependency-addition commands in README_RU.md.
+# Flutter >=3.35 is required by DropdownButtonFormField.initialValue.
+dependencies:
+  flutter_localizations:
+    sdk: flutter
+  shared_preferences: ^2.3.0
+# Existing flutter, image_picker and all other dependencies must remain unchanged.
+# Tests use the standard flutter_test SDK dev_dependency already in Flutter projects.
