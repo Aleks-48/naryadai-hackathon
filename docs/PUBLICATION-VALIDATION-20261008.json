@@ -1,0 +1,31 @@
+{
+  "date_utc": "2026-10-08",
+  "scope": "Text-only source overlay; existing Android scaffold, PNG icons, synthetic demo photos and unrelated repository files preserved. APK and Gradle wrapper JAR not included.",
+  "sources": {
+    "server_archive_sha256": "f1d2739c7fa7504dc2b49f2f532306d00b8ad805553feece4131606050969224",
+    "mobile_v3_archive_sha256": "252df84fcc82c9b5b4c60bc517f0141164682008fb12d561613fdc184cdc3774",
+    "mobile_analyzer_hotfix_archive_sha256": "d27cf0babb1f55890767156ede640a2e0742f6c0ec92b3fb16341fa8c4c317fa"
+  },
+  "fresh_checks": {
+    "python_unittest": "103 passed on complete server archive tree, 15.734s",
+    "node_frontend": "40 passed",
+    "streamlit_apptest": "6 passed, 13.901s",
+    "flutter_wire_contract": "9 loopback HTTP groups passed; Python client, not Dart",
+    "mobile_static_source": "535 RU/KK/EN entries and translation/source guards passed",
+    "mobile_create_contract": "Passed after fixture-only correction: deterministic distinct synthetic images, sixth unique photo rejected at capacity"
+  },
+  "not_verified": [
+    "Fresh Flutter analyzer/test suite",
+    "APK binary and reproducible clean-clone Android build",
+    "Real LLM request",
+    "Real Telegram delivery",
+    "Production Docker deployment",
+    "Full-device performance"
+  ],
+  "publication_corrections": [
+    "Root and mobile README updated",
+    "Two analyzer hotfix files overlaid on mobile v3",
+    "Legacy create-contract fixtures separated from perceptual duplicate test"
+  ],
+  "build_limit": "gradle-wrapper.jar absent; existing pubspec.lock not newly resolved; no iOS scaffold"
+}

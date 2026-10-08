@@ -68,7 +68,8 @@ class StreamlitApiAppTest(unittest.TestCase):
             os.environ["NARYADAI_API_URL"] = cls.previous_api_url
 
     def new_app(self, username: str, role: str) -> AppTest:
-        app = AppTest.from_file(str(APP), default_timeout=30).run()
+        # Streamlit widget reruns are slow on Windows when SQLite and browser files are cold.
+        app = AppTest.from_file(str(APP), default_timeout=120).run()
         self.assertFalse(app.exception, self.exceptions(app))
         app.text_input[0].set_value(username)
         app.text_input[1].set_value("demo123")

@@ -1,7 +1,7 @@
 {
   "id": "/",
-  "name": "НарядКонтроль — ремонтные работы",
-  "short_name": "НарядКонтроль",
+  "name": "EnbekPlus — ЕңбекПлюс · ремонтные работы",
+  "short_name": "EnbekPlus",
   "description": "Локальный интерфейс управления ремонтными нарядами",
   "lang": "ru",
   "start_url": "/",
@@ -20,12 +20,6 @@
       "src": "/static/icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "any maskable"
-    },
-    {
-      "src": "/static/icon.svg",
-      "sizes": "any",
-      "type": "image/svg+xml",
       "purpose": "any maskable"
     }
   ]

@@ -10,11 +10,12 @@ import importlib.util
 import io
 import json
 import os
+import random
 from pathlib import Path
 import sys
 import tempfile
 import threading
-from PIL import Image, ImageDraw
+from PIL import Image
 
 
 def main():
@@ -78,15 +79,16 @@ def main():
             assert call('/api/orders', {**payload, 'norm_hours': 0}, master)[0] == 400
             assert call('/api/orders', {**payload, 'due_at': '2000-01-01T00:00:00Z'}, master)[0] == 400
             print('PASS dual assignee, zero hours and past deadline rejected')
-            for index in range(5):
-                image = Image.new('RGB', (128,128), (30+index*30,90+index*20,170-index*25))
-                draw = ImageDraw.Draw(image)
-                draw.rectangle((index*8,16,70+index*5,75),fill=(220,20+index*20,80))
+            for index in range(6):
+                # Independent deterministic textures keep this capacity test separate
+                # from the server's intentional perceptual-duplicate rejection.
+                rng = random.Random(20261008 + index)
+                image = Image.frombytes('RGB', (128, 128),
+                    bytes(rng.randrange(256) for _ in range(128 * 128 * 3)))
                 buffer=io.BytesIO();image.save(buffer,format='PNG')
                 photo = {'phase':'before','file_name':f'create-fixture-{index}.png',
                     'data_url':'data:image/png;base64,'+base64.b64encode(buffer.getvalue()).decode()}
-                assert call(f"/api/orders/{order['id']}/photos", photo, master)[0] == 201
-            assert call(f"/api/orders/{order['id']}/photos", photo, master)[0] == 400
+                assert call(f"/api/orders/{order['id']}/photos", photo, master)[0] == (201 if index < 5 else 400)
             _, detail, _ = call(f"/api/orders/{order['id']}", auth=master)
             assert len([p for p in detail['order']['photos'] if p['phase']=='before']) == 5
             print('PASS create-once then five BEFORE uploads; sixth rejected; same order retained')

@@ -8,6 +8,7 @@ import 'preferences_store.dart';
 import 'telegram_settings.dart';
 import 'order_photos.dart';
 import 'create_order.dart';
+import 'ai_review_card.dart';
 
 const _emulatorBaseUrl = 'http://10.0.2.2:8768';
 
@@ -1098,6 +1099,8 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
                   ],
                   const SizedBox(height: 12),
                   _photoSection(order, isWorker),
+                  const SizedBox(height: 12),
+                  AiReviewCard(order: order),
                   const SizedBox(height: 12),
                   if (isWorker) _workerActions(order),
                   if (isMaster) _masterActions(order),

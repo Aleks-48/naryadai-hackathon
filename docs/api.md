@@ -1,8 +1,10 @@
-# НарядКонтроль HTTP API · локальный MVP
+# EnbekPlus HTTP API · локальный MVP
 
 API обслуживается приложением `server.py` и используется PWA и опциональным Streamlit-клиентом. Это ещё не версионированный внешний API. JSON ошибок имеет форму `{"error":"..."}`. UI должен показывать ошибку сервера, а не создавать локальную фиктивную запись.
 
 ## Сессия и защита запросов
+
+GET /api/health не требует аутентификации и возвращает строго {"ok":true,"app":"EnbekPlus","mode":"local-mvp"}. Путь endpoint и режим local-mvp сохранены.
 
 - `GET /api/health` — неаутентифицированная проверка доступности.
 - `POST /api/login` с `{"username":"...","password":"..."}` — сервер возвращает профиль, `csrf` и ставит случайный opaque session в `HttpOnly; SameSite=Strict` cookie. Сырой session token в JSON не возвращается.

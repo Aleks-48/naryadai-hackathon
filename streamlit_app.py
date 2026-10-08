@@ -1,4 +1,4 @@
-"""Thin optional demo UI over the canonical НарядКонтроль HTTP API. No mock state or business rules live here."""
+"""Thin optional demo UI over the canonical EnbekPlus HTTP API. No mock state or business rules live here."""
 from __future__ import annotations
 
 import base64
@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parent
 EXTERNAL_API_URL = os.environ.get("NARYADAI_API_URL", "").strip().rstrip("/")
 EMBEDDED_MODE = not bool(EXTERNAL_API_URL)
 TIMEOUT = (3, 20)
-st.set_page_config(page_title="НарядКонтроль · демо", page_icon="🛠️", layout="wide")
+st.set_page_config(page_title="EnbekPlus · демо", page_icon="🛠️", layout="wide")
 
 STREAMLIT_STYLE = """
 <style>
@@ -328,7 +328,7 @@ def submit_manual_queue_move(context: tuple[str, int, tuple[int, ...], int, str]
 
 
 def login_panel() -> None:
-    st.title("НарядКонтроль")
+    st.title("EnbekPlus")
     st.caption("Общий синтетический демо-стенд поверх настоящего API нарядов.")
     if EMBEDDED_MODE:
         st.warning("Общие демо-аккаунты: изменения и синтетические фото видны другим участникам. Перезапуск может удалить все данные. Не загружайте реальные сведения.")
@@ -488,9 +488,10 @@ def show_master_actions(order: dict[str, Any]) -> None:
     if status == "ai_review":
         c1, c2 = st.columns(2)
         with c1.form(f"close-{oid}"):
+            rating = st.selectbox("Оценка мастера по наряду (1–5)", [1, 2, 3, 4, 5], index=4)
             reason = st.text_input("Комментарий мастера к приёмке", max_chars=1000)
             if st.form_submit_button("Принять и закрыть", type="primary"):
-                api("POST", f"/api/orders/{oid}/action", {"action": "close", "closure_comment": reason}); st.rerun()
+                api("POST", f"/api/orders/{oid}/action", {"action": "close", "closure_comment": reason, "rating": rating}); st.rerun()
         with c2.form(f"rework-{oid}"):
             reason = st.text_input("Что исправить")
             if st.form_submit_button("На доработку"):
@@ -518,6 +519,7 @@ def create_order(constants: dict[str, Any], workers: list[dict[str, Any]]) -> No
         with st.form("new-order"):
             title = st.text_input("Название")
             description = st.text_area("Описание", height=100)
+            issuance_comment = st.text_area("Комментарий мастера при выдаче (необязательно)", max_chars=1000, height=80)
             left, right = st.columns(2)
             equipment_id = left.selectbox("Оборудование", [x["id"] for x in choices],
                                           format_func=lambda key: next(f"{x['code']} · {x['name']}" for x in choices if x["id"] == key),
@@ -533,7 +535,8 @@ def create_order(constants: dict[str, Any], workers: list[dict[str, Any]]) -> No
                 type=["jpg", "jpeg", "png", "webp"], key="new-order-before-photos", accept_multiple_files=True)
             if st.form_submit_button("\u0412\u044b\u0434\u0430\u0442\u044c \u0447\u0435\u0440\u0435\u0437 API", type="primary"):
                 body = {"title": title, "description": description, "area_id": area_id, "equipment_id": equipment_id,
-                        "worker_id": user_id, "work_type": work_type, "priority": priority, "norm_hours": hours}
+                        "worker_id": user_id, "work_type": work_type, "priority": priority, "norm_hours": hours,
+                        "issuance_comment": issuance_comment}
                 selected = before_photos or []
                 if len(selected) > 5:
                     st.error("\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043d\u0435 \u0431\u043e\u043b\u0435\u0435 \u043f\u044f\u0442\u0438 \u0444\u043e\u0442\u043e.")
@@ -858,7 +861,7 @@ def main() -> None:
     user = st.session_state.user
     st.session_state.naryadai_api_url = API_URL
     with st.sidebar:
-        st.title("НарядКонтроль")
+        st.title("EnbekPlus")
         st.write(user["display_name"])
         st.caption(user["role_label"])
         st.caption(f"Профиль: {user.get('specialty') or '-'} · разряд {user.get('qualification_level') or '-'} · смена {user.get('shift_code') or '-'} · синтетика")
@@ -895,7 +898,7 @@ def main() -> None:
             create_order(constants, bootstrap.get("free_workers", []))
         live_orders_panel(user, constants)
     except (RuntimeError, requests.RequestException) as error:
-        st.error(f"Ошибка API НарядКонтроль: {error}")
+        st.error(f"Ошибка API EnbekPlus: {error}")
 
 if __name__ == "__main__":
     main()

@@ -230,6 +230,63 @@ class RuntimeConfigurationTest(unittest.TestCase):
         self.assertEqual(shift_c+shift_a,whole)
 
 
+class EscalationCandidateTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="enbekplus-escalation-test-")
+        self.db_path = Path(self.temp.name) / "test.sqlite3"
+        self.media_patch = unittest.mock.patch.object(app, "MEDIA", Path(self.temp.name) / "media")
+        self.media_patch.start()
+        app.init_db(self.db_path)
+
+    def tearDown(self):
+        self.media_patch.stop()
+        self.temp.cleanup()
+
+    def test_acceptance_escalation_suggests_only_active_free_on_shift_workers(self):
+        now = app.utcnow()
+        with app.connect(self.db_path) as db:
+            master = db.execute("SELECT id FROM users WHERE username='master01'").fetchone()[0]
+            worker01 = db.execute("SELECT id FROM users WHERE username='worker01'").fetchone()[0]
+            worker02 = db.execute("SELECT id,display_name FROM users WHERE username='worker02'").fetchone()
+            area = db.execute("SELECT id FROM areas ORDER BY id LIMIT 1").fetchone()[0]
+            equipment = db.execute("SELECT id FROM equipment WHERE area_id=? ORDER BY id LIMIT 1",(area,)).fetchone()[0]
+            db.execute("UPDATE orders SET status='closed' WHERE status IN ('issued','accepted','queued','in_progress','paused','executed','ai_review','rework')")
+            db.execute("UPDATE users SET is_active=0 WHERE role='worker'")
+            db.execute("UPDATE users SET is_active=1,shift_code='A' WHERE id=?",(worker02["id"],))
+
+            def add_order(code, assignee, issued_at):
+                return db.execute("""INSERT INTO orders(code,title,description,work_type,priority,area_id,equipment_id,
+                    assigned_to,assigned_master_id,status,created_at,issued_at,due_at)
+                    VALUES (?,?,?,'planned','emergency',?,?,?,?,'issued',?,?,?)""",
+                    (code,"Escalation test","Synthetic test order",area,equipment,assignee,master,
+                     app.iso(now-app.timedelta(minutes=5)),app.iso(issued_at),app.iso(now+app.timedelta(hours=2)))).lastrowid
+
+            blocked = add_order("QA-ESC-BLOCKED",worker01,now-app.timedelta(minutes=4))
+            off_shift = add_order("QA-ESC-OFFSHIFT",worker01,now-app.timedelta(minutes=1))
+            available = add_order("QA-ESC-AVAILABLE",worker01,now-app.timedelta(minutes=1))
+            blocker = add_order("QA-ESC-WORKER02-OFFER",worker02["id"],now)
+
+            with unittest.mock.patch.object(app,"shift_is_active",return_value=True):
+                app.maybe_escalate(db)
+            payload = db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='acceptance_escalated'",(blocked,)).fetchone()
+            self.assertIsNotNone(payload)
+            self.assertIsNone(json.loads(payload[0])["suggested_worker"])
+
+            db.execute("UPDATE orders SET status='closed' WHERE id=?",(blocker,))
+            db.execute("UPDATE orders SET issued_at=? WHERE id=?",(app.iso(now-app.timedelta(minutes=4)),off_shift))
+            with unittest.mock.patch.object(app,"shift_is_active",return_value=False):
+                app.maybe_escalate(db)
+            payload = db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='acceptance_escalated'",(off_shift,)).fetchone()
+            self.assertIsNotNone(payload)
+            self.assertIsNone(json.loads(payload[0])["suggested_worker"])
+
+            db.execute("UPDATE orders SET issued_at=? WHERE id=?",(app.iso(now-app.timedelta(minutes=4)),available))
+            with unittest.mock.patch.object(app,"shift_is_active",return_value=True):
+                app.maybe_escalate(db)
+            payload = db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='acceptance_escalated'",(available,)).fetchone()
+            self.assertIsNotNone(payload)
+            self.assertEqual(json.loads(payload[0])["suggested_worker"],worker02["display_name"])
+            self.assertEqual(db.execute("SELECT is_active FROM users WHERE id=?",(worker01,)).fetchone()[0],0)
 class LocalAPITest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -314,9 +371,34 @@ class LocalAPITest(unittest.TestCase):
             labor_hours=1.0,materials=[],materials_not_used=True)[0],200)
         checked=self.action(worker,oid,"ai_check")
         self.assertEqual(checked[1]["order"]["status"],"ai_review",checked[1])
-        closed=self.action(master,oid,"close",closure_comment="Плановый результат проверен мастером.")
+        closed=self.action(master,oid,"close",rating=4,closure_comment="Плановый результат проверен мастером.")
         self.assertEqual(closed[0],200,closed[1])
         return oid
+
+    def test_brigade_issuance_requires_and_selects_an_active_worker(self):
+        master = self.client("master01")
+        payload = {"title": "Synthetic active brigade assignment",
+            "description": "Regression test with synthetic accounts only.",
+            "work_type": "planned", "priority": "planned", "area_id": self.area_id,
+            "equipment_id": self.equipment_id, "brigade": "A", "norm_hours": 8}
+        with app.connect(self.db_path) as db:
+            previous = [(row["id"], row["is_active"]) for row in db.execute(
+                "SELECT id,is_active FROM users WHERE role='worker' AND brigade='A'")]
+            self.assertGreaterEqual(len(previous), 2)
+            active_choice = previous[1][0]
+            db.execute("UPDATE users SET is_active=0 WHERE role='worker' AND brigade='A'")
+        try:
+            none_active = master.call("/api/orders", "POST", payload)
+            self.assertEqual(none_active[0], 409, none_active[1])
+            with app.connect(self.db_path) as db:
+                db.execute("UPDATE users SET is_active=1 WHERE id=?", (active_choice,))
+            issued = master.call("/api/orders", "POST", payload)
+            self.assertEqual(issued[0], 201, issued[1])
+            self.assertEqual(issued[1]["order"]["assigned_to"], active_choice)
+        finally:
+            with app.connect(self.db_path) as db:
+                db.executemany("UPDATE users SET is_active=? WHERE id=?",
+                    [(is_active, user_id) for user_id, is_active in previous])
 
     def test_manual_queue_is_scoped_revisioned_and_independent_of_priority(self):
         master = self.client("master01")
@@ -503,7 +585,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(first_review["mode"],"rules-only: configuration_missing")
         self.assertEqual(first_review["verdict"],"rework")
         self.assertTrue(any("фото" in issue.lower() for issue in first_review["issues"]))
-        self.assertEqual(self.action(master,order_id,"close",closure_comment="Принято мастером")[0],409)
+        self.assertEqual(self.action(master,order_id,"close", rating=4,closure_comment="Принято мастером")[0],409)
 
         # Rework cycle; binary content, digest duplicate detection and upload latency.
         self.assertEqual(self.action(worker,order_id,"start")[1]["order"]["status"],"in_progress")
@@ -528,17 +610,17 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(second_json["verdict"],"comments")
         self.assertEqual(second_json["photo_check"]["verifiability_score"],3)
         self.assertTrue(second_json["master_confirmation_required"])
-        self.assertEqual(self.action(master,order_id,"close")[0],400)
+        self.assertEqual(self.action(master,order_id,"close", rating=4)[0],400)
         with app.connect(self.db_path) as db:
             close_audit_before=db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='close'",(order_id,)).fetchone()[0]
         for invalid_comment in (None,True,7,[],{},"    "):
-            bad_close=self.action(master,order_id,"close",closure_comment=invalid_comment)
+            bad_close=self.action(master,order_id,"close", rating=4,closure_comment=invalid_comment)
             self.assertEqual(bad_close[0],400,repr(invalid_comment))
             with app.connect(self.db_path) as db:
                 state=db.execute("SELECT status,closed_at FROM orders WHERE id=?",(order_id,)).fetchone()
                 self.assertEqual(tuple(state),("ai_review",None))
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='close'",(order_id,)).fetchone()[0],close_audit_before)
-        closed=self.action(master,order_id,"close",closure_comment="Фото проверено мастером; дата EXIF неизвестна.")
+        closed=self.action(master,order_id,"close", rating=4,closure_comment="Фото проверено мастером; дата EXIF неизвестна.")
         self.assertEqual(closed[0],200,closed[1])
         self.assertEqual(closed[1]["order"]["status"],"closed")
 
@@ -727,7 +809,7 @@ class LocalAPITest(unittest.TestCase):
                                labor_hours=1.5,materials=[],materials_not_used=True)
         self.assertEqual(completed[0],200,completed[1])
         self.assertEqual(self.action(workers[0],oid,"ai_check")[1]["order"]["status"],"ai_review")
-        closed=self.action(master,oid,"close",closure_comment="Мастер проверил заменённое фото и отчёт.")
+        closed=self.action(master,oid,"close", rating=4,closure_comment="Мастер проверил заменённое фото и отчёт.")
         self.assertEqual(closed[0],200,closed[1])
         self.assertEqual(closed[1]["order"]["status"],"closed")
 
@@ -773,7 +855,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(self.action(worker,oid,"complete",completion_text=report,fault_code_id=self.fault_id,
                                      labor_hours=1.5,materials=[],materials_not_used=True)[0],200)
         self.assertEqual(self.action(worker,oid,"ai_check")[1]["order"]["status"],"ai_review")
-        closed=self.action(master,oid,"close",closure_comment="Принято после новой фотографии.")
+        closed=self.action(master,oid,"close", rating=4,closure_comment="Принято после новой фотографии.")
         self.assertEqual(closed[0],200,closed[1])
         with app.connect(self.db_path) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM audit WHERE order_id=? AND event='photo_uploaded'",(oid,)).fetchone()[0],7)
@@ -828,7 +910,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(reviewed[1]["order"]["status"],"ai_review")
         fresh_check=reviewed[1]["order"]["ai_result"]
         self.assertNotIn("отличается от исполнения",fresh_check)
-        closed=self.action(master,oid,"close",closure_comment="Мастер принял новый отчёт и фото.")
+        closed=self.action(master,oid,"close", rating=4,closure_comment="Мастер принял новый отчёт и фото.")
         self.assertEqual(closed[0],200,closed[1])
         self.assertEqual(closed[1]["order"]["status"],"closed")
         with app.connect(self.db_path) as db:
@@ -931,7 +1013,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(completed[0],200,completed[1])
         self.assertEqual(completed[1]["order"]["worker_completion_comment"],"")
         self.assertEqual(self.action(worker,oid,"ai_check")[1]["order"]["status"],"ai_review")
-        closed=self.action(master,oid,"close",closure_comment="Проверено мастером; итог принят.")
+        closed=self.action(master,oid,"close",rating=4,closure_comment="Проверено мастером; итог принят.")
         self.assertEqual(closed[0],200,closed[1])
         with app.connect(self.db_path) as db:
             completion_payload=json.loads(db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='complete' ORDER BY id DESC LIMIT 1",(oid,)).fetchone()[0])
@@ -975,7 +1057,10 @@ class LocalAPITest(unittest.TestCase):
             expected="planned" if index%4==3 else "unscheduled"
             self.assertEqual(row["work_type"],expected,row["code"])
 
-    def test_polling_visibility_with_two_real_http_sessions(self):
+    def test_health_payload_matches_enbekplus_contract(self):
+        status, body = self.client("master01").call("/api/health")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"ok": True, "app": "EnbekPlus", "mode": "local-mvp"})
         master=self.client("master01"); worker=self.client("worker15")
         initial_poll=threading.Event(); seen=threading.Event(); stop=threading.Event(); measure={}
         def poll_worker():
@@ -1182,7 +1267,23 @@ class LocalAPITest(unittest.TestCase):
             classified_score["evidence"]["classified_rejections"])*100,1)
         self.assertEqual(classified_score["factors"]["unjustified_refusal"],expected_factor)
 
-    def test_model_low_confidence_explicitly_requires_master(self):
+    def test_rules_only_completion_is_limited_and_requires_master_semantic_review(self):
+        context = {
+            "problem": "Утечка насоса P-07; заменить уплотнение и диагностировать износ подшипника.",
+            "equipment": "Насос P-07",
+            "fault_code": "F-12",
+            "work_type": "planned",
+            "materials": [{"sku": "MAT-001", "name": "Подшипник", "unit": "шт", "quantity": 100000}],
+        }
+        report = "Выполнил замену лампы в коридоре; свет работает стабильно после выполнения."
+        with unittest.mock.patch.dict(os.environ, {"NARYADAI_LLM_ENABLED": ""}):
+            result = app.complete_review(report, [], 1, 1.0, "planned", context)
+        self.assertTrue(result["mode"].startswith("rules-only:"))
+        self.assertEqual(result["verdict"], "comments")
+        self.assertTrue(result["needs_master_attention"])
+        self.assertTrue(result["master_confirmation_required"])
+        self.assertIn("не проверено", result["summary"])
+        self.assertTrue(any("Семантическая проверка недоступна" in issue for issue in result["issues"]))
         model={"mode":"external-test","summary":"test","issues":[],"verdict":"accepted","confidence":0.35}
         with unittest.mock.patch.object(app,"llm_review",return_value=model):
             result=app.complete_review("Работа выполнена и результат стабилен.",[],1,1.0,"planned")
@@ -1193,7 +1294,7 @@ class LocalAPITest(unittest.TestCase):
 
     def test_llm_review_sends_bounded_anonymized_context_as_untrusted_data(self):
         model_report={"verdict":"accepted","summary":"Synthetic match","issues":[],
-                      "confidence":0.9,"needs_master_attention":False}
+                      "confidence":0.9,"report_score":4,"score_reason":"Отчёт содержит действия и результат.","needs_master_attention":False}
         class Response:
             def __enter__(self): return self
             def __exit__(self,*args): return False
@@ -1225,7 +1326,7 @@ class LocalAPITest(unittest.TestCase):
         bounded=payload["order_context"]
         self.assertEqual(set(bounded),{"original_problem","equipment","reported_fault","work_type","materials",
             "materials_not_used","reported_labor_hours","hours_until_deadline_from_start","unique_after_photos",
-            "truncated","truncated_fields"})
+            "truncated","truncated_fields","norm_reference"})
         self.assertLessEqual(len(bounded["original_problem"]),1200)
         self.assertLessEqual(len(bounded["equipment"]),160)
         self.assertLessEqual(len(bounded["reported_fault"]),120)
@@ -1311,7 +1412,7 @@ class LocalAPITest(unittest.TestCase):
                 self.seen.append((context,report,verdict))
                 parsed={"verdict":verdict,"summary":"Synthetic semantic fixture response.",
                         "issues":[issue] if issue else [],"confidence":0.94,
-                        "needs_master_attention":verdict!="accepted"}
+                        "report_score":4 if verdict=="accepted" else 1,"score_reason":"Учебное объяснение оценки.","needs_master_attention":verdict!="accepted"}
                 payload={"choices":[{"message":{"content":json.dumps(parsed)}}]}
                 return Response(payload)
         opener=FakeSemanticOpener()
@@ -1334,7 +1435,7 @@ class LocalAPITest(unittest.TestCase):
 
     def test_gemini_json_schema_adapter_is_opt_in_and_validates_response(self):
         report = {"verdict":"accepted","summary":"Текст описывает работу и результат.","issues":[],
-                  "confidence":0.92,"needs_master_attention":False}
+                  "confidence":0.92,"report_score":4,"score_reason":"Отчёт содержит действия и результат.","needs_master_attention":False}
         class Response:
             def __init__(self, payload): self.payload=payload
             def __enter__(self): return self
@@ -1358,7 +1459,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(request_body["response_format"]["type"],"json_schema")
         self.assertTrue(request_body["response_format"]["json_schema"]["strict"])
         self.assertEqual(set(request_body["response_format"]["json_schema"]["schema"]["required"]),
-                         {"verdict","summary","issues","confidence","needs_master_attention"})
+                         {"verdict","summary","issues","confidence","report_score","score_reason","needs_master_attention"})
         with unittest.mock.patch.dict(os.environ,{**settings,"NARYADAI_LLM_ENABLED":""}):
             disabled=app.llm_review("Нормальный пример текста достаточной длины.")
         self.assertEqual(disabled["mode"],"rules-only: disabled")
@@ -1392,7 +1493,7 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(truncated["note"],"IncompleteRead")
 
         report={"verdict":"accepted","summary":"Synthetic response","issues":[],"confidence":10**400,
-                "needs_master_attention":False}
+                "report_score":4,"score_reason":"Отчёт содержит действия и результат.","needs_master_attention":False}
         payload={"choices":[{"message":{"content":json.dumps(report)}}]}
         class Response:
             def __enter__(self): return self
@@ -1478,20 +1579,24 @@ class LocalAPITest(unittest.TestCase):
         self.assertEqual(self.action(worker,pid,"accept")[0],200);self.assertEqual(self.action(worker,pid,"start")[0],200)
         self.assertEqual(self.action(worker,pid,"complete",completion_text=report,fault_code_id=self.fault_id,labor_hours=1.2,materials=[],materials_not_used=True)[0],200)
         self.assertEqual(self.action(worker,pid,"ai_check")[1]["order"]["status"],"ai_review")
-        self.assertEqual(self.action(worker,pid,"close")[0],403)
-        self.assertEqual(self.action(master,pid,"close")[0],400)
-        accepted=self.action(master,pid,"close",closure_comment="Проверено мастером, замечаний нет.")
+        self.assertEqual(self.action(worker,pid,"close", rating=4)[0],403)
+        self.assertEqual(self.action(master,pid,"close", rating=4)[0],400)
+        accepted=self.action(master,pid,"close",rating=4,closure_comment="Проверено мастером, замечаний нет.")
         self.assertEqual(accepted[0],200,accepted[1])
         with app.connect(self.db_path) as db:
             close_event=db.execute("SELECT payload_json FROM audit WHERE order_id=? AND event='close' ORDER BY id DESC LIMIT 1",(pid,)).fetchone()
             self.assertEqual(json.loads(close_event[0])["closure_comment"],"Проверено мастером, замечаний нет.")
         today=app.utcnow().date().isoformat()
+        with app.connect(self.db_path) as db:
+            db.execute("UPDATE orders SET completed_at=?,closed_at=? WHERE id=?",
+                       (today+"T07:30:00Z",today+"T07:35:00Z",pid))
+            db.commit()
         shift=worker.call(f"/api/reports?date_from={today}&date_to={today}&brigade=A&shift_code=A")
         self.assertEqual(shift[0],200,shift[1])
         self.assertGreaterEqual(shift[1]["summary"]["completed"],1)
         self.assertEqual(shift[1]["summary"]["date_from"],today)
         self.assertEqual(shift[1]["summary"]["shift_code"],"A")
-        self.assertIn("не является подтверждённым простоем",shift[1]["summary"]["pause_minutes_note"])
+        self.assertIn("не подтверждённый простой",shift[1]["summary"]["pause_minutes_note"])
         self.assertEqual(worker.call("/api/reports?date_from=2026-09-02&date_to=2026-09-01")[0],400)
         self.assertEqual(worker.call("/api/reports?date_from=bad&date_to=2026-09-01")[0],400)
         profile=worker.call("/api/bootstrap?rating_from=2026-09-01&rating_to=2026-10-02")[1]
@@ -1540,7 +1645,7 @@ class LocalAPITest(unittest.TestCase):
                 if path=="/": self.assertIn("manifest.webmanifest",body)
                 if path=="/sw.js":
                     self.assertIn("cache.addAll",body)
-                    self.assertIn("naryadai-shell-v13",body)
+                    self.assertIn("naryadai-shell-v14",body)
                 if path.endswith("styles.css"): self.assertIn("max-width:760px",body)
                 if path.endswith("/manifest.webmanifest"):
                     manifest=json.loads(body)
@@ -1749,11 +1854,21 @@ class LocalAPITest(unittest.TestCase):
             status=db.execute("SELECT status FROM telegram_outbox WHERE dedupe_key='race-send'").fetchone()[0]
             self.assertEqual(status,"delivered")
         with unittest.mock.patch.dict(os.environ,settings):
-            self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *_:self.fail("race sent twice")))
+            unrelated_sends=[]
+            app.deliver_telegram_once(self.db_path,sender=lambda token,chat,text:unrelated_sends.append((chat,text)))
+        self.assertFalse(any(chat=="7812345" and "Race-scoped message" in text
+                             for chat,text in unrelated_sends))
+        with app.connect(self.db_path) as db:
+            race=db.execute("SELECT status,attempts FROM telegram_outbox WHERE dedupe_key='race-send'").fetchone()
+        self.assertEqual((race["status"],race["attempts"]),("delivered",1))
 
 
 
         # A retry queued for the former assignee is cancelled by the real API reassignment.
+        # Remove earlier test events so this one-row delivery assertion cannot consume unrelated work.
+        with app.connect(self.db_path) as db:
+            db.execute("DELETE FROM telegram_outbox")
+            db.commit()
         stale_order=self.create_order(master)
         with app.connect(self.db_path) as db:
             db.execute("DELETE FROM telegram_outbox WHERE order_id=?",(stale_order["id"],))
@@ -1774,8 +1889,11 @@ class LocalAPITest(unittest.TestCase):
         moved=master.call(f"/api/orders/{stale_order['id']}/assign","POST",{"worker_id":int(replacement_id)})
         self.assertEqual(moved[0],200,moved[1])
         self.assertEqual(worker.call(f"/api/orders/{stale_order['id']}")[0],404)
+        cancelled_sends=[]
         with unittest.mock.patch.dict(os.environ,settings):
-            self.assertFalse(app.deliver_telegram_once(self.db_path,sender=lambda *_:self.fail("stale reassigned notice must not send")))
+            app.deliver_telegram_once(self.db_path,
+                sender=lambda token,chat,text:cancelled_sends.append((chat,text)))
+        self.assertFalse(any("Private delayed notice" in text for _,text in cancelled_sends))
         with app.connect(self.db_path) as db:
             stale=db.execute("SELECT status,attempts,last_error,payload_json FROM telegram_outbox WHERE dedupe_key='stale-reassigned'").fetchone()
             self.assertEqual((stale["status"],stale["attempts"],stale["last_error"],stale["payload_json"]),

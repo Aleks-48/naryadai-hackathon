@@ -27,7 +27,7 @@ function harness() {
   ['#app','#login-screen','#detail-drawer','#drawer-backdrop','#view-root','#toast-region','#offline-banner','#telegram-button'].forEach(get);
   const localStorageWrites=[],logs=[];
   const globals={document,console:{log:(...x)=>logs.push(x),warn:(...x)=>logs.push(x),error:(...x)=>logs.push(x)},localStorage:{setItem:(...x)=>localStorageWrites.push(x),removeItem:(...x)=>localStorageWrites.push(x),getItem:()=>null},navigator:{onLine:true},location:{protocol:'http:',hostname:'example.invalid'},window:{addEventListener(){}},URLSearchParams,setTimeout:()=>0,clearInterval(){},setInterval:()=>1,performance:{now:()=>0},fetch:()=>Promise.reject(new Error('Unexpected real fetch')),FileReader:class{},prompt:()=>null,confirm:()=>true};
-  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','detailButtons','reassignmentForm','bindDrawer','loadReport','loadAudit','render','runAction','showTelegram','moveWorkQueue','exifPayload','insertJpegExif'];
+  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','detailButtons','reassignmentForm','bindDrawer','loadReport','renderReports','bindReportControls','renderReportResult','reportEquipmentOptions','downtimeOrderOptions','submitEquipmentDowntime','loadAudit','render','runAction','showTelegram','moveWorkQueue','exifPayload','insertJpegExif'];
   const expose=`globalThis.app={S,${names.join(',')},override(overrides){${['api','refresh','refreshDrawer','openOrder','renderDrawer','render','syncChrome','compressImage','renderReportResult'].map(n=>`if(overrides.${n})${n}=overrides.${n};`).join('')}}};`;
   const source=fs.readFileSync(sourcePath,'utf8').replace(/\n  bindGlobal\(\);[\s\S]*?\n\}\)\(\);\s*$/,`\n  ${expose}\n})();`);
   vm.runInNewContext(source,globals,{filename:sourcePath});
@@ -322,4 +322,91 @@ test('manual queue reorder is single-flight and logout discards stale refresh',a
   h.app.logoutLocal();pending.resolve();await Promise.all([first,duplicate]);
   assert.equal(refreshes,0);
   assert.equal(calls.length,1);
+});
+
+test('rating event shift uses rating_shift without narrowing the roster',async()=>{
+  const h=harness(),calls=[];h.app.S.orderId=null;h.app.S.ratingFrom='2026-09-01';h.app.S.ratingTo='2026-09-30';h.app.S.ratingShift='B';
+  h.app.override({api:async path=>{calls.push(path);return {user:h.app.S.me}},render(){}});
+  await h.app.refresh();const query=new URL('http://local'+calls[0]).searchParams;
+  assert.equal(query.get('rating_shift'),'B');assert.equal(query.get('rating_from'),'2026-09-01');assert.equal(query.get('rating_to'),'2026-09-30');assert.equal(query.has('shift_code'),false);
+});
+
+function reportInputs(h){
+  h.app.S.view='reports';h.get('#report-result');
+  for(const [id,value] of Object.entries({'report-from':'2026-09-01','report-to':'2026-09-30','report-brigade':'B','report-shift':'C','report-area':'2','report-equipment':'7','report-worker':'12'}))h.get('#'+id).value=value;
+}
+
+test('reports send all server filters, preserve selections and only explicitly request AI',async()=>{
+  const h=harness(),calls=[];reportInputs(h);h.get('#load-report');h.app.S.me.role='master';
+  h.app.S.data.constants={areas:[{id:2,name:'Area'}],equipment:[{id:7,area_id:2,name:'Asset',code:'EQ7'}],users:[{id:12,role:'worker',display_name:'Worker'}]};
+  h.app.override({api:async path=>{calls.push(path);return {summary:{}}},renderReportResult(){}});h.app.bindReportControls();
+  await h.get('#load-report').events.click({type:'click'});
+  const query=new URL('http://local'+calls[0]).searchParams;
+  for(const [key,value] of Object.entries({date_from:'2026-09-01',date_to:'2026-09-30',brigade:'B',shift_code:'C',area_id:'2',equipment_id:'7',worker_id:'12'}))assert.equal(query.get(key),value);
+  assert.equal(query.has('include_ai_summary'),false);
+  assert.equal(h.app.S.reportArea,'2');assert.equal(h.app.S.reportEquipment,'7');assert.equal(h.app.S.reportWorker,'12');
+  const html=h.app.renderReports();for(const id of ['report-area','report-equipment','report-worker'])assert.match(html,new RegExp(`id="${id}"`));
+  for(const id of ['2','7','12'])assert.match(html,new RegExp(`value="${id}" selected`));
+  await h.app.loadReport({type:'click'});assert.equal(new URL('http://local'+calls[1]).searchParams.has('include_ai_summary'),false);
+  await h.app.loadReport(true);assert.equal(new URL('http://local'+calls[2]).searchParams.get('include_ai_summary'),'1');
+  for(const id of ['report-area','report-equipment','report-worker'])h.get('#'+id).value='';
+  await h.app.loadReport();const cleared=new URL('http://local'+calls[3]).searchParams;
+  for(const key of ['area_id','equipment_id','worker_id'])assert.equal(cleared.has(key),false);
+});
+
+test('report equipment choices follow area and downtime order choices follow equipment',()=>{
+  const h=harness();h.app.S.me.role='master';h.app.S.data.constants.equipment=[{id:3,area_id:1,code:'E3',name:'One'},{id:7,area_id:2,code:'E7',name:'Two'}];
+  h.app.S.data.orders=[{id:101,equipment_id:3,code:'ORDER-101',title:'Local <order>'},{id:202,equipment_id:7,code:'ORDER-202',title:'Other'}];
+  assert.match(h.app.reportEquipmentOptions('1','3'),/value="3" selected/);assert.doesNotMatch(h.app.reportEquipmentOptions('1','7'),/value="7"/);
+  h.get('#report-area').value='2';h.get('#report-equipment').value='3';h.get('#downtime-equipment').value='3';h.get('#downtime-order');h.app.bindReportControls();
+  h.get('#report-area').events.change();assert.match(h.get('#report-equipment').innerHTML,/value="7"/);assert.doesNotMatch(h.get('#report-equipment').innerHTML,/value="3"/);
+  h.get('#downtime-equipment').events.change();assert.match(h.get('#downtime-order').innerHTML,/ORDER-101/);assert.match(h.get('#downtime-order').innerHTML,/&lt;order&gt;/);assert.doesNotMatch(h.get('#downtime-order').innerHTML,/ORDER-202/);assert.equal(h.get('#downtime-order').disabled,false);
+  h.get('#downtime-equipment').value='';h.get('#downtime-equipment').events.change();assert.equal(h.get('#downtime-order').disabled,true);assert.doesNotMatch(h.get('#downtime-order').innerHTML,/ORDER-/);
+});
+
+test('reports render refusals and current workload separately with server time semantics',()=>{
+  const h=harness();h.get('#report-result');h.app.S.report={summary:{date_from:'2026-09-01',date_to:'2026-09-30',shift_code:'C',issued:3,completed:2,closed:1,refusals:4,current_active_orders:8,current_overdue_orders:6,period_note:'Event UTC <period>',refusals_note:'Actor attribution',workload_note:'No date or shift filter'},worker_totals:[{worker:'Synthetic <worker>',brigade:'A',issued:3,completed:2,closed:1,refusals:4,labor_hours:5,current_active:8,current_in_progress:2,current_queued:3}]};
+  h.app.renderReportResult();const html=h.get('#report-result').innerHTML;
+  for(const text of ['События за выбранный период','Текущая загрузка · на сейчас','Отказы','Сейчас открыто','Сейчас просрочено','В работе / на паузе','В очереди / доработка','Event UTC &lt;period&gt;','Actor attribution','No date or shift filter'])assert.ok(html.includes(text),text);
+  assert.match(html,/<td>Synthetic &lt;worker&gt;<\/td><td>A<\/td><td>3<\/td><td>2<\/td><td>1<\/td><td>4<\/td><td>5<\/td>/);
+  assert.match(html,/<td>Synthetic &lt;worker&gt;<\/td><td>8<\/td><td>2<\/td><td>3<\/td>/);
+  assert.doesNotMatch(html,/назначенная синтетическая смена/);
+});
+
+function downtimeInputs(h){
+  h.app.S.me.role='master';h.app.S.view='reports';h.get('#downtime-submit');
+  for(const [id,value] of Object.entries({'downtime-equipment':'3','downtime-order':'101','downtime-start':'2026-09-01T08:00','downtime-end':'2026-09-01T09:00','downtime-reason':'Synthetic interval'}))h.get('#'+id).value=value;
+}
+
+test('linked downtime keeps numeric order_id and idempotency across failed retries',async()=>{
+  const h=harness(),calls=[];downtimeInputs(h);
+  h.app.override({api:async(path,method,body)=>{calls.push([path,method,body]);throw new Error('retryable')}});
+  await h.app.submitEquipmentDowntime({preventDefault(){}});await h.app.submitEquipmentDowntime({preventDefault(){}});
+  assert.equal(calls[0][0],'/api/equipment/downtime');assert.equal(calls[0][1],'POST');assert.equal(calls[0][2].order_id,101);assert.equal(calls[0][2].equipment_id,3);
+  assert.equal(calls[0][2].idempotency_key,calls[1][2].idempotency_key);
+  h.get('#downtime-order').value='';await h.app.submitEquipmentDowntime({preventDefault(){}});
+  assert.equal(calls[2][2].order_id,null);assert.notEqual(calls[1][2].idempotency_key,calls[2][2].idempotency_key);
+});
+
+test('downtime submission is single-flight and does not reopen reports after navigation',async()=>{
+  const h=harness(),pending=deferred(),calls=[];downtimeInputs(h);
+  h.app.override({api:(path,method,body)=>{calls.push([path,method,body]);return pending.promise}});
+  const first=h.app.submitEquipmentDowntime({preventDefault(){}});await h.app.submitEquipmentDowntime({preventDefault(){}});
+  assert.equal(calls.length,1);assert.equal(h.get('#downtime-submit').disabled,true);
+  h.app.S.view='home';h.app.S.viewVersion++;pending.resolve({duplicate:false});await first;
+  assert.equal(calls.length,1);assert.equal(h.app.S.downtimeDraft,null);assert.equal(h.app.S.registeringDowntime,false);
+});
+
+test('downtime rejects invalid or inverted dates before any write',async()=>{
+  const h=harness(),calls=[];downtimeInputs(h);h.app.override({api:async path=>{calls.push(path);return {}}});
+  h.get('#downtime-end').value='2026-09-01T07:00';await h.app.submitEquipmentDowntime({preventDefault(){}});
+  h.get('#downtime-end').value='invalid';await h.app.submitEquipmentDowntime({preventDefault(){}});assert.equal(calls.length,0);
+});
+
+test('a newer filtered report wins over an older in-flight report',async()=>{
+  const h=harness(),old=deferred(),next=deferred();reportInputs(h);let requests=0,rendered=0;
+  h.app.override({api:()=>++requests===1?old.promise:next.promise,renderReportResult(){rendered++}});
+  const first=h.app.loadReport();h.get('#report-worker').value='15';const second=h.app.loadReport();
+  next.resolve({summary:{worker_id:15}});await second;old.resolve({summary:{worker_id:12}});await first;
+  assert.equal(h.app.S.report.summary.worker_id,15);assert.equal(rendered,1);
 });

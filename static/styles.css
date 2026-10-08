@@ -229,3 +229,7 @@ button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-vis
 .notification-popover input:disabled,.notification-popover select:disabled,.notification-popover textarea:disabled{background:#2d3236;color:#c4c7c5;opacity:1}
 .notification-popover .icon-button{background:#303438;color:#efede8;border-color:#50555a}
 .notification-popover button:focus-visible,.notification-popover input:focus-visible,.notification-popover select:focus-visible,.notification-popover textarea:focus-visible{outline:3px solid #f0aa2b;outline-offset:2px}
+
+/* Reporting selectors may contain long asset/order labels; keep controls inside narrow panels. */
+.report-controls > .field-label{min-width:0;max-width:100%;flex:1 1 180px}
+.report-controls .field-select{min-width:0}

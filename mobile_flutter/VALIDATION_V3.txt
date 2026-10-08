@@ -1,0 +1,38 @@
+EnbekPlus Mobile v3 — actual validation, 2026-10-08 UTC
+
+BASELINE
+Source: the agreed mobile v2 drop-in update (EnbekPlus-master-create-v2.zip).
+Baseline archive SHA-256: 2859a95037b843e6a3f41ed27cf380119da2d2aafd0c178c6d83f1a319ee50c2
+Backend contract: immutable-fef6930a/EnbekPlus/server.py (read-only).
+No working computer, GitHub repository, live server, model, Telegram bot, or production database was modified or contacted.
+
+EXECUTED: STATIC / PACKAGING CHECKS
+PASS tool/verify_source.py: 535 complete RU/KK/EN entries, equal placeholders, direct UI keys; prior Content-Length/media guards retained; original theme contrast checks retained.
+PASS tool/verify_review_source.py with agreed baseline and server: dynamic analysis labels, 4 exact error strings and displayed server field names, no network/action code in new projection/card.
+PASS baseline byte comparison: API and every pre-existing lib/test/tool file except main.dart/translations.dart are unchanged; pubspec.yaml and dependency fragment unchanged.
+PASS main.dart source delta is exactly one import and one read-only card insertion plus spacing. No role/acceptance/action logic changed.
+PASS old 445 translation values are unchanged; 90 entries added.
+PASS Pygments lexical token / balanced-delimiter smoke check on seven new Dart files. This is NOT a Dart parser, type checker, formatter or compiler.
+PASS Python tool syntax parsing without importing/executing backend.
+PASS independent source review, including backend contract. Identified privacy/stale-analysis/warning-bound findings corrected and re-reviewed; no remaining blocking source findings reported.
+PASS incremental patch applied to a separate v2 copy and reproduced every delivered lib/test/tool/pubspec file byte-for-byte.
+PASS ZIP CRC, file allowlist, internal SHA-256 manifest, and baseline file coverage verified.
+
+BLOCKED / NOT EXECUTED
+flutter analyze: blocked, shell reports flutter: command not found (exit 127).
+flutter test test/ai_review_test.dart test/ai_review_card_test.dart test/ai_review_translations_test.dart: blocked, flutter: command not found (exit 127).
+dart tool/ai_review_regression.dart: blocked, dart: command not found (exit 127).
+dart format --output=none --set-exit-if-changed lib test tool: blocked, dart: command not found (exit 127).
+Full existing Flutter test suite, device/emulator visual inspection, Android/iOS builds and live-server flows: NOT RUN.
+No APK built. No Gradle wrapper JAR included or downloaded. No SDK installed.
+
+TESTS INCLUDED, NOT CLAIMED AS PASSED
+- Valid rules-only variants; matching model metadata; report score, reason and confidence; false/missing/unknown flags; master-decision requirement
+- Null/empty/malformed/oversized/wrong-type JSON; unknown modes/fields; strict optional photo/material scalar fields
+- Embedded JSON and credential-shaped text; ordinary bracketed equipment identifiers; bounded text/issues; backend warnings beyond 20 model issues
+- Prior-result labeling after active work/resubmission or newer completion, while fresh verdict=rework remains current
+- Master rating/reason from closed orders independent of AI fields, including missing AI result
+- 320 px / 200% text in RU/KK/EN and light/dark themes; role-specific detail integration with no mutation; exact server error translation
+
+RELEASE STATUS
+Prepared and source-reviewed update package only. Compile, analyze, run all tests, and inspect on a device with the current project SDK before treating it as a tested mobile release.

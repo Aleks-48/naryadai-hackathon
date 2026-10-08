@@ -1,0 +1,929 @@
+--- a/.env.example
++++ b/.env.example
+@@ -5,7 +5,8 @@
+ NARYADAI_LLM_MODEL=
+ NARYADAI_LLM_REPORT_SUMMARY=0
+ 
+-# Optional Telegram bot adapter. No bot or external messages are created by this project.
++# Optional Telegram bot adapter. Disabled by default. Configure secrets only locally.
++# Both the bot token and webhook secret are required; enabling it may send notifications.
+ NARYADAI_TELEGRAM_ENABLED=0
+ NARYADAI_TELEGRAM_BOT_TOKEN=
+ NARYADAI_TELEGRAM_WEBHOOK_SECRET=
+--- a/README.md
++++ b/README.md
+@@ -147,3 +147,29 @@
+ - The source archive is built separately from this working copy and excludes the Git directory, local database/runtime data, virtual environments, and secrets.
+ 
+ These checks are local MVP evidence; they are not a production readiness or real Android device claim.
++
++
++## Безопасное включение существующей LLM-проверки (8 октября 2026)
++
++По умолчанию LLM выключена. Compose теперь передаёт NARYADAI_LLM_ENABLED с безопасным значением по умолчанию 0; наличие ключа само по себе не включает внешние запросы. Это исправление конфигурации не активирует модель и не меняет ваши реальные контейнеры.
++
++Для ручного включения на своей машине, после выбора провайдера и согласования передачи только синтетических демоданных:
++
++1. Задайте локально NARYADAI_LLM_ENABLED=1 и NARYADAI_LLM_MODEL с выбранным именем модели. Используйте уже предусмотренные NARYADAI_LLM_API_KEY и при необходимости NARYADAI_LLM_API_URL (только HTTPS).
++2. Ключ вводите только локально или через менеджер секретов. Не присылайте его в чат, не добавляйте в ZIP/репозиторий и не публикуйте вывод docker compose config с раскрытыми значениями.
++3. Пересоздайте сервис app своим обычным разрешённым способом (например, docker compose up -d --build app), сохраняя именованный data volume. Не выполняйте down -v для обновления.
++4. Проверьте mode в результате конкретной проверки: rules-only означает, что настоящая модель не была использована. Сам факт установленного флага не доказывает успешный вызов модели. При ошибке/отсутствии конфигурации сервер остаётся в явно обозначенном rules-only.
++5. Чтобы выключить новые обращения, верните NARYADAI_LLM_ENABLED=0 и пересоздайте сервис app.
++
++Существующий адаптер передаёт текст отчёта и ограниченный контекст наряда. Настоящие производственные/персональные данные без отдельного разрешения не используйте. LLM, фото и их оценка не подтверждают исправность оборудования или допуск к опасным работам; окончательное решение остаётся за мастером.
++
++
++### Отдельное включение сводки и Telegram
++
++Скопируйте .env.example в локальный .env вручную; файл .env исключён из Git и сборочного контекста. Пустые ключи в шаблоне нужно заполнять только на своей машине. Не передавайте .env, ключи или токен через чат, GitHub или архив исходников.
++
++NARYADAI_LLM_REPORT_SUMMARY=0 по умолчанию. Для разрешённой сводки отчёта отдельно задайте NARYADAI_LLM_REPORT_SUMMARY=1; также нужна включённая и настроенная LLM. Сводка запрашивается только явной кнопкой, для мастера/руководителя и при достаточном числе записей. Обычное обновление отчёта не вызывает LLM.
++
++Telegram по умолчанию выключен: NARYADAI_TELEGRAM_ENABLED=0, NARYADAI_TELEGRAM_BOT_TOKEN и NARYADAI_TELEGRAM_WEBHOOK_SECRET пустые. Для ручного включения существующего адаптера администратор локально задаёт оба секрета и NARYADAI_TELEGRAM_ENABLED=1, затем пересоздаёт app. Наличие токена без webhook secret недостаточно: сервер сохраняет проверку X-Telegram-Bot-Api-Secret-Token и не принимает webhook без совпадающего секрета. Настройка бота/webhook и привязка пользователем выполняются отдельно; этот архив их не создаёт. Включённый адаптер может доставлять уведомления, поэтому сначала используйте отдельного тестового бота и синтетические данные. Чтобы остановить новые доставки, верните NARYADAI_TELEGRAM_ENABLED=0 и пересоздайте app.
++
++Ни проверка реального провайдера, ни доставка Telegram, ни изменение ваших работающих контейнеров при подготовке архива не выполнялись.
+--- a/compose.yaml
++++ b/compose.yaml
+@@ -8,9 +8,14 @@
+       NARYADAI_DATA_DIR: /data
+       NARYADAI_HOST: 0.0.0.0
+       NARYADAI_PORT: 8765
++      NARYADAI_LLM_ENABLED: ${NARYADAI_LLM_ENABLED:-0}
+       NARYADAI_LLM_API_URL: ${NARYADAI_LLM_API_URL:-}
+       NARYADAI_LLM_API_KEY: ${NARYADAI_LLM_API_KEY:-}
+       NARYADAI_LLM_MODEL: ${NARYADAI_LLM_MODEL:-}
++      NARYADAI_LLM_REPORT_SUMMARY: ${NARYADAI_LLM_REPORT_SUMMARY:-0}
++      NARYADAI_TELEGRAM_ENABLED: ${NARYADAI_TELEGRAM_ENABLED:-0}
++      NARYADAI_TELEGRAM_BOT_TOKEN: ${NARYADAI_TELEGRAM_BOT_TOKEN:-}
++      NARYADAI_TELEGRAM_WEBHOOK_SECRET: ${NARYADAI_TELEGRAM_WEBHOOK_SECRET:-}
+     ports:
+       - 127.0.0.1:8765:8765
+     volumes:
+--- a/server.py
++++ b/server.py
+@@ -3130,8 +3130,12 @@
+             if brigade:
+                 if brigade not in {"A","B","C"}: raise ApiError(400,"Бригада не найдена")
+                 worker = db.execute("""SELECT u.id FROM users u LEFT JOIN orders o ON o.assigned_to=u.id AND o.status IN ('accepted','queued','in_progress','paused','executed','ai_review','rework')
+-                    WHERE u.role='worker' AND u.brigade=? GROUP BY u.id ORDER BY COUNT(o.id),u.id LIMIT 1""",(brigade,)).fetchone()
+-                targets={r[0] for r in db.execute("SELECT id FROM users WHERE role='worker' AND brigade=?",(brigade,))}
++                    WHERE u.role='worker' AND u.is_active=1 AND u.brigade=?
++                    GROUP BY u.id ORDER BY COUNT(o.id),u.id LIMIT 1""",(brigade,)).fetchone()
++                if not worker:
++                    raise ApiError(409, "В бригаде нет активного исполнителя.")
++                targets={r[0] for r in db.execute(
++                    "SELECT id FROM users WHERE role='worker' AND is_active=1 AND brigade=?",(brigade,))}
+             else:
+                 try: worker_id=int(worker_id)
+                 except (TypeError,ValueError): raise ApiError(400,"Исполнитель не выбран")
+--- a/static/app.js
++++ b/static/app.js
+@@ -2,7 +2,7 @@
+   "use strict";
+   const $ = (s, root = document) => root.querySelector(s);
+   const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+-  const S = { me: null, data: null, view: "home", orderId: null, filter: "all", search: "", areaFilter:"", equipmentFilter:"", workerFilter:"", priorityFilter:"", timer: null, installPrompt: null, report: null, session: 0, refreshRequest: 0, drawerVersion: 0, drawerRequest: 0, drawerOrderId: null, drawerStatus: null, viewVersion: 0, reportRequest: 0, telegramRequest: 0, telegramOutsideHandler: null, ratingFrom:"", ratingTo:"", ratingShift:"", reportFrom:"", reportTo:"", reportShift:"", reportBrigade:"", completing: new Set(), uploading: new Set(), drawerWrites:new Set(), creatingOrder: false, downtimeDraft:null, registeringDowntime:false, workQueueWrites:new Set() };
++  const S = { me: null, data: null, view: "home", orderId: null, filter: "all", search: "", areaFilter:"", equipmentFilter:"", workerFilter:"", priorityFilter:"", timer: null, installPrompt: null, report: null, session: 0, refreshRequest: 0, drawerVersion: 0, drawerRequest: 0, drawerOrderId: null, drawerStatus: null, viewVersion: 0, reportRequest: 0, telegramRequest: 0, telegramOutsideHandler: null, ratingFrom:"", ratingTo:"", ratingShift:"", reportFrom:"", reportTo:"", reportShift:"", reportBrigade:"", reportArea:"", reportEquipment:"", reportWorker:"", completing: new Set(), uploading: new Set(), drawerWrites:new Set(), creatingOrder: false, downtimeDraft:null, registeringDowntime:false, workQueueWrites:new Set() };
+   const STATUS_RU = {issued:"Выдан",accepted:"Принят",queued:"В очереди",rejected:"Отклонён",in_progress:"В работе",paused:"Приостановлен",executed:"Исполнено",ai_review:"Проверка ИИ",rework:"Доработка",closed:"Закрыт"};
+   const EQUIPMENT_TYPE_RU={crusher:"Дробилка",conveyor:"Конвейер",pump:"Насос",compressor:"Компрессор",fan:"Вентилятор",unknown:"Неизвестно"};
+   const EVENT_RU = {issued:"Выдал наряд",accept:"Принял наряд",queue:"Поставил в очередь",reject:"Отклонил наряд",start:"Начал работу",pause:"Приостановил работу",resume:"Продолжил работу",complete:"Зафиксировал исполнение",ai_check:"Проверил отчёт",request_rework:"Вернул на доработку",close:"Принял и закрыл",reissue:"Выдал повторно",reassigned:"Переназначил",cancel:"Отменил наряд",priority_changed:"Изменил приоритет",photo_uploaded:"Загрузил фото",rating_adjusted:"Изменил оценку",rejection_classified:"Классифицировал отказ",acceptance_escalated:"Эскалация принятия",deadline_reminder:"Напоминание о сроке",deadline_escalated:"Эскалация просрочки",deadline_repeat:"Повторное сообщение о просрочке",equipment_downtime_registered:"Зарегистрировал простой оборудования",photo_duplicate_rejected:"\u0414\u0443\u0431\u043b\u044c \u0444\u043e\u0442\u043e \u043e\u0442\u043a\u043b\u043e\u043d\u0451\u043d, \u0444\u0430\u0439\u043b \u043d\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0451\u043d",photo_limit_rejected:"\u0424\u043e\u0442\u043e \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u043e \u043f\u043e \u043b\u0438\u043c\u0438\u0442\u0443",photo_legacy_duplicate_retired:"\u0421\u0442\u0430\u0440\u044b\u0439 \u0434\u0443\u0431\u043b\u044c \u0434\u0435\u0430\u043a\u0442\u0438\u0432\u0438\u0440\u043e\u0432\u0430\u043d, \u0444\u0430\u0439\u043b \u043e\u0447\u0438\u0449\u0435\u043d",photo_superseded:"\u0424\u043e\u0442\u043e \u0437\u0430\u043c\u0435\u043d\u0435\u043d\u044b \u043f\u0440\u0438 \u0432\u043e\u0437\u0432\u0440\u0430\u0442\u0435 \u043d\u0430 \u0434\u043e\u0440\u0430\u0431\u043e\u0442\u043a\u0443",order_create_duplicate_photos_rejected:"\u0414\u0443\u0431\u043b\u0438 \u0444\u043e\u0442\u043e \u0434\u043e \u0432\u044b\u0434\u0430\u0447\u0438 \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u044b"};
+@@ -57,7 +57,7 @@
+     if(!S.me)return;
+     const c=context(), request=++S.refreshRequest;
+     try {
+-      const params=new URLSearchParams();if(S.ratingFrom)params.set("rating_from",S.ratingFrom);if(S.ratingTo)params.set("rating_to",S.ratingTo);if(S.ratingShift)params.set("shift_code",S.ratingShift);const data=await api(`/api/bootstrap${params.size?`?${params}`:""}`);if(!sameSession(c)||request!==S.refreshRequest)return;
++      const params=new URLSearchParams();if(S.ratingFrom)params.set("rating_from",S.ratingFrom);if(S.ratingTo)params.set("rating_to",S.ratingTo);if(S.ratingShift)params.set("rating_shift",S.ratingShift);const data=await api(`/api/bootstrap${params.size?`?${params}`:""}`);if(!sameSession(c)||request!==S.refreshRequest)return;
+       S.data=data;S.me=data.user;$("#offline-banner").classList.add("hidden");
+       syncChrome();if(S.view!=="reports"||!$("#report-result"))render();
+       if(S.orderId)await refreshDrawer(true);
+@@ -146,7 +146,7 @@
+     const people=S.data.members||[], today=new Date().toISOString().slice(0,10), monthAgo=new Date(Date.now()-29*86400000).toISOString().slice(0,10);
+     return `${pageHeading("Команда и загрузка", "Исполнители", "Доступность рассчитывается по нарядам и учебному UTC-графику. Специальность, разряд и смена синтетические; они не подтверждают допуск.")}
+       <div class="filter-line"><div class="notice-box" style="max-width:720px"><strong>Формула рейтинга:</strong> качество 40%, срок 20%, отсутствие доработок и явно связанных повторов 20%, объём с коэффициентом сложности 10%, только подтверждённые необоснованные отказы 10%. Вес доступных факторов нормируется до 100%. Повтор учитывается только после явной связи мастером, с основанием и правом отмены.</div></div>
+-      <div class="filter-line"><label class="field-label">Оценка с <input id="team-rating-from" class="field-input" type="date" value="${ESC(S.ratingFrom||monthAgo)}"></label><label class="field-label">по <input id="team-rating-to" class="field-input" type="date" value="${ESC(S.ratingTo||today)}"></label><label class="field-label">Смена <select id="team-shift-filter" class="field-select"><option value="">все</option>${["A","B","C"].map(x=>`<option value="${x}" ${S.ratingShift===x?"selected":""}>${x} · UTC</option>`).join("")}</select></label><button class="button button-primary" id="apply-team-filters">Применить</button><select id="team-brigade-filter" class="select-small"><option value="all">Все бригады</option><option>A</option><option>B</option><option>C</option></select></div>
++      <div class="filter-line"><label class="field-label">Оценка с <input id="team-rating-from" class="field-input" type="date" value="${ESC(S.ratingFrom||monthAgo)}"></label><label class="field-label">по <input id="team-rating-to" class="field-input" type="date" value="${ESC(S.ratingTo||today)}"></label><label class="field-label">Смена событий рейтинга · UTC <select id="team-shift-filter" class="field-select"><option value="">все</option>${["A","B","C"].map(x=>`<option value="${x}" ${S.ratingShift===x?"selected":""}>${x} · UTC</option>`).join("")}</select></label><button class="button button-primary" id="apply-team-filters">Применить</button><select id="team-brigade-filter" class="select-small"><option value="all">Все бригады</option><option>A</option><option>B</option><option>C</option></select></div>
+       <div class="notice-box">Профили, разряды, бригады и сменный график — вымышленные демонстрационные данные. Это не удостоверения, квалификационная проверка, разрешение на опасные работы или фактическое табелирование.</div>
+       <div class="grid team-grid">${people.map(m=>`<article class="team-card team-person" data-brigade="${ESC(m.brigade)}"><div class="team-top"><span class="team-avatar">${initials(m.display_name)}</span><div><b>${ESC(m.display_name)}</b><small>Бригада ${ESC(m.brigade)} · <span class="availability">${ESC(m.availability_label)}</span></small><small>${ESC(m.specialty||"—")} · разряд ${m.qualification_level??"—"} · смена ${ESC(m.shift_code||"—")} (синтетика)</small></div><b style="margin-left:auto;color:#257c61;font:800 17px Manrope">${m.rating_detail?.score??"—"}</b></div><div class="team-metrics"><div><b>${m.active_orders||0}</b><span>активные наряды</span></div><div><b>${m.queue_count||0}</b><span>в очереди</span></div><div><b>${m.rating_detail?.evidence?.closed||0}</b><span>закрыто за период</span></div></div><div class="rating-scale">${ratingFactors(m.rating_detail)}</div></article>`).join("")}</div>`;
+   }
+@@ -162,11 +162,30 @@
+     $("#apply-team-filters")?.addEventListener("click",()=>{S.ratingFrom=from?.value||"";S.ratingTo=to?.value||"";S.ratingShift=shift?.value||"";if(S.ratingFrom&&S.ratingTo&&S.ratingTo<S.ratingFrom){toast("Дата окончания раньше даты начала.",true);return;}refresh();});
+     $("#team-brigade-filter")?.addEventListener("change",e=>$$('.team-person').forEach(c=>c.classList.toggle("hidden",e.target.value!=="all"&&c.dataset.brigade!==e.target.value)));
+   }
+-  function renderReports(){const today=new Date().toISOString().slice(0,10), equipment=S.data?.constants?.equipment||[];const downtimeForm=role()==="master"?`<section class="panel"><h2>Зарегистрировать простой оборудования</h2><p class="demo-note">Отдельный закрытый интервал, время вводится в часовом поясе устройства и нормализуется сервером в UTC. Это не пауза исполнителя и не подтверждение состояния оборудования.</p><form id="downtime-form"><div class="report-controls"><label class="field-label">Оборудование<select id="downtime-equipment" class="field-select" required><option value="">Выберите</option>${equipment.map(e=>`<option value="${e.id}">${ESC(e.code)} · ${ESC(e.name)}</option>`).join("")}</select></label><label class="field-label">Начало · время устройства<input id="downtime-start" class="field-input" type="datetime-local" required></label><label class="field-label">Окончание · время устройства<input id="downtime-end" class="field-input" type="datetime-local" required></label><label class="field-label">Причина<input id="downtime-reason" class="field-input" minlength="4" maxlength="500" required placeholder="Например: зарегистрировано сообщение о простое"></label><button class="button button-primary" id="downtime-submit">Сохранить интервал</button></div></form></section>`:"";return `${pageHeading("Наряды и периоды", "Сменные отчёты", "Фильтр по периоду и смене исполнителя. Все даты — UTC; смена в демоданных назначена синтетическому профилю.")}${downtimeForm}
+-    <section class="panel"><div class="report-controls"><label class="field-label">С <input id="report-from" class="field-input" type="date" value="${ESC(S.reportFrom||today)}"></label><label class="field-label">По <input id="report-to" class="field-input" type="date" value="${ESC(S.reportTo||today)}"></label><label class="field-label">Бригада <select id="report-brigade" class="field-select"><option value="">все</option>${["A","B","C"].map(x=>`<option value="${x}" ${S.reportBrigade===x?"selected":""}>${x}</option>`).join("")}</select></label><label class="field-label">Смена <select id="report-shift" class="field-select"><option value="">все</option>${["A","B","C"].map(x=>`<option value="${x}" ${S.reportShift===x?"selected":""}>${x} · UTC</option>`).join("")}</select></label><button class="button button-primary" id="load-report">Сформировать отчёт</button></div><div id="report-result"><div class="empty-state">Выберите период и сформируйте отчёт.</div></div></section>`;}
++  function reportEquipmentOptions(areaId,selected=""){
++    return '<option value="">всё</option>'+(S.data?.constants?.equipment||[]).filter(e=>!areaId||String(e.area_id)===String(areaId)).map(e=>`<option value="${e.id}" ${String(e.id)===String(selected)?"selected":""}>${ESC(e.code)} · ${ESC(e.name)}</option>`).join("");
++  }
++  function downtimeOrderOptions(equipmentId){
++    return '<option value="">Без связи с нарядом</option>'+orders().filter(o=>equipmentId&&String(o.equipment_id)===String(equipmentId)).map(o=>`<option value="${o.id}">${ESC(o.code)} · ${ESC(o.title)}</option>`).join("");
++  }
++  function renderReports(){
++    const today=new Date().toISOString().slice(0,10),equipment=S.data?.constants?.equipment||[],areas=S.data?.constants?.areas||[];
++    const workers=(S.data?.constants?.users||[]).filter(u=>u.role==="worker"&&(role()!=="worker"||u.id===S.me.id));
++    const downtimeForm=role()==="master"?`<section class="panel"><h2>Зарегистрировать простой оборудования</h2><p class="demo-note">Отдельный закрытый интервал, время вводится в часовом поясе устройства и нормализуется сервером в UTC. Это не пауза исполнителя и не подтверждение состояния оборудования. Связь с нарядом необязательна; без неё интервал не входит в отчёт с фильтром исполнителя или бригады.</p><form id="downtime-form"><div class="report-controls"><label class="field-label">Оборудование<select id="downtime-equipment" class="field-select" required><option value="">Выберите</option>${equipment.map(e=>`<option value="${e.id}">${ESC(e.code)} · ${ESC(e.name)}</option>`).join("")}</select></label><label class="field-label">Связанный наряд · необязательно<select id="downtime-order" class="field-select" disabled>${downtimeOrderOptions("")}</select></label><label class="field-label">Начало · время устройства<input id="downtime-start" class="field-input" type="datetime-local" required></label><label class="field-label">Окончание · время устройства<input id="downtime-end" class="field-input" type="datetime-local" required></label><label class="field-label">Причина<input id="downtime-reason" class="field-input" minlength="4" maxlength="500" required placeholder="Например: зарегистрировано сообщение о простое"></label><button class="button button-primary" id="downtime-submit">Сохранить интервал</button></div></form></section>`:"";
++    return `${pageHeading("Наряды и периоды", "Сменные отчёты", "Период и смена фильтруют время события UTC. Текущая загрузка показана отдельно, без фильтра дат и смены.")}${downtimeForm}
++    <section class="panel"><div class="report-controls"><label class="field-label">С <input id="report-from" class="field-input" type="date" value="${ESC(S.reportFrom||today)}"></label><label class="field-label">По <input id="report-to" class="field-input" type="date" value="${ESC(S.reportTo||today)}"></label><label class="field-label">Участок <select id="report-area" class="field-select"><option value="">все</option>${areas.map(a=>`<option value="${a.id}" ${String(a.id)===S.reportArea?"selected":""}>${ESC(a.name)}</option>`).join("")}</select></label><label class="field-label">Оборудование <select id="report-equipment" class="field-select">${reportEquipmentOptions(S.reportArea,S.reportEquipment)}</select></label><label class="field-label">Исполнитель <select id="report-worker" class="field-select"><option value="">все доступные</option>${workers.map(w=>`<option value="${w.id}" ${String(w.id)===S.reportWorker?"selected":""}>${ESC(w.display_name)}</option>`).join("")}</select></label><label class="field-label">Бригада <select id="report-brigade" class="field-select"><option value="">все</option>${["A","B","C"].map(x=>`<option value="${x}" ${S.reportBrigade===x?"selected":""}>${x}</option>`).join("")}</select></label><label class="field-label">Смена событий · UTC <select id="report-shift" class="field-select"><option value="">все</option>${["A","B","C"].map(x=>`<option value="${x}" ${S.reportShift===x?"selected":""}>${x} · ${{A:"06–14",B:"14–22",C:"22–06"}[x]} UTC</option>`).join("")}</select></label><button class="button button-primary" id="load-report">Сформировать отчёт</button></div><div id="report-result"><div class="empty-state">Выберите период и сформируйте отчёт.</div></div></section>`;
++  }
+   function bindReportControls(){
+-    $("#load-report")?.addEventListener("click",loadReport);
++    $("#load-report")?.addEventListener("click",()=>loadReport());
+     $("#report-result")?.addEventListener("click",e=>{if(e.target.closest("[data-ai-summary]"))loadReport(true);});
++    $("#report-area")?.addEventListener("change",()=>{
++      const equipment=$("#report-equipment");if(!equipment)return;
++      equipment.innerHTML=reportEquipmentOptions($("#report-area").value,equipment.value);
++    });
++    $("#downtime-equipment")?.addEventListener("change",()=>{
++      const order=$("#downtime-order"),equipmentId=$("#downtime-equipment").value;if(!order)return;
++      order.innerHTML=downtimeOrderOptions(equipmentId);order.disabled=!equipmentId;
++    });
+     $("#downtime-form")?.addEventListener("submit",submitEquipmentDowntime);
+     if(S.report&&$("#report-result"))renderReportResult();
+   }
+@@ -174,42 +193,51 @@
+     event.preventDefault();if(S.registeringDowntime)return;
+     const start=$("#downtime-start")?.value,end=$("#downtime-end")?.value;
+     if(!start||!end){toast("Укажите начало и окончание интервала.",true);return;}
+-    const payload={equipment_id:Number($("#downtime-equipment").value),started_at:new Date(start).toISOString(),ended_at:new Date(end).toISOString(),reason:$("#downtime-reason").value.trim()};
++    const startDate=new Date(start),endDate=new Date(end);
++    if(!Number.isFinite(startDate.valueOf())||!Number.isFinite(endDate.valueOf())||endDate<=startDate){toast("Окончание должно быть позже начала; проверьте даты.",true);return;}
++    const orderId=$("#downtime-order")?.value||"",c=context(),view=S.viewVersion;
++    const payload={equipment_id:Number($("#downtime-equipment").value),order_id:orderId?Number(orderId):null,started_at:startDate.toISOString(),ended_at:endDate.toISOString(),reason:$("#downtime-reason").value.trim()};
+     const fingerprint=JSON.stringify(payload);if(S.downtimeDraft?.fingerprint!==fingerprint){const key=globalThis.crypto?.randomUUID?.()||`nai-${Date.now()}-${Math.random().toString(36).slice(2)}`;S.downtimeDraft={fingerprint,key};}
+     payload.idempotency_key=S.downtimeDraft.key;S.registeringDowntime=true;const button=$("#downtime-submit");if(button)button.disabled=true;
+-    try{const result=await api("/api/equipment/downtime","POST",payload);S.downtimeDraft=null;toast(result.duplicate?"Этот интервал уже был сохранён; повтор не создан.":"Простой оборудования зарегистрирован.");await loadReport();}
+-    catch(e){toast(e.message,true);}
++    try{const result=await api("/api/equipment/downtime","POST",payload);if(!sameSession(c))return;S.downtimeDraft=null;toast(result.duplicate?"Этот интервал уже был сохранён; повтор не создан.":"Простой оборудования зарегистрирован.");if(S.view==="reports"&&S.viewVersion===view)await loadReport();}
++    catch(e){if(sameSession(c))toast(e.message,true);}
+     finally{S.registeringDowntime=false;const current=$("#downtime-submit");if(current)current.disabled=false;}
+   }
+   async function loadReport(includeAiSummary=false){
+-    const from=$("#report-from")?.value||new Date().toISOString().slice(0,10), to=$("#report-to")?.value||from, brigade=$("#report-brigade")?.value||"", shift=$("#report-shift")?.value||"";
++    const from=$("#report-from")?.value||new Date().toISOString().slice(0,10), to=$("#report-to")?.value||from, brigade=$("#report-brigade")?.value||"", shift=$("#report-shift")?.value||"",area=$("#report-area")?.value||"",equipment=$("#report-equipment")?.value||"",worker=$("#report-worker")?.value||"";
+     if(to<from){toast("Дата окончания раньше даты начала.",true);return;}
+-    S.reportFrom=from;S.reportTo=to;S.reportBrigade=brigade;S.reportShift=shift;
++    S.reportFrom=from;S.reportTo=to;S.reportBrigade=brigade;S.reportShift=shift;S.reportArea=area;S.reportEquipment=equipment;S.reportWorker=worker;
+     const c=context(), view=S.viewVersion, request=++S.reportRequest;
+     const current=()=>sameSession(c)&&S.view==="reports"&&S.viewVersion===view&&S.reportRequest===request;
+     $("#report-result").innerHTML='<div class="loading-state"><span class="loader"></span>Собираем сводку…</div>';
+-    try{const result=await api(`/api/reports?date_from=${encodeURIComponent(from)}&date_to=${encodeURIComponent(to)}&brigade=${encodeURIComponent(brigade)}&shift_code=${encodeURIComponent(shift)}${includeAiSummary?"&include_ai_summary=1":""}`);if(!current())return;S.report=result;renderReportResult();}
++    const params=new URLSearchParams({date_from:from,date_to:to,brigade,shift_code:shift});
++    if(area)params.set("area_id",area);if(equipment)params.set("equipment_id",equipment);if(worker)params.set("worker_id",worker);
++    if(includeAiSummary===true)params.set("include_ai_summary","1");
++    try{const result=await api(`/api/reports?${params}`);if(!current())return;S.report=result;renderReportResult();}
+     catch(e){if(current())$("#report-result").innerHTML=`<div class="empty-state">${ESC(e.message)}</div>`;}
+   }
+   function renderReportResult(){
+     if(!S.report)return;
+     const summary=S.report.summary,items=S.report.items||[];
+     const table=items.length?"<div class=\"report-table-wrap\"><table class=\"report-table\"><thead><tr><th>Наряд</th><th>Оборудование</th><th>Исполнитель</th><th>Результат</th><th>Фактические часы</th><th>Учебный ориентир труда</th><th>Оценка</th></tr></thead><tbody>"+
+-      items.map(x=>{const ref=x.norm_reference,lab=ref?.labor,shown=ref?.status==="unknown"?"unknown":`${lab?.quantity??"unknown"} ${lab?.unit||""}`;return `<tr><td>${ESC(x.code)}<br>${ESC(x.title)}</td><td>${ESC(x.equipment)}<br>${ESC(x.fault_code||"—")}</td><td>${ESC(x.worker)}<br>Бригада ${ESC(x.brigade||"—")} · смена ${ESC(x.shift_code||"—")}</td><td>${ESC(x.status)}<br>${dateFmt(x.completed_at)}</td><td>${x.labor_hours??"—"} ч</td><td>${ESC(shown)} · синтетика</td><td>${x.rating??"—"}/5</td></tr>`;}).join("")+"</tbody></table><p class=\"demo-note\">Срок-дедлайн, фактические часы и учебный ориентир — разные значения. Сравнение не влияет на рейтинг и не является оценкой работника.</p></div>":"<div class=\"empty-state\">За выбранный период нет исполненных нарядов.</div>";
+-    const workerRows=(S.report.worker_totals||[]).map(x=>"<tr><td>"+ESC(x.worker)+"</td><td>"+ESC(x.brigade||"—")+"</td><td>"+ESC(x.shift_code||"—")+"</td><td>"+x.completed+"</td><td>"+x.closed+"</td><td>"+x.labor_hours+"</td></tr>").join("");
++      items.map(x=>{const ref=x.norm_reference,lab=ref?.labor,shown=ref?.status==="unknown"?"unknown":`${lab?.quantity??"unknown"} ${lab?.unit||""}`;return `<tr><td>${ESC(x.code)}<br>${ESC(x.title)}</td><td>${ESC(x.equipment)}<br>${ESC(x.fault_code||"—")}</td><td>${ESC(x.worker)}<br>Бригада ${ESC(x.brigade||"—")} · смена профиля ${ESC(x.shift_code||"—")}</td><td>${ESC(x.status)}<br>${dateFmt(x.completed_at)}</td><td>${x.labor_hours??"—"} ч</td><td>${ESC(shown)} · синтетика</td><td>${x.rating??"—"}/5</td></tr>`;}).join("")+"</tbody></table><p class=\"demo-note\">Срок-дедлайн, фактические часы и учебный ориентир — разные значения. Сравнение не влияет на рейтинг и не является оценкой работника.</p></div>":"<div class=\"empty-state\">За выбранный период нет исполненных нарядов.</div>";
++    const workerRows=(S.report.worker_totals||[]).map(x=>`<tr><td>${ESC(x.worker)}</td><td>${ESC(x.brigade||"—")}</td><td>${ESC(x.issued??0)}</td><td>${ESC(x.completed??0)}</td><td>${ESC(x.closed??0)}</td><td>${ESC(x.refusals??0)}</td><td>${ESC(x.labor_hours??0)}</td></tr>`).join("");
++    const workloadRows=(S.report.worker_totals||[]).map(x=>`<tr><td>${ESC(x.worker)}</td><td>${ESC(x.current_active??0)}</td><td>${ESC(x.current_in_progress??0)}</td><td>${ESC(x.current_queued??0)}</td></tr>`).join("");
+     const materialRows=(S.report.material_totals||[]).map(x=>"<tr><td>"+ESC(x.sku)+"</td><td>"+ESC(x.name)+"</td><td>"+x.quantity+" "+ESC(x.unit)+"</td></tr>").join("");
+-    const headline="<p class=\"demo-note\">"+ESC(summary.date_from)+" — "+ESC(summary.date_to)+" UTC · назначенная синтетическая смена: "+ESC(summary.shift_code)+"</p>";
++    const headline="<p class=\"demo-note\">"+ESC(summary.date_from)+" — "+ESC(summary.date_to)+" UTC · смена событий: "+ESC(summary.shift_code)+"</p>";
+     const downtimeTotals=(S.report.equipment_downtime_by_equipment||[]).map(x=>"<tr><td>"+ESC(x.equipment_code)+"</td><td>"+ESC(x.equipment)+"</td><td>"+x.downtime_minutes+" мин</td></tr>").join("");
+     const downtimeTable=(role()==="master"||role()==="manager")?`<section class="notice-box"><strong>Зарегистрированный простой оборудования: ${summary.equipment_downtime_minutes??"—"} мин</strong><p>${ESC(summary.equipment_downtime_note||"")}</p>${downtimeTotals?`<div class="report-table-wrap"><table class="report-table"><thead><tr><th>Код</th><th>Оборудование</th><th>Объединённое время</th></tr></thead><tbody>${downtimeTotals}</tbody></table></div>`:"<p>За период нет зарегистрированных интервалов.</p>"}</section>`:"";
+-    const cards="<div class=\"grid report-summary\">"+stat("Выдано",summary.issued,"в периоде","＋")+stat("Исполнено",summary.completed,"зафиксировано исполнителем","▤")+stat("Закрыто",summary.closed,"принято мастером","✓")+stat("Просрочено",summary.late_completions,"среди исполненных","!")+stat("Сейчас просрочено",summary.current_overdue_orders,"открытый срез","◷")+stat("Часы работы",summary.labor_hours,"фактические трудозатраты","◷")+stat("Пауза по журналу",summary.pause_minutes,"только паузы исполнителя","Ⅱ")+(summary.equipment_downtime_minutes!=null?stat("Простой оборудования",summary.equipment_downtime_minutes,"мин · отдельный журнал","◷"):"")+"</div>";
++    const cards="<h3>События за выбранный период</h3><div class=\"grid report-summary\">"+stat("Выдано",summary.issued,"в периоде","＋")+stat("Исполнено",summary.completed,"зафиксировано исполнителем","▤")+stat("Закрыто",summary.closed,"принято мастером","✓")+stat("Просрочено",summary.late_completions,"среди исполненных","!")+stat("Отказы",summary.refusals??0,"события отказа исполнителя","↩")+stat("Часы работы",summary.labor_hours,"фактические трудозатраты","◷")+stat("Пауза по журналу",summary.pause_minutes,"только паузы исполнителя","Ⅱ")+(summary.equipment_downtime_minutes!=null?stat("Простой оборудования",summary.equipment_downtime_minutes,"мин · отдельный журнал","◷"):"")+"</div>";
++    const periodNote=`<p class="demo-note">${ESC(summary.period_note||"Выдача — issued_at, исполнение/часы/материалы — completed_at, закрытие — closed_at. Смена определяется по времени события UTC.")}</p><p class="demo-note">${ESC(summary.refusals_note||"Отказы считаются по времени и автору события, включая переназначенные наряды; отмены мастером не включены.")}</p>`;
++    const workload=`<h3>Текущая загрузка · на сейчас</h3><p class="demo-note">${ESC(summary.workload_note||"Текущая загрузка и просрочка — без фильтра дат/смены, с выбранными участком, оборудованием, исполнителем и бригадой.")}</p><div class="grid report-summary">${stat("Сейчас открыто",summary.current_active_orders??0,"включая ожидающие приёмки","▤")}${stat("Сейчас просрочено",summary.current_overdue_orders??0,"без фильтра дат и смены","◷")}</div>${workloadRows?`<div class="report-table-wrap"><table class="report-table"><thead><tr><th>Исполнитель</th><th>Открыто сейчас</th><th>В работе / на паузе</th><th>В очереди / доработка</th></tr></thead><tbody>${workloadRows}</tbody></table></div>`:""}`;
+     const llmUsed=String(S.report.ai_summary_mode||summary.summary_mode||"").startsWith("llm:");
+     const notice="<div class=\"notice-box\"><strong>"+(llmUsed?"LLM-сводка по агрегатам · "+ESC(S.report.ai_summary_mode):"Правиловая сводка · "+ESC(S.report.ai_summary_mode||"rules-only"))+":</strong> "+ESC(S.report.ai_summary||("За "+summary.date_from+" — "+summary.date_to+" закрыто "+summary.closed+" из "+summary.completed+" исполненных нарядов."))+(summary.synthetic?" · синтетические данные":"")+"<br>"+ESC(summary.pause_minutes_note||"")+"</div>";
+     const aiAction=S.report.ai_summary_available&&!llmUsed?"<div class=\"notice-box\"><span>Дополнительный запрос отправит только агрегированные счётчики периода, без текста нарядов и имён.</span> <button class=\"button button-outline\" data-ai-summary>Сформировать LLM-сводку</button></div>":"";
+-    const workers=workerRows?"<h3>По исполнителям</h3><div class=\"report-table-wrap\"><table class=\"report-table\"><thead><tr><th>Исполнитель</th><th>Бригада</th><th>Смена · синтетика</th><th>Исполнено</th><th>Закрыто</th><th>Часы</th></tr></thead><tbody>"+workerRows+"</tbody></table></div>":"";
++    const workers=workerRows?"<h3>По исполнителям · события периода</h3><div class=\"report-table-wrap\"><table class=\"report-table\"><thead><tr><th>Исполнитель</th><th>Бригада</th><th>Выдано</th><th>Исполнено</th><th>Закрыто</th><th>Отказы</th><th>Часы</th></tr></thead><tbody>"+workerRows+"</tbody></table></div>":"";
+     const materials=materialRows?"<h3>Материалы и количество</h3><div class=\"report-table-wrap\"><table class=\"report-table\"><thead><tr><th>Артикул</th><th>Материал</th><th>Итого</th></tr></thead><tbody>"+materialRows+"</tbody></table></div>":"";
+     const normRows=S.data?.constants?.norm_catalog||[];
+     const catalog=normRows.length?`<details class="panel"><summary>Синтетический каталог ориентиров · ${normRows.length} строк</summary><p class="demo-note">Значения учебные и не утверждены заказчиком. Для отсутствующего сочетания типа работы и оборудования API возвращает unknown.</p><div class="report-table-wrap"><table class="report-table"><thead><tr><th>Тип работы</th><th>Тип оборудования</th><th>Ориентир</th><th>Источник / версия</th></tr></thead><tbody>${normRows.map(n=>`<tr><td>${n.work_type==="planned"?"Плановая":"Внеплановая"}</td><td>${ESC(EQUIPMENT_TYPE_RU[n.equipment_type]||"unknown")}</td><td>${n.kind==="labor"?`Труд · ${n.quantity} ${ESC(n.unit)}`:`${ESC(n.sku||"")} · ${ESC(n.material_name||"материал unknown")} · ${n.quantity} ${ESC(n.unit)}`}</td><td>${ESC(n.source_name)} · ${ESC(n.source_version)}<br>${ESC(n.source_note)}</td></tr>`).join("")}</tbody></table></div></details>`:'<div class="empty-state">Каталог ориентиров: unknown. Автоматическое сравнение не выполняется.</div>';
+-    $("#report-result").innerHTML=headline+cards+notice+downtimeTable+aiAction+catalog+workers+materials+table;
++    $("#report-result").innerHTML=headline+cards+periodNote+notice+downtimeTable+aiAction+workers+workload+catalog+materials+table;
+   }
+   async function loadAudit(){
+     const c=context(),view=S.viewVersion;const current=()=>sameSession(c)&&S.view==="audit"&&S.viewVersion===view;
+--- a/static/index.html
++++ b/static/index.html
+@@ -6,7 +6,7 @@
+   <meta name="theme-color" content="#f0aa2b">
+   <meta name="description" content="Локальный MVP управления ремонтными нарядами">
+   <link rel="manifest" href="/static/manifest.webmanifest">
+-  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
++  <link rel="icon" href="/static/icon-192.png" type="image/png">
+   <link rel="stylesheet" href="/static/styles.css">
+   <title>EnbekPlus — ремонтные работы</title>
+ </head>
+--- a/static/manifest.webmanifest
++++ b/static/manifest.webmanifest
+@@ -21,12 +21,6 @@
+       "sizes": "512x512",
+       "type": "image/png",
+       "purpose": "any maskable"
+-    },
+-    {
+-      "src": "/static/icon.svg",
+-      "sizes": "any",
+-      "type": "image/svg+xml",
+-      "purpose": "any maskable"
+     }
+   ]
+ }
+--- a/static/styles.css
++++ b/static/styles.css
+@@ -229,3 +229,7 @@
+ .notification-popover input:disabled,.notification-popover select:disabled,.notification-popover textarea:disabled{background:#2d3236;color:#c4c7c5;opacity:1}
+ .notification-popover .icon-button{background:#303438;color:#efede8;border-color:#50555a}
+ .notification-popover button:focus-visible,.notification-popover input:focus-visible,.notification-popover select:focus-visible,.notification-popover textarea:focus-visible{outline:3px solid #f0aa2b;outline-offset:2px}
++
++/* Reporting selectors may contain long asset/order labels; keep controls inside narrow panels. */
++.report-controls > .field-label{min-width:0;max-width:100%;flex:1 1 180px}
++.report-controls .field-select{min-width:0}
+--- a/static/sw.js
++++ b/static/sw.js
+@@ -1,5 +1,5 @@
+-const CACHE = "naryadai-shell-v13";
+-const SHELL = ["/", "/static/styles.css", "/static/app.js", "/static/icon.svg", "/static/icon-192.png", "/static/icon-512.png", "/static/manifest.webmanifest"];
++const CACHE = "naryadai-shell-v14";
++const SHELL = ["/", "/static/styles.css", "/static/app.js", "/static/icon-192.png", "/static/icon-512.png", "/static/manifest.webmanifest"];
+ self.addEventListener("install", event => event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL))));
+ self.addEventListener("activate", event => event.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k.startsWith("naryadai-shell-") && k !== CACHE).map(k => caches.delete(k))))));
+ self.addEventListener("fetch", event => {
+--- /dev/null
++++ b/tests/run_flutter_v2_contract.py
+@@ -0,0 +1,149 @@
++"""Exercise only the final Flutter v2 wire contract against a disposable server copy."""
++import base64
++import hashlib
++import http.client
++from http.server import ThreadingHTTPServer
++import importlib.util
++import io
++import json
++import os
++from pathlib import Path
++import random
++import tempfile
++import threading
++from PIL import Image
++
++ROOT = Path(__file__).resolve().parents[1]
++SERVER = ROOT / 'server.py'
++checks = []
++
++def record(name):
++    checks.append(name)
++    print('PASS', name, flush=True)
++
++with tempfile.TemporaryDirectory(prefix='enbek-native-contract-') as temp:
++    os.environ['NARYADAI_DATA_DIR'] = temp
++    for key in ('NARYADAI_LLM_ENABLED', 'NARYADAI_LLM_API_KEY', 'NARYADAI_LLM_MODEL',
++                'NARYADAI_LLM_REPORT_SUMMARY', 'NARYADAI_TELEGRAM_ENABLED',
++                'NARYADAI_TELEGRAM_BOT_TOKEN', 'NARYADAI_TELEGRAM_WEBHOOK_SECRET'):
++        os.environ[key] = ''
++    spec = importlib.util.spec_from_file_location('native_contract_server', SERVER)
++    app = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(app)
++    db_path = Path(temp) / 'synthetic.sqlite3'
++    app.MEDIA = Path(temp) / 'media'
++    app.init_db(db_path)
++    app.patch_cookie_login()
++    app.patch_get_photo()
++    class QuietHandler(app.AppHandler):
++        def log_message(self, *_args): pass
++    server = ThreadingHTTPServer(('127.0.0.1', 0), QuietHandler)
++    server.db_path = db_path
++    server.daemon_threads = True
++    worker_thread = threading.Thread(target=server.serve_forever, daemon=True)
++    worker_thread.start()
++
++    class Client:
++        def __init__(self): self.cookie = None; self.csrf = None
++        def request(self, path, body=None, csrf=True, raw=False):
++            connection = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=25)
++            headers = {'Accept':'image/jpeg,image/png,image/webp' if raw else 'application/json', 'Cache-Control':'no-store'}
++            if self.cookie: headers['Cookie'] = self.cookie
++            if body is not None and csrf and self.csrf: headers['X-CSRF-Token'] = self.csrf
++            data = None if body is None else json.dumps(body, ensure_ascii=False, separators=(',',':')).encode('utf-8')
++            if data is not None:
++                headers['Content-Type'] = 'application/json; charset=utf-8'
++                headers['Content-Length'] = str(len(data))
++            try:
++                connection.request('GET' if body is None else 'POST', path, data, headers)
++                response = connection.getresponse()
++                content = response.read()
++                cookie = response.getheader('Set-Cookie')
++                if cookie and cookie.startswith('naryadai_session='): self.cookie = cookie.split(';',1)[0]
++                return response.status, content if raw else json.loads(content), response.getheader('Content-Type')
++            finally: connection.close()
++        def login(self, username):
++            status, body, _ = self.request('/api/login', {'username':username, 'password':'demo123'}, csrf=False)
++            assert status == 200 and self.cookie and isinstance(body['user']['csrf'],str)
++            self.csrf = body['user']['csrf']
++            return body['user']
++
++    def image_payload(seed, phase):
++        rng = random.Random(seed)
++        image = Image.new('RGB',(80,80))
++        image.putdata([(rng.randrange(256),rng.randrange(256),rng.randrange(256)) for _ in range(6400)])
++        output = io.BytesIO(); image.save(output,format='PNG'); data=output.getvalue()
++        return {'phase':phase,'file_name':f'fixture-{seed}.png','data_url':'data:image/png;base64,'+base64.b64encode(data).decode()}, data
++
++    try:
++        master, worker, manager, stranger, anonymous = (Client() for _ in range(5))
++        master_user=master.login('master01'); worker_user=worker.login('worker01')
++        manager.login('manager'); stranger.login('worker15')
++        record('login cookie name + user.csrf + UTF-8 fixed-length JSON')
++        status, bootstrap, _=master.request('/api/bootstrap')
++        assert status==200 and isinstance(bootstrap['orders'],list)
++        c=bootstrap['constants']
++        for key in ('areas','equipment','users','fault_codes','materials'): assert isinstance(c[key],list) and c[key]
++        eq=c['equipment'][0]
++        create={'title':'Проверка узла 🔧','description':'Проверить оборудование и записать фактический результат.',
++                'issuance_comment':'Синтетическая проверка клиента','work_type':'unscheduled','priority':'normal',
++                'area_id':eq['area_id'],'equipment_id':eq['id'],'worker_id':worker_user['id'],'norm_hours':8.0}
++        assert master.request('/api/orders',create,csrf=False)[0]==403
++        assert worker.request('/api/orders',create)[0]==403
++        assert manager.request('/api/orders',create)[0]==403
++        record('bootstrap catalogs + missing-CSRF/worker/manager create rejection')
++        status, created, _=master.request('/api/orders',create)
++        order=created['order']; oid=order['id']
++        assert status==201 and order['status']=='issued' and order['photos']==[]
++        before,_=image_payload(100,'before')
++        status, uploaded, _=master.request(f'/api/orders/{oid}/photos',before)
++        assert status==201 and isinstance(uploaded['photo']['id'],int)
++        record('native create payload + separate BEFORE photo upload')
++        for action in ('accept','start'):
++            assert worker.request(f'/api/orders/{oid}/action',{'action':action})[0]==200
++        after,after_bytes=image_payload(200,'after')
++        status,uploaded,_=worker.request(f'/api/orders/{oid}/photos',after)
++        assert status==201
++        photo_id=uploaded['photo']['id']
++        assert anonymous.request(f'/api/photos/{photo_id}',raw=True)[0]==401
++        assert stranger.request(f'/api/photos/{photo_id}',raw=True)[0]==404
++        for client in (master,worker,manager):
++            status,received,mime=client.request(f'/api/photos/{photo_id}',raw=True)
++            assert status==200 and mime=='image/png' and received==after_bytes and len(received)<=4_000_000
++        record('protected photo bytes/MIME for allowed roles; anonymous and unrelated worker denied')
++        complete={'action':'complete','completion_text':'Выполнена проверка узла; результат описан без утверждения допуска к опасным работам.',
++                  'worker_completion_comment':'Тестовый комментарий исполнителя','labor_hours':1.5,
++                  'fault_code_id':c['fault_codes'][0]['id'],'materials_not_used':True,'materials':[]}
++        status,completed,_=worker.request(f'/api/orders/{oid}/action',complete)
++        assert status==200 and completed['order']['status']=='executed'
++        status,reviewed,_=worker.request(f'/api/orders/{oid}/action',{'action':'ai_check'})
++        assert status==200 and reviewed['order']['status']=='ai_review'
++        result=json.loads(reviewed['order']['ai_result'])
++        assert result['verdict']=='comments' and result['master_confirmation_required'] is True
++        record('worker complete payload + ai_check -> ai_review with mandatory master review')
++        status,reworked,_=master.request(f'/api/orders/{oid}/action',{'action':'request_rework','reason':'Нужна повторная проверка.'})
++        assert status==200 and reworked['order']['status']=='rework'
++        assert not [p for p in reworked['order']['photos'] if p['phase']=='after']
++        assert worker.request(f'/api/photos/{photo_id}',raw=True)[0]==404
++        assert worker.request(f'/api/orders/{oid}/action',{'action':'start'})[0]==200
++        replacement,_=image_payload(300,'after')
++        assert worker.request(f'/api/orders/{oid}/photos',replacement)[0]==201
++        assert worker.request(f'/api/orders/{oid}/action',complete)[0]==200
++        assert worker.request(f'/api/orders/{oid}/action',{'action':'ai_check'})[0]==200
++        record('master rework retires previous AFTER images; worker can restart/reupload/report')
++        status,closed,_=master.request(f'/api/orders/{oid}/action',{'action':'close','closure_comment':'Мастер проверил отчёт и подтверждает приёмку.','rating':4})
++        assert status==200 and closed['order']['status']=='closed' and closed['order']['rating']==4
++        assert master.request(f'/api/orders/{oid}/rating',{'rating':5,'reason':'Повторная проверка мастером.'})[0]==200
++        assert master.request(f'/api/orders/{oid}')[1]['order']['rating']==5
++        record('master close + rating-adjustment payloads')
++        status,tg,_=master.request('/api/telegram/status')
++        assert status==200 and tg['enabled'] is False and tg['paired'] is False and isinstance(tg['delivery_counts'],dict)
++        assert master.request('/api/telegram/pair',{})[0]==409
++        assert master.request('/api/telegram/unpair',{})[0]==200
++        record('Telegram disabled status/pair rejection/unpair schema; no real binding or token used')
++        assert master.request('/api/logout',{})[0]==200
++        assert master.request('/api/bootstrap')[0]==401
++        record('logout invalidates the session')
++    finally:
++        server.shutdown();server.server_close();worker_thread.join(timeout=5)
++    print(json.dumps({'server_sha256':hashlib.sha256(SERVER.read_bytes()).hexdigest(),'checks':checks,'count':len(checks),'scope':'loopback Python requests matching exact Flutter v2 payloads; not a Dart/device test'},ensure_ascii=False,indent=2))
+--- /dev/null
++++ b/tests/run_pwa_reporting_smoke.py
+@@ -0,0 +1,150 @@
++"""Optional local Chromium smoke for reporting contracts; synthetic data, no integrations.
++
++Run: python tests/run_pwa_reporting_smoke.py --browser /usr/bin/chromium
++Requires the optional playwright Python package and an installed Chromium binary.
++Never connects to a deployed app; creates and removes its own temporary database.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import os
++from pathlib import Path
++import sys
++import tempfile
++import threading
++from urllib.parse import parse_qs, urlparse
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT))
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--browser', default='/usr/bin/chromium')
++    parser.add_argument('--evidence-dir')
++    args = parser.parse_args()
++    with tempfile.TemporaryDirectory(prefix='enbekplus-pwa-report-') as directory:
++        # Strip inherited integration settings before importing the app. No delivery
++        # or watchdog threads run in this smoke. The browser blocks other origins.
++        for key in list(os.environ):
++            if key.startswith(('NARYADAI_LLM_', 'NARYADAI_TELEGRAM_')):
++                os.environ.pop(key)
++        os.environ['NARYADAI_LLM_ENABLED'] = '0'
++        os.environ['NARYADAI_TELEGRAM_ENABLED'] = '0'
++        os.environ['NARYADAI_DATA_DIR'] = directory
++        import server as app
++        from playwright.sync_api import sync_playwright
++
++        db_path = Path(directory) / 'smoke.sqlite3'
++        app.init_db(db_path)
++        app.patch_get_photo()
++        app.patch_cookie_login()
++        http = app.ThreadingHTTPServer(('127.0.0.1', 0), app.AppHandler)
++        http.daemon_threads = True
++        http.db_path = db_path
++        thread = threading.Thread(target=http.serve_forever, daemon=True)
++        thread.start()
++        origin = f'http://127.0.0.1:{http.server_port}'
++        checks = []
++        try:
++            with sync_playwright() as p:
++                browser = p.chromium.launch(executable_path=args.browser, headless=True)
++                context = browser.new_context(viewport={'width':1440, 'height':1080}, timezone_id='UTC', service_workers='block')
++                context.route('**/*', lambda route: route.continue_() if route.request.url.startswith(origin + '/') else route.abort())
++                page = context.new_page()
++                errors = []
++                page.on('pageerror', lambda error: errors.append(str(error)))
++                page.goto(origin)
++                page.locator('#username').fill('master01')
++                page.locator('#password').fill('demo123')
++                page.locator('#login-form button[type=submit]').click()
++                page.locator('#app').wait_for(state='visible')
++                page.locator('[data-view="reports"]').wait_for(state='visible')
++                bootstrap = page.request.get(origin+'/api/bootstrap').json()
++                order = next(o for o in bootstrap['orders'] if o['status'] in ('issued','accepted','queued','in_progress','paused','rework'))
++                page.locator('[data-view="reports"]').click()
++                page.locator('#report-from').fill('2001-02-01')
++                page.locator('#report-to').fill('2001-02-01')
++                page.locator('#report-area').select_option(str(order['area_id']))
++                page.locator('#report-equipment').select_option(str(order['equipment_id']))
++                page.locator('#report-worker').select_option(str(order['worker']['id']))
++                page.locator('#report-brigade').select_option(order['worker']['brigade'])
++                page.locator('#report-shift').select_option('A')
++                with page.expect_response(lambda r: '/api/reports?' in r.url) as result:
++                    page.locator('#load-report').click()
++                response = result.value
++                assert response.ok, response.text()
++                query = parse_qs(urlparse(response.url).query)
++                for key,value in [('area_id',order['area_id']),('equipment_id',order['equipment_id']),('worker_id',order['worker']['id'])]:
++                    assert query[key] == [str(value)], (key,query)
++                assert 'include_ai_summary' not in query
++                report = response.json()
++                page.locator('#report-result h3', has_text='Текущая загрузка').wait_for()
++                assert report['summary']['completed'] == 0
++                assert report['summary']['current_active_orders'] > 0
++                assert 'Отказы' in page.locator('#report-result').inner_text()
++                assert 'без фильтра дат/смены' in page.locator('#report-result').inner_text()
++                checks.append('All report query filters; no implicit AI; empty event period still shows current workload')
++
++                page.locator('#downtime-equipment').select_option(str(order['equipment_id']))
++                page.locator('#downtime-order').select_option(str(order['id']))
++                page.locator('#downtime-start').fill('2001-02-01T06:30')
++                page.locator('#downtime-end').fill('2001-02-01T07:30')
++                page.locator('#downtime-reason').fill('Synthetic UI contract smoke')
++                with page.expect_response(lambda r: '/api/equipment/downtime' in r.url and r.request.method=='POST') as saved:
++                    with page.expect_response(lambda r: '/api/reports?' in r.url) as after:
++                        page.locator('#downtime-submit').click()
++                assert saved.value.status == 201, saved.value.text()
++                assert saved.value.request.post_data_json['order_id'] == order['id']
++                assert saved.value.json()['item']['order_id'] == order['id']
++                assert after.value.json()['summary']['equipment_downtime_minutes'] == 60
++                page.get_by_text('Зарегистрированный простой оборудования: 60 мин', exact=True).wait_for()
++                checks.append('Optional downtime order_id survives real POST and worker/brigade-filtered report shows 60 minutes')
++
++                page.locator('[data-view="home"]').click()
++                page.locator('[data-view="reports"]').click()
++                for control,value in [('report-area',order['area_id']),('report-equipment',order['equipment_id']),('report-worker',order['worker']['id'])]:
++                    assert page.locator('#'+control).input_value()==str(value)
++                assert 'Текущая загрузка' in page.locator('#report-result').inner_text()
++                if args.evidence_dir:
++                    evidence=Path(args.evidence_dir);evidence.mkdir(parents=True,exist_ok=True)
++                    page.screenshot(path=str(evidence/'pwa-reports-desktop.png'),full_page=True)
++                other_area=next(a for a in bootstrap['constants']['areas'] if a['id']!=order['area_id'])
++                page.locator('#report-area').select_option(str(other_area['id']))
++                assert page.locator('#report-equipment').input_value()==''
++                assert page.locator(f'#report-equipment option[value="{order["equipment_id"]}"]').count()==0
++                checks.append('Submitted report filters and results survive navigation; incompatible equipment clears on area change')
++
++                page.locator('[data-view="team"]').click()
++                roster_count=page.locator('.team-person').count()
++                page.locator('#team-shift-filter').select_option('C')
++                with page.expect_response(lambda r: '/api/bootstrap?' in r.url and 'rating_shift=C' in r.url) as rating:
++                    page.locator('#apply-team-filters').click()
++                assert 'shift_code' not in parse_qs(urlparse(rating.value.url).query)
++                page.wait_for_function('(count) => document.querySelectorAll(".team-person").length === count', arg=roster_count)
++                checks.append('Rating shift uses rating_shift and does not remove other roster shifts')
++
++                page.locator('[data-view="reports"]').click()
++                page.set_viewport_size({'width':390,'height':844})
++                assert page.locator('#report-area').is_visible()
++                assert page.locator('#report-equipment').is_visible()
++                assert page.locator('#report-worker').is_visible()
++                assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
++                if args.evidence_dir:
++                    page.screenshot(path=str(Path(args.evidence_dir)/'pwa-reports-mobile.png'),full_page=True)
++                checks.append('390 px viewport has usable report controls and no document-level horizontal overflow')
++                assert not errors, errors
++                result={'checks':checks,'browser':browser.version,'page_errors':errors,'external_integrations':'disabled; external browser origins blocked'}
++                print(json.dumps(result,ensure_ascii=False,indent=2))
++                if args.evidence_dir:
++                    (Path(args.evidence_dir)/'pwa-report-smoke.json').write_text(json.dumps(result,ensure_ascii=False,indent=2))
++                browser.close()
++        finally:
++            http.shutdown()
++            http.server_close()
++            thread.join(timeout=5)
++
++
++if __name__=='__main__':
++    main()
+--- a/tests/test_app.py
++++ b/tests/test_app.py
+@@ -1645,7 +1645,7 @@
+                 if path=="/": self.assertIn("manifest.webmanifest",body)
+                 if path=="/sw.js":
+                     self.assertIn("cache.addAll",body)
+-                    self.assertIn("naryadai-shell-v13",body)
++                    self.assertIn("naryadai-shell-v14",body)
+                 if path.endswith("styles.css"): self.assertIn("max-width:760px",body)
+                 if path.endswith("/manifest.webmanifest"):
+                     manifest=json.loads(body)
+--- /dev/null
++++ b/tests/test_compose_llm_opt_in.py
+@@ -0,0 +1,88 @@
++"""Configuration regressions: forwarding is allowed, live LLM use stays opt-in."""
++from pathlib import Path
++import os
++import re
++import unittest
++from unittest import mock
++
++import server as app
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class ComposeLlmOptInTest(unittest.TestCase):
++    def test_compose_forwards_enabled_with_safe_zero_default(self):
++        source = (ROOT / 'compose.yaml').read_text(encoding='utf-8')
++        matches = re.findall(r'^\s+NARYADAI_LLM_ENABLED:\s*(.+)$', source, re.MULTILINE)
++        self.assertEqual(matches, ['${NARYADAI_LLM_ENABLED:-0}'])
++        # Existing provider configuration forwarding is retained verbatim.
++        for key in ('NARYADAI_LLM_API_URL', 'NARYADAI_LLM_API_KEY', 'NARYADAI_LLM_MODEL'):
++            self.assertIn(f'{key}: ${{{key}:-}}', source)
++
++    def test_explicit_zero_stays_rules_only_even_with_synthetic_configuration(self):
++        fake = {
++            'NARYADAI_LLM_ENABLED': '0',
++            'NARYADAI_LLM_API_KEY': 'synthetic-test-not-a-real-key',
++            'NARYADAI_LLM_MODEL': 'synthetic-test-model',
++            'NARYADAI_LLM_API_URL': 'https://example.invalid/chat/completions',
++        }
++        with mock.patch.dict(os.environ, fake, clear=True), \
++             mock.patch.object(app.urllib.request, 'urlopen', side_effect=AssertionError('No external request allowed')) as network:
++            result = app.llm_review('Синтетическая проверка: внешний запрос запрещён.')
++        self.assertEqual(result['mode'], 'rules-only: disabled')
++        network.assert_not_called()
++
++    def test_missing_enabled_stays_rules_only_and_readme_explains_manual_opt_in(self):
++        fake = {
++            'NARYADAI_LLM_API_KEY': 'synthetic-test-not-a-real-key',
++            'NARYADAI_LLM_MODEL': 'synthetic-test-model',
++        }
++        with mock.patch.dict(os.environ, fake, clear=True), \
++             mock.patch.object(app.urllib.request, 'urlopen', side_effect=AssertionError('No external request allowed')) as network:
++            result = app.llm_review('Синтетическая проверка без флага включения.')
++        self.assertEqual(result['mode'], 'rules-only: disabled')
++        network.assert_not_called()
++        readme = (ROOT / 'README.md').read_text(encoding='utf-8')
++        self.assertIn('NARYADAI_LLM_ENABLED=1', readme)
++        self.assertIn('NARYADAI_LLM_ENABLED=0', readme)
++        self.assertIn('rules-only', readme)
++        self.assertIn('Не присылайте его в чат', readme)
++
++    def test_optional_adapters_and_summary_have_disabled_or_empty_defaults(self):
++        source = (ROOT / 'compose.yaml').read_text(encoding='utf-8')
++        expected = {
++            'NARYADAI_LLM_REPORT_SUMMARY': '0',
++            'NARYADAI_TELEGRAM_ENABLED': '0',
++            'NARYADAI_TELEGRAM_BOT_TOKEN': '',
++            'NARYADAI_TELEGRAM_WEBHOOK_SECRET': '',
++        }
++        for key, default in expected.items():
++            matches = re.findall(r'^\s+' + key + r':\s*(.+)$', source, re.MULTILINE)
++            self.assertEqual(matches, [f'${{{key}:-{default}}}'], key)
++        template = dict(line.split('=', 1) for line in
++                        (ROOT / '.env.example').read_text(encoding='utf-8').splitlines()
++                        if line and not line.startswith('#'))
++        for key in ('NARYADAI_LLM_ENABLED', 'NARYADAI_LLM_REPORT_SUMMARY', 'NARYADAI_TELEGRAM_ENABLED'):
++            self.assertEqual(template[key], '0', key)
++        for key in ('NARYADAI_LLM_API_KEY', 'NARYADAI_TELEGRAM_BOT_TOKEN', 'NARYADAI_TELEGRAM_WEBHOOK_SECRET'):
++            self.assertEqual(template[key], '', key)
++
++    def test_telegram_requires_explicit_opt_in_and_both_local_secrets(self):
++        with mock.patch.dict(os.environ, {}, clear=True):
++            self.assertFalse(app.telegram_delivery_configured())
++        fake = {'NARYADAI_TELEGRAM_ENABLED': '0',
++                'NARYADAI_TELEGRAM_BOT_TOKEN': 'synthetic-test-not-real',
++                'NARYADAI_TELEGRAM_WEBHOOK_SECRET': 'synthetic-test-not-real'}
++        with mock.patch.dict(os.environ, fake, clear=True):
++            self.assertFalse(app.telegram_delivery_configured())
++        fake['NARYADAI_TELEGRAM_ENABLED'] = '1'
++        for missing in ('NARYADAI_TELEGRAM_BOT_TOKEN', 'NARYADAI_TELEGRAM_WEBHOOK_SECRET'):
++            with mock.patch.dict(os.environ, {**fake, missing: ''}, clear=True):
++                self.assertFalse(app.telegram_delivery_configured())
++        # This is only a pure configuration predicate; no delivery is started.
++        with mock.patch.dict(os.environ, fake, clear=True):
++            self.assertTrue(app.telegram_delivery_configured())
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- a/tests/test_frontend_races.js
++++ b/tests/test_frontend_races.js
+@@ -27,7 +27,7 @@
+   ['#app','#login-screen','#detail-drawer','#drawer-backdrop','#view-root','#toast-region','#offline-banner','#telegram-button'].forEach(get);
+   const localStorageWrites=[],logs=[];
+   const globals={document,console:{log:(...x)=>logs.push(x),warn:(...x)=>logs.push(x),error:(...x)=>logs.push(x)},localStorage:{setItem:(...x)=>localStorageWrites.push(x),removeItem:(...x)=>localStorageWrites.push(x),getItem:()=>null},navigator:{onLine:true},location:{protocol:'http:',hostname:'example.invalid'},window:{addEventListener(){}},URLSearchParams,setTimeout:()=>0,clearInterval(){},setInterval:()=>1,performance:{now:()=>0},fetch:()=>Promise.reject(new Error('Unexpected real fetch')),FileReader:class{},prompt:()=>null,confirm:()=>true};
+-  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','detailButtons','reassignmentForm','bindDrawer','loadReport','loadAudit','render','runAction','showTelegram','moveWorkQueue','exifPayload','insertJpegExif'];
++  const names=['api','logoutLocal','refresh','refreshDrawer','openOrder','openNewOrder','closeDrawer','saveCompletion','uploadPhotos','createOrder','bindIssueForm','renderDrawer','detailButtons','reassignmentForm','bindDrawer','loadReport','renderReports','bindReportControls','renderReportResult','reportEquipmentOptions','downtimeOrderOptions','submitEquipmentDowntime','loadAudit','render','runAction','showTelegram','moveWorkQueue','exifPayload','insertJpegExif'];
+   const expose=`globalThis.app={S,${names.join(',')},override(overrides){${['api','refresh','refreshDrawer','openOrder','renderDrawer','render','syncChrome','compressImage','renderReportResult'].map(n=>`if(overrides.${n})${n}=overrides.${n};`).join('')}}};`;
+   const source=fs.readFileSync(sourcePath,'utf8').replace(/\n  bindGlobal\(\);[\s\S]*?\n\}\)\(\);\s*$/,`\n  ${expose}\n})();`);
+   vm.runInNewContext(source,globals,{filename:sourcePath});
+@@ -323,3 +323,90 @@
+   assert.equal(refreshes,0);
+   assert.equal(calls.length,1);
+ });
++
++test('rating event shift uses rating_shift without narrowing the roster',async()=>{
++  const h=harness(),calls=[];h.app.S.orderId=null;h.app.S.ratingFrom='2026-09-01';h.app.S.ratingTo='2026-09-30';h.app.S.ratingShift='B';
++  h.app.override({api:async path=>{calls.push(path);return {user:h.app.S.me}},render(){}});
++  await h.app.refresh();const query=new URL('http://local'+calls[0]).searchParams;
++  assert.equal(query.get('rating_shift'),'B');assert.equal(query.get('rating_from'),'2026-09-01');assert.equal(query.get('rating_to'),'2026-09-30');assert.equal(query.has('shift_code'),false);
++});
++
++function reportInputs(h){
++  h.app.S.view='reports';h.get('#report-result');
++  for(const [id,value] of Object.entries({'report-from':'2026-09-01','report-to':'2026-09-30','report-brigade':'B','report-shift':'C','report-area':'2','report-equipment':'7','report-worker':'12'}))h.get('#'+id).value=value;
++}
++
++test('reports send all server filters, preserve selections and only explicitly request AI',async()=>{
++  const h=harness(),calls=[];reportInputs(h);h.get('#load-report');h.app.S.me.role='master';
++  h.app.S.data.constants={areas:[{id:2,name:'Area'}],equipment:[{id:7,area_id:2,name:'Asset',code:'EQ7'}],users:[{id:12,role:'worker',display_name:'Worker'}]};
++  h.app.override({api:async path=>{calls.push(path);return {summary:{}}},renderReportResult(){}});h.app.bindReportControls();
++  await h.get('#load-report').events.click({type:'click'});
++  const query=new URL('http://local'+calls[0]).searchParams;
++  for(const [key,value] of Object.entries({date_from:'2026-09-01',date_to:'2026-09-30',brigade:'B',shift_code:'C',area_id:'2',equipment_id:'7',worker_id:'12'}))assert.equal(query.get(key),value);
++  assert.equal(query.has('include_ai_summary'),false);
++  assert.equal(h.app.S.reportArea,'2');assert.equal(h.app.S.reportEquipment,'7');assert.equal(h.app.S.reportWorker,'12');
++  const html=h.app.renderReports();for(const id of ['report-area','report-equipment','report-worker'])assert.match(html,new RegExp(`id="${id}"`));
++  for(const id of ['2','7','12'])assert.match(html,new RegExp(`value="${id}" selected`));
++  await h.app.loadReport({type:'click'});assert.equal(new URL('http://local'+calls[1]).searchParams.has('include_ai_summary'),false);
++  await h.app.loadReport(true);assert.equal(new URL('http://local'+calls[2]).searchParams.get('include_ai_summary'),'1');
++  for(const id of ['report-area','report-equipment','report-worker'])h.get('#'+id).value='';
++  await h.app.loadReport();const cleared=new URL('http://local'+calls[3]).searchParams;
++  for(const key of ['area_id','equipment_id','worker_id'])assert.equal(cleared.has(key),false);
++});
++
++test('report equipment choices follow area and downtime order choices follow equipment',()=>{
++  const h=harness();h.app.S.me.role='master';h.app.S.data.constants.equipment=[{id:3,area_id:1,code:'E3',name:'One'},{id:7,area_id:2,code:'E7',name:'Two'}];
++  h.app.S.data.orders=[{id:101,equipment_id:3,code:'ORDER-101',title:'Local <order>'},{id:202,equipment_id:7,code:'ORDER-202',title:'Other'}];
++  assert.match(h.app.reportEquipmentOptions('1','3'),/value="3" selected/);assert.doesNotMatch(h.app.reportEquipmentOptions('1','7'),/value="7"/);
++  h.get('#report-area').value='2';h.get('#report-equipment').value='3';h.get('#downtime-equipment').value='3';h.get('#downtime-order');h.app.bindReportControls();
++  h.get('#report-area').events.change();assert.match(h.get('#report-equipment').innerHTML,/value="7"/);assert.doesNotMatch(h.get('#report-equipment').innerHTML,/value="3"/);
++  h.get('#downtime-equipment').events.change();assert.match(h.get('#downtime-order').innerHTML,/ORDER-101/);assert.match(h.get('#downtime-order').innerHTML,/&lt;order&gt;/);assert.doesNotMatch(h.get('#downtime-order').innerHTML,/ORDER-202/);assert.equal(h.get('#downtime-order').disabled,false);
++  h.get('#downtime-equipment').value='';h.get('#downtime-equipment').events.change();assert.equal(h.get('#downtime-order').disabled,true);assert.doesNotMatch(h.get('#downtime-order').innerHTML,/ORDER-/);
++});
++
++test('reports render refusals and current workload separately with server time semantics',()=>{
++  const h=harness();h.get('#report-result');h.app.S.report={summary:{date_from:'2026-09-01',date_to:'2026-09-30',shift_code:'C',issued:3,completed:2,closed:1,refusals:4,current_active_orders:8,current_overdue_orders:6,period_note:'Event UTC <period>',refusals_note:'Actor attribution',workload_note:'No date or shift filter'},worker_totals:[{worker:'Synthetic <worker>',brigade:'A',issued:3,completed:2,closed:1,refusals:4,labor_hours:5,current_active:8,current_in_progress:2,current_queued:3}]};
++  h.app.renderReportResult();const html=h.get('#report-result').innerHTML;
++  for(const text of ['События за выбранный период','Текущая загрузка · на сейчас','Отказы','Сейчас открыто','Сейчас просрочено','В работе / на паузе','В очереди / доработка','Event UTC &lt;period&gt;','Actor attribution','No date or shift filter'])assert.ok(html.includes(text),text);
++  assert.match(html,/<td>Synthetic &lt;worker&gt;<\/td><td>A<\/td><td>3<\/td><td>2<\/td><td>1<\/td><td>4<\/td><td>5<\/td>/);
++  assert.match(html,/<td>Synthetic &lt;worker&gt;<\/td><td>8<\/td><td>2<\/td><td>3<\/td>/);
++  assert.doesNotMatch(html,/назначенная синтетическая смена/);
++});
++
++function downtimeInputs(h){
++  h.app.S.me.role='master';h.app.S.view='reports';h.get('#downtime-submit');
++  for(const [id,value] of Object.entries({'downtime-equipment':'3','downtime-order':'101','downtime-start':'2026-09-01T08:00','downtime-end':'2026-09-01T09:00','downtime-reason':'Synthetic interval'}))h.get('#'+id).value=value;
++}
++
++test('linked downtime keeps numeric order_id and idempotency across failed retries',async()=>{
++  const h=harness(),calls=[];downtimeInputs(h);
++  h.app.override({api:async(path,method,body)=>{calls.push([path,method,body]);throw new Error('retryable')}});
++  await h.app.submitEquipmentDowntime({preventDefault(){}});await h.app.submitEquipmentDowntime({preventDefault(){}});
++  assert.equal(calls[0][0],'/api/equipment/downtime');assert.equal(calls[0][1],'POST');assert.equal(calls[0][2].order_id,101);assert.equal(calls[0][2].equipment_id,3);
++  assert.equal(calls[0][2].idempotency_key,calls[1][2].idempotency_key);
++  h.get('#downtime-order').value='';await h.app.submitEquipmentDowntime({preventDefault(){}});
++  assert.equal(calls[2][2].order_id,null);assert.notEqual(calls[1][2].idempotency_key,calls[2][2].idempotency_key);
++});
++
++test('downtime submission is single-flight and does not reopen reports after navigation',async()=>{
++  const h=harness(),pending=deferred(),calls=[];downtimeInputs(h);
++  h.app.override({api:(path,method,body)=>{calls.push([path,method,body]);return pending.promise}});
++  const first=h.app.submitEquipmentDowntime({preventDefault(){}});await h.app.submitEquipmentDowntime({preventDefault(){}});
++  assert.equal(calls.length,1);assert.equal(h.get('#downtime-submit').disabled,true);
++  h.app.S.view='home';h.app.S.viewVersion++;pending.resolve({duplicate:false});await first;
++  assert.equal(calls.length,1);assert.equal(h.app.S.downtimeDraft,null);assert.equal(h.app.S.registeringDowntime,false);
++});
++
++test('downtime rejects invalid or inverted dates before any write',async()=>{
++  const h=harness(),calls=[];downtimeInputs(h);h.app.override({api:async path=>{calls.push(path);return {}}});
++  h.get('#downtime-end').value='2026-09-01T07:00';await h.app.submitEquipmentDowntime({preventDefault(){}});
++  h.get('#downtime-end').value='invalid';await h.app.submitEquipmentDowntime({preventDefault(){}});assert.equal(calls.length,0);
++});
++
++test('a newer filtered report wins over an older in-flight report',async()=>{
++  const h=harness(),old=deferred(),next=deferred();reportInputs(h);let requests=0,rendered=0;
++  h.app.override({api:()=>++requests===1?old.promise:next.promise,renderReportResult(){rendered++}});
++  const first=h.app.loadReport();h.get('#report-worker').value='15';const second=h.app.loadReport();
++  next.resolve({summary:{worker_id:15}});await second;old.resolve({summary:{worker_id:12}});await first;
++  assert.equal(h.app.S.report.summary.worker_id,15);assert.equal(rendered,1);
++});
+--- /dev/null
++++ b/tests/test_pwa_shell_resources.py
+@@ -0,0 +1,50 @@
++"""All install-time PWA resources must exist and return successful local HTTP."""
++import json
++from pathlib import Path
++import re
++import unittest
++import urllib.request
++
++from tests import test_app as support
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class PwaShellResourcesTest(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        support.LocalAPITest.setUpClass()
++        cls.addClassCleanup(support.LocalAPITest.tearDownClass)
++        cls.base = support.LocalAPITest.base
++
++    def test_all_shell_manifest_and_favicon_urls_respond_200(self):
++        sw = (ROOT / 'static/sw.js').read_text(encoding='utf-8')
++        match = re.search(r'const SHELL = (\[[^;]+\]);', sw)
++        self.assertIsNotNone(match)
++        shell = json.loads(match.group(1))
++        manifest = json.loads((ROOT / 'static/manifest.webmanifest').read_text(encoding='utf-8'))
++        index = (ROOT / 'static/index.html').read_text(encoding='utf-8')
++        favicon = re.search(r'<link rel="icon" href="([^"]+)" type="image/png">', index)
++        self.assertIsNotNone(favicon)
++        icons = [item['src'] for item in manifest['icons']]
++        self.assertEqual(set(icons), {'/static/icon-192.png', '/static/icon-512.png'})
++        self.assertIn(favicon.group(1), icons)
++        self.assertIn('/static/app.js', shell)
++        self.assertIn('/static/styles.css', shell)
++        self.assertIn('/static/manifest.webmanifest', shell)
++        self.assertTrue(set(icons).issubset(shell))
++        for path in sorted(set(shell + icons + [favicon.group(1), manifest['start_url']])):
++            with self.subTest(path=path):
++                self.assertTrue(path.startswith('/'))
++                with urllib.request.urlopen(self.base + path, timeout=5) as response:
++                    self.assertEqual(response.status, 200)
++                    body = response.read()
++                    self.assertTrue(body)
++                    if path.endswith('.png'):
++                        self.assertEqual(response.headers.get_content_type(), 'image/png')
++                        self.assertTrue(body.startswith(b'\x89PNG\r\n\x1a\n'))
++        self.assertNotIn('/static/icon.svg', sw + index + json.dumps(manifest))
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- /dev/null
++++ b/tests/test_reassign_active_workers.py
+@@ -0,0 +1,113 @@
++"""Assignment eligibility regressions; all HTTP calls use disposable synthetic data."""
++from __future__ import annotations
++
++import unittest
++
++import server as app
++from tests import test_app as support
++
++
++class ReassignActiveWorkersTest(unittest.TestCase):
++    def setUp(self):
++        # Reuse the project's existing loopback fixture without inheriting and
++        # rerunning its entire test class. Every case gets a fresh database.
++        support.LocalAPITest.setUpClass()
++        self.addCleanup(support.LocalAPITest.tearDownClass)
++        self.fixture = support.LocalAPITest()
++        self.master = self.fixture.client('master01')
++        self.order = self.fixture.create_order(self.master, before_photo=False)
++        self.order_id = self.order['id']
++        self.path = f'/api/orders/{self.order_id}/assign'
++
++    def _seed_queue_state(self):
++        with app.connect(self.fixture.db_path) as db:
++            order = db.execute('SELECT * FROM orders WHERE id=?', (self.order_id,)).fetchone()
++            scope = app.queue_scope_key(order)
++            db.execute('INSERT OR REPLACE INTO manual_queue_state(scope_key,revision,updated_at,updated_by) VALUES (?,?,?,?)',
++                       (scope, 17, app.iso(), order['assigned_master_id']))
++            db.execute('INSERT OR REPLACE INTO manual_queue_items(order_id,scope_key,position) VALUES (?,?,?)',
++                       (self.order_id, scope, 1))
++            # A purely local pending row catches accidental cancellation too.
++            # No binding, bot credentials, or delivery worker is created.
++            db.execute("""INSERT INTO telegram_outbox
++                (recipient_user_id,order_id,recipient_role,event,payload_json,status,created_at)
++                VALUES (?,?,'worker','synthetic_reassignment_probe','{}','queued_local',?)""",
++                (order['assigned_to'], self.order_id, app.iso()))
++            db.commit()
++
++    def _snapshot(self):
++        # Covers row changes as well as inserts: a failed assignment must not
++        # alter deadlines/status, queue revisions, audit, notifications or outbox.
++        tables = ('orders', 'audit', 'notifications', 'telegram_outbox',
++                  'manual_queue_items', 'manual_queue_state')
++        with app.connect(self.fixture.db_path) as db:
++            return {table: [tuple(row) for row in db.execute(f'SELECT * FROM {table} ORDER BY rowid')]
++                    for table in tables}
++
++    def test_all_inactive_brigade_is_409_and_changes_nothing(self):
++        self._seed_queue_state()
++        with app.connect(self.fixture.db_path) as db:
++            db.execute("UPDATE users SET is_active=0 WHERE role='worker' AND brigade='B'")
++            db.commit()
++        before = self._snapshot()
++        status, body = self.master.call(self.path, 'POST', {'brigade': 'B'})
++        self.assertEqual(status, 409, body)
++        self.assertEqual(body['error'], 'В бригаде нет активного исполнителя.')
++        self.assertEqual(self._snapshot(), before)
++
++    def test_mixed_brigade_selects_active_least_loaded_and_notifies_only_active(self):
++        with app.connect(self.fixture.db_path) as db:
++            ids = [row[0] for row in db.execute("SELECT id FROM users WHERE role='worker' AND brigade='B' ORDER BY id")]
++            self.assertGreaterEqual(len(ids), 3)
++            idle, busy = ids[-1], ids[-2]
++            db.execute("UPDATE users SET is_active=0 WHERE role='worker' AND brigade='B'")
++            db.execute('UPDATE users SET is_active=1 WHERE id IN (?,?)', (idle, busy))
++            # Give the disabled workers and chosen idle worker zero active jobs.
++            placeholders = ','.join('?' for _ in ids)
++            db.execute(f"UPDATE orders SET status='closed' WHERE assigned_to IN ({placeholders})", ids)
++            db.commit()
++        busy_order = self.fixture.create_order(self.master, worker_id=busy, before_photo=False)
++        with app.connect(self.fixture.db_path) as db:
++            db.execute("UPDATE orders SET status='accepted' WHERE id=?", (busy_order['id'],))
++            notification_start = db.execute('SELECT COALESCE(MAX(id),0) FROM notifications').fetchone()[0]
++            audit_start = db.execute('SELECT COALESCE(MAX(id),0) FROM audit').fetchone()[0]
++            db.commit()
++        status, body = self.master.call(self.path, 'POST', {'brigade': 'B'})
++        self.assertEqual(status, 200, body)
++        with app.connect(self.fixture.db_path) as db:
++            assigned = db.execute('SELECT assigned_to,assigned_brigade,status FROM orders WHERE id=?', (self.order_id,)).fetchone()
++            self.assertEqual(tuple(assigned), (idle, 'B', 'issued'))
++            notified = [row[0] for row in db.execute('SELECT user_id FROM notifications WHERE id>? AND order_id=?',
++                                                   (notification_start, self.order_id))]
++            self.assertCountEqual(notified, [idle, busy])
++            reassigned = db.execute("SELECT COUNT(*) FROM audit WHERE id>? AND order_id=? AND event='reassigned'",
++                                    (audit_start, self.order_id)).fetchone()[0]
++            self.assertEqual(reassigned, 1)
++            self.assertEqual(db.execute('SELECT is_active FROM users WHERE id=?', (idle,)).fetchone()[0], 1)
++
++    def test_inactive_individual_is_rejected_and_changes_nothing(self):
++        self._seed_queue_state()
++        with app.connect(self.fixture.db_path) as db:
++            inactive = db.execute("SELECT id FROM users WHERE role='worker' AND brigade='B' ORDER BY id LIMIT 1").fetchone()[0]
++            db.execute('UPDATE users SET is_active=0 WHERE id=?', (inactive,))
++            db.commit()
++        before = self._snapshot()
++        status, body = self.master.call(self.path, 'POST', {'worker_id': inactive})
++        self.assertEqual(status, 400, body)
++        self.assertEqual(body['error'], 'Исполнитель не найден')
++        self.assertEqual(self._snapshot(), before)
++
++    def test_empty_brigade_is_409_not_500_and_changes_nothing(self):
++        self._seed_queue_state()
++        with app.connect(self.fixture.db_path) as db:
++            db.execute("UPDATE users SET brigade='A' WHERE role='worker' AND brigade='B'")
++            db.commit()
++        before = self._snapshot()
++        status, body = self.master.call(self.path, 'POST', {'brigade': 'B'})
++        self.assertEqual(status, 409, body)
++        self.assertEqual(body['error'], 'В бригаде нет активного исполнителя.')
++        self.assertEqual(self._snapshot(), before)
++
++
++if __name__ == '__main__':
++    unittest.main()

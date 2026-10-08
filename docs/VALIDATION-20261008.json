@@ -1,0 +1,41 @@
+{
+  "date_utc": "2026-10-08",
+  "baseline_archive_sha256": "fef6930ab66e1e073f9cecece7015edcb73b0024faab0c42158563564e418964",
+  "server_sha256": "1a3406096333e377daa36f65947880ccbb96aa50dcaec96210eafe6d381b2e2f",
+  "python_unittest": {
+    "passed": 103,
+    "failed": 0,
+    "seconds": 17.113
+  },
+  "node_tests": {
+    "passed": 40,
+    "failed": 0
+  },
+  "streamlit_apptest": {
+    "passed": 6,
+    "failed": 0,
+    "seconds": 15.493
+  },
+  "flutter_v2_wire_contract": {
+    "passed_groups": 9,
+    "failed": 0,
+    "scope": "Loopback HTTP matching client payloads; not Dart or device execution"
+  },
+  "syntax": {
+    "all_python_ast": "passed",
+    "app_js": "passed",
+    "sw_js": "passed",
+    "frontend_test_js": "passed"
+  },
+  "pwa_resources": "All SHELL, manifest icon/start and favicon resources return HTTP 200; PNG MIME/signature checked",
+  "config": "Enabled flags default 0, template secrets empty; actual server opt-in gates retained",
+  "network": "Only disposable loopback services; network guard blocks nonloopback; no real LLM or Telegram",
+  "not_run": [
+    "Docker image build/Compose runtime",
+    "Real external LLM call",
+    "Real Telegram delivery/webhook setup",
+    "Chromium visual smoke (socket denied)",
+    "Fresh Flutter build/device tests"
+  ],
+  "independent_review": "No blockers in assignment transaction, config defaults and PNG resource wiring"
+}
